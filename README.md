@@ -73,8 +73,10 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 
 - `--task <TASK>` (alias `--goal <TASK>`): Natural language task/goal to accomplish.
 - `--max-steps <MAX_STEPS>`: Maximum number of steps before stopping (default `30`).
+- `--start-url <URL>`: Activate Chrome and navigate active tab to this URL before step 0.
+- `--fill <KEY=VALUE>`: Repeatable target-to-text fill mapping (e.g. `--fill "origin field=Osaka"`).
 - `--dry-run`: Perform capture and decision making without executing mouse/keyboard actions.
-- `--json`: Print a single final JSON result object to stdout: `{"status":"done|step_limit|wait_limit|blocked|error","steps":N,"reason":"..."}`.
+- `--json`: Print a single final JSON result object to stdout (`{status, steps, reason, ...}`).
 
 Exit codes:
 - `0` (`done`): Task completed.
@@ -181,8 +183,10 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 
 - `--task <TASK>`（別名 `--goal <TASK>`）：指定自然語言任務目標。
 - `--max-steps <MAX_STEPS>`：最大步數上限（預設 `30`）。
+- `--start-url <URL>`：於第 0 步前喚醒 Chrome 並將前景視窗使用中分頁導向此網址。
+- `--fill <KEY=VALUE>`：可重複指定的目標欄位填入文字對應（例如 `--fill "origin field=Osaka"`）。
 - `--dry-run`：乾跑模式，不執行實際滑鼠或鍵盤動作。
-- `--json`：於標準輸出印出單一 JSON 結果物件：`{"status":"done|step_limit|wait_limit|blocked|error","steps":N,"reason":"..."}`。
+- `--json`：於標準輸出印出單一 JSON 結果物件（`{status, steps, reason, ...}`）。
 - 結束狀態碼：`0` (`done`)、`1` (`error`)、`2` (`step_limit`)、`3` (`wait_limit`)、`4` (`blocked`)。完整說明請參考 [`skills/decision-computer-use/SKILL.md`](skills/decision-computer-use/SKILL.md)。
 
 ### 安全規則 (Safety Rules)

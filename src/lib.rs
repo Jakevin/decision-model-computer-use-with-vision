@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod api;
+pub mod browser;
 pub mod capture;
 pub mod decider;
 pub mod input;

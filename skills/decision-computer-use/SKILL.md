@@ -39,16 +39,25 @@ Usage: decision-cu run [OPTIONS] --task <TASK>
 Options:
       --task <TASK>            Natural language task/goal to accomplish (alias: --goal) [alias: --goal]
       --max-steps <MAX_STEPS>  Maximum number of steps before stopping [default: 30]
+      --start-url <URL>        Activate Chrome and navigate active tab to this URL before step 0
+      --fill <KEY=VALUE>       Repeatable target-to-text fill mapping (e.g. --fill "origin field=Osaka")
       --dry-run                Perform capture and decision making without executing mouse/keyboard actions
-      --json                   Print a single final JSON result object to stdout ({status, steps, reason})
+      --json                   Print a single final JSON result object to stdout ({status, steps, reason, ...})
   -h, --help                   Print help
 ```
 
 ### Example Invocations
 
 ```bash
-# Recommended for AI agents: structured JSON output on stdout
-cargo run --quiet -- run --task "Search nonstop flights from SFO to JFK" --max-steps 20 --json
+# Live one-way flight search with start URL and field fills
+cargo run --quiet -- run \
+  --task "Search one-way flights from Osaka to Taipei on Nov 3, 2026" \
+  --start-url "https://www.google.com/travel/flights" \
+  --fill "origin field=Osaka" \
+  --fill "destination field=Taipei" \
+  --fill "departure date=Nov 3, 2026" \
+  --max-steps 25 \
+  --json
 
 # Dry-run inspection (captures, crops, and queries Decision 3.0 without clicking or typing)
 cargo run --quiet -- run --task "Check departure date selector" --max-steps 5 --dry-run --json
@@ -60,26 +69,27 @@ cargo run --quiet -- run --goal "Sort flights by cheapest" --max-steps 10 --json
 ## How to Give a Task
 
 - Provide a clear, read-only visual inspection or search instruction via `--task "<text>"` (or `--goal "<text>"`).
-- Keep the active Google Chrome window focused on the target page (e.g., `https://www.google.com/travel/flights`).
+- Pass `--start-url "https://www.google.com/travel/flights"` to automatically activate Chrome and set the active tab URL before step 0 (never opens or closes tabs/windows).
+- Pass repeatable `--fill "target=value"` flags for fields that should be automatically selected (`Meta+A`) and typed into right after clicking them.
 - When calling from an automated agent, always pass `--json` so stdout contains a single machine-readable JSON line.
 
 ## Outputs & Exit Codes
 
-When `--json` is passed, `decision-cu` prints exactly one JSON object to `stdout`:
+When `--json` is passed, `decision-cu` prints exactly one JSON object to `stdout` including all run summary fields:
 
 ```json
-{"status":"done","steps":4,"reason":"Task completed ('done' returned by model)"}
+{"status":"done","steps":8,"reason":"results page with prices","clicks":6,"requests_sent":14,"images_sent":14,"avg_seconds_per_step":1.42,"all_images_cropped":true,"tab_events":0}
 ```
 
 | `status` | Exit Code | Meaning |
 | :--- | :---: | :--- |
-| `done` | `0` | The model returned `"done"` and the task finished normally. |
-| ` error` | `1` | Missing `VSR_API_KEY`, HTTP/API transport error, or platform input/capture failure. |
-| `step_limit` | `2` | Reached `--max-steps` before the model returned `"done"`. |
+| `done` | `0` | Results page with flight prices reached (`results` noul >= 0.8 for 2 consecutive steps) or model returned `"done"` with `results` noul >= 0.5. |
+| `error` | `1` | Missing `VSR_API_KEY`, HTTP/API transport error, or platform input/capture failure. |
+| `step_limit` | `2` | Reached `--max-steps` before completion. |
 | `wait_limit` | `3` | Exceeded `max_consecutive_waits` (`> 2` consecutive `"wait"` decisions). |
-| `blocked` | `4` | Blocked by privacy or safety policy (`NoCrop`, `CropTooSmall`, `ClickInTabStrip`, `ClickOutsideWindow`, `ForbiddenTarget`, or `SensitiveTextBlocked`). |
+| `blocked` | `4` | Blocked by privacy or safety policy (`NoCrop`, `CropTooSmall`, `ClickInTabStrip`, `ClickOutsideWindow`, `ForbiddenTarget`, `SensitiveTextBlocked`, or `> 2` off-prefix `tab_events`). |
 
-Detailed per-step JSONL logs are written to `./runs/run-<timestamp>.jsonl` with automatic secret redaction (`redact()`).
+Detailed per-step logs are written to `./runs/<timestamp>/steps.jsonl` and the run summary is written to `./runs/<timestamp>/summary.json` with automatic secret redaction (`redact()`).
 
 ## Safety Limits
 

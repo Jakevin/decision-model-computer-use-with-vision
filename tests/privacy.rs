@@ -71,6 +71,7 @@ struct MockInput {
     keys: Vec<KeyCode>,
     scrolls: Vec<i32>,
     modifier_releases: usize,
+    select_alls: usize,
 }
 
 impl Input for MockInput {
@@ -102,6 +103,55 @@ impl Input for MockInput {
         self.modifier_releases += 1;
         Ok(())
     }
+
+    fn select_all(&mut self) -> Result<(), InputError> {
+        self.release_modifiers()?;
+        self.select_alls += 1;
+        self.release_modifiers()
+    }
+}
+
+struct SequenceBrowser {
+    urls: RefCell<VecDeque<Option<String>>>,
+    set_urls: Vec<String>,
+    activated: usize,
+}
+
+impl SequenceBrowser {
+    fn new(urls: Vec<Option<String>>) -> Self {
+        Self {
+            urls: RefCell::new(VecDeque::from(urls)),
+            set_urls: Vec::new(),
+            activated: 0,
+        }
+    }
+}
+
+impl decision_cu::browser::Browser for SequenceBrowser {
+    fn active_tab_url(&self) -> Option<String> {
+        self.urls.borrow_mut().pop_front().flatten()
+    }
+
+    fn set_active_tab_url(&mut self, url: &str) -> Result<(), decision_cu::browser::BrowserError> {
+        self.set_urls.push(url.to_string());
+        Ok(())
+    }
+
+    fn activate_chrome(&mut self) -> Result<(), decision_cu::browser::BrowserError> {
+        self.activated += 1;
+        Ok(())
+    }
+}
+
+fn make_choice_response_with_results(kind: &str, target: &str, results_noul: f64) -> Response {
+    let mut resp = make_choice_response(kind, target);
+    resp.answers.insert(
+        "results".to_string(),
+        Answer::Noul {
+            noul: results_noul,
+        },
+    );
+    resp
 }
 
 fn make_choice_response(kind: &str, target: &str) -> Response {
@@ -491,4 +541,248 @@ fn request_and_response_json_shape_matches_docs() {
         }
         _ => panic!("Expected box answer"),
     }
+}
+
+#[test]
+fn url_off_prefix_nothing_sent_and_tab_event() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+    let backend = MockBackend::new(vec![]);
+    let decider = VisionDecider::new(
+        backend,
+        vec![TargetSpec::new("search button", None)],
+    );
+    let browser = SequenceBrowser::new(vec![
+        Some("https://example.com/other".to_string()),
+        Some("https://news.ycombinator.com".to_string()),
+        Some("chrome://newtab".to_string()),
+    ]);
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_tab_events");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+    let summary_path = logger.summary_path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_browser(browser)
+        .with_start_url(Some("https://www.google.com/travel/flights".to_string()))
+        .with_start_url_wait(std::time::Duration::ZERO)
+        .with_logger(logger);
+
+    let summary = agent.run("Find flights").unwrap();
+    assert!(matches!(summary.stop_reason, StopReason::SafetyBlocked(_)));
+    assert_eq!(summary.steps_taken, 0);
+    assert_eq!(summary.requests_sent, 0);
+    assert_eq!(summary.images_sent, 0);
+    assert_eq!(summary.tab_events, 3);
+    assert_eq!(agent.decider().backend().request_count(), 0);
+    assert_eq!(agent.audit_log().records().len(), 0);
+    assert_eq!(agent.browser().set_urls.len(), 4);
+    assert_eq!(agent.browser().activated, 1);
+
+    let steps_content = std::fs::read_to_string(&steps_path).unwrap();
+    assert!(steps_content.contains("\"tab_event\""));
+    let summary_content = std::fs::read_to_string(&summary_path).unwrap();
+    let summary_json: serde_json::Value = serde_json::from_str(&summary_content).unwrap();
+    assert_eq!(summary_json["status"], "blocked");
+    assert_eq!(summary_json["tab_events"], 3);
+    assert_eq!(summary_json["requests_sent"], 0);
+    assert_eq!(summary_json["images_sent"], 0);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn fill_typing_after_click_selects_all_and_types_in_same_step() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results("click", "origin field", 0.1),
+        make_box_response(0.4, 0.4, 0.6, 0.6, 0.95),
+        make_choice_response_with_results("done", "nothing to click", 0.6),
+    ]);
+    let mut fills = BTreeMap::new();
+    fills.insert("origin field".to_string(), "Osaka".to_string());
+
+    let decider = VisionDecider::new(
+        backend,
+        vec![TargetSpec::new("origin field", Some("Where from?".to_string()))],
+    )
+    .with_type_values(fills);
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default());
+    let summary = agent.run("Search one-way flights from Osaka").unwrap();
+
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.steps_taken, 2);
+    assert_eq!(summary.clicks, 1);
+    assert_eq!(agent.input().clicks.len(), 1);
+    assert_eq!(agent.input().select_alls, 1);
+    assert_eq!(agent.input().typed, vec!["Osaka".to_string()]);
+    assert!(agent.input().keys.is_empty());
+    assert_eq!(
+        summary.history[0],
+        "clicked and typed 'Osaka' into origin field"
+    );
+
+    let reqs = agent.decider().backend().requests.borrow();
+    match reqs[0].questions.get("kind").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("type"));
+            assert!(criteria.contains_key("press enter"));
+        }
+        _ => panic!("Expected choice question for kind"),
+    }
+}
+
+#[test]
+fn results_stop_after_two_consecutive_and_done_requires_half_noul() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results("done", "nothing to click", 0.2),
+        make_choice_response_with_results("scroll", "nothing to click", 0.85),
+        make_choice_response_with_results("wait", "nothing to click", 0.91),
+    ]);
+    let decider = VisionDecider::new(
+        backend,
+        vec![TargetSpec::new("search button", None)],
+    );
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default());
+    let summary = agent.run("Find flights").unwrap();
+
+    assert_eq!(summary.stop_reason, StopReason::ResultsPageWithPrices);
+    assert_eq!(summary.steps_taken, 3);
+    let summary_json = summary.to_summary_json();
+    assert_eq!(summary_json.status, "done");
+    assert_eq!(summary_json.reason, "results page with prices");
+}
+
+#[test]
+fn summary_counters_and_step_log_fields() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 50.0,
+        y: 40.0,
+        width: 700.0,
+        height: 500.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results("click", "search button", 0.1),
+        make_box_response(0.4, 0.4, 0.6, 0.6, 0.9),
+        make_choice_response_with_results("press enter", "nothing to click", 0.3),
+        make_choice_response_with_results("done", "nothing to click", 0.7),
+    ]);
+    let decider = VisionDecider::new(
+        backend,
+        vec![TargetSpec::new("search button", None)],
+    );
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_summary_counters");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+    let summary_path = logger.summary_path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_logger(logger);
+    let summary = agent.run("Search flights").unwrap();
+
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.steps_taken, 3);
+    assert_eq!(summary.clicks, 1);
+    assert_eq!(summary.requests_sent, 4);
+    assert_eq!(summary.images_sent, 4);
+    assert!(summary.all_images_cropped);
+    assert_eq!(summary.tab_events, 0);
+    assert!(summary.avg_seconds_per_step >= 0.0);
+    assert_eq!(agent.input().keys, vec![KeyCode::Return]);
+
+    let summary_str = std::fs::read_to_string(&summary_path).unwrap();
+    let s_val: serde_json::Value = serde_json::from_str(&summary_str).unwrap();
+    assert_eq!(s_val["status"], "done");
+    assert_eq!(s_val["steps"], 3);
+    assert_eq!(s_val["clicks"], 1);
+    assert_eq!(s_val["requests_sent"], 4);
+    assert_eq!(s_val["images_sent"], 4);
+    assert_eq!(s_val["all_images_cropped"], true);
+    assert_eq!(s_val["tab_events"], 0);
+
+    let steps_str = std::fs::read_to_string(&steps_path).unwrap();
+    let lines: Vec<&str> = steps_str.lines().collect();
+    assert_eq!(lines.len(), 3);
+    let step0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(step0["step"], 0);
+    assert_eq!(step0["url"], "https://www.google.com/travel/flights");
+    assert_eq!(step0["kind"], "click");
+    assert_eq!(step0["target"], "search button");
+    assert!(step0["box_crop_px"].is_object());
+    assert!(step0["box_confidence"].is_number());
+    assert_eq!(step0["reasked"], false);
+    assert!(step0["click_point"].is_array());
+    assert!(step0["seconds"].is_number());
+    assert_eq!(step0["results_noul"], 0.1);
+    assert!(step0["sent_image_crop_rect"].is_object());
+    assert_eq!(step0["sent_size"], serde_json::json!([1400, 1000]));
+    assert_eq!(step0["full_screen_size"], serde_json::json!([1600, 1200]));
+
+    let key = ApiKey::new("sk-vsr-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefG");
+    let client = DecisionClient::with_endpoint(key, "http://127.0.0.1:1/invalid").unwrap();
+    assert_eq!(client.requests_sent(), 0);
+    let mut q = BTreeMap::new();
+    q.insert(
+        "results".to_string(),
+        Question::Noul {
+            instructions: "results?".to_string(),
+        },
+    );
+    let req = Request {
+        model: DEFAULT_MODEL.to_string(),
+        state: "Goal: test".to_string(),
+        images: vec![],
+        questions: q,
+    };
+    let _ = client.ask(&req);
+    assert_eq!(client.requests_sent(), 1);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }

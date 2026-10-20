@@ -23,6 +23,10 @@ pub trait Input {
     fn key(&mut self, key: KeyCode) -> Result<(), InputError>;
     fn scroll_vertical(&mut self, amount: i32) -> Result<(), InputError>;
     fn release_modifiers(&mut self) -> Result<(), InputError>;
+    fn select_all(&mut self) -> Result<(), InputError> {
+        self.release_modifiers()?;
+        self.release_modifiers()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -103,5 +107,18 @@ impl Input for EnigoInput {
             let _ = self.enigo.key(modifier, Direction::Release);
         }
         Ok(())
+    }
+
+    fn select_all(&mut self) -> Result<(), InputError> {
+        use enigo::{Direction, Key, Keyboard};
+        self.release_modifiers()?;
+        let _ = self.enigo.key(Key::Meta, Direction::Press);
+        let res = self
+            .enigo
+            .key(Key::Unicode('a'), Direction::Click)
+            .map_err(|e| InputError::Platform(e.to_string()));
+        let _ = self.enigo.key(Key::Meta, Direction::Release);
+        let _ = self.release_modifiers();
+        res
     }
 }

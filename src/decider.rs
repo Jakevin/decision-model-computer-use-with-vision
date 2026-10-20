@@ -1,11 +1,16 @@
-use crate::api::{Answer, ApiError, BoundingBox, DecisionBackend, Question, Request, DEFAULT_MODEL};
+use crate::api::{
+    Answer, ApiError, BoundingBox, DecisionBackend, Question, Request, Response, DEFAULT_MODEL,
+};
 use crate::privacy::PreparedImage;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 
 pub const NOTHING_TO_CLICK: &str = "nothing to click";
 pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.2;
+pub const RESULTS_QUESTION_INSTRUCTIONS: &str =
+    "Does the image show a Google Flights results list with flight prices?";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetSpec {
@@ -23,12 +28,18 @@ impl TargetSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum ActionKind {
+    #[serde(rename = "click")]
     Click,
+    #[serde(rename = "type")]
     Type,
+    #[serde(rename = "press enter")]
+    PressEnter,
+    #[serde(rename = "scroll")]
     Scroll,
+    #[serde(rename = "wait")]
     Wait,
+    #[serde(rename = "done")]
     Done,
 }
 
@@ -37,10 +48,22 @@ impl ActionKind {
         match s.trim().to_lowercase().as_str() {
             "click" => Some(Self::Click),
             "type" => Some(Self::Type),
+            "press enter" | "press_enter" => Some(Self::PressEnter),
             "scroll" => Some(Self::Scroll),
             "wait" => Some(Self::Wait),
             "done" => Some(Self::Done),
             _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Click => "click",
+            Self::Type => "type",
+            Self::PressEnter => "press enter",
+            Self::Scroll => "scroll",
+            Self::Wait => "wait",
+            Self::Done => "done",
         }
     }
 }
@@ -48,12 +71,15 @@ impl ActionKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Decision {
     pub kind: ActionKind,
+    pub kind_confidence: f64,
     pub target: Option<String>,
     pub click_point_screen_pt: Option<(f64, f64)>,
     pub bbox: Option<BoundingBox>,
+    pub box_confidence: Option<f64>,
     pub confidence: f64,
     pub reasked: bool,
     pub text_to_type: Option<String>,
+    pub results_noul: f64,
 }
 
 #[derive(Debug, Error)]
@@ -85,7 +111,14 @@ pub fn map_box_center_to_screen_pt(bbox: &BoundingBox, img: &PreparedImage) -> (
 }
 
 pub fn format_state(goal: &str, history: &[String]) -> String {
-    let recent: Vec<&String> = history.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect();
+    let recent: Vec<&String> = history
+        .iter()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     if recent.is_empty() {
         format!("Goal: {}\nHistory: (none)", goal)
     } else {
@@ -99,11 +132,33 @@ pub fn format_state(goal: &str, history: &[String]) -> String {
     }
 }
 
+fn pending_fill_target<'a>(
+    history: &[String],
+    type_values: &'a BTreeMap<String, String>,
+) -> Option<&'a str> {
+    if type_values.is_empty() {
+        return None;
+    }
+    let last = history.last()?;
+    if !last.starts_with("click '") {
+        return None;
+    }
+    for key in type_values.keys() {
+        let prefix = format!("click '{}'", key);
+        if last.starts_with(&prefix) {
+            return Some(key.as_str());
+        }
+    }
+    None
+}
+
 pub struct VisionDecider<B: DecisionBackend> {
     backend: B,
     model: String,
     targets: Vec<TargetSpec>,
-    type_values: BTreeMap<String, String>,
+    pub type_values: BTreeMap<String, String>,
+    requests_sent: AtomicUsize,
+    images_sent: AtomicUsize,
 }
 
 impl<B: DecisionBackend> VisionDecider<B> {
@@ -113,6 +168,8 @@ impl<B: DecisionBackend> VisionDecider<B> {
             model: DEFAULT_MODEL.to_string(),
             targets,
             type_values: BTreeMap::new(),
+            requests_sent: AtomicUsize::new(0),
+            images_sent: AtomicUsize::new(0),
         }
     }
 
@@ -121,12 +178,37 @@ impl<B: DecisionBackend> VisionDecider<B> {
         self
     }
 
+    pub fn type_values(&self) -> &BTreeMap<String, String> {
+        &self.type_values
+    }
+
+    pub fn fill_for(&self, target_label: &str) -> Option<&str> {
+        self.type_values.get(target_label).map(|s| s.as_str())
+    }
+
     pub fn backend(&self) -> &B {
         &self.backend
     }
 
     pub fn targets(&self) -> &[TargetSpec] {
         &self.targets
+    }
+
+    pub fn requests_sent(&self) -> usize {
+        self.requests_sent
+            .load(Ordering::SeqCst)
+            .max(self.backend.requests_sent())
+    }
+
+    pub fn images_sent(&self) -> usize {
+        self.images_sent.load(Ordering::SeqCst)
+    }
+
+    fn ask_backend(&self, req: &Request) -> Result<Response, DeciderError> {
+        self.requests_sent.fetch_add(1, Ordering::SeqCst);
+        self.images_sent
+            .fetch_add(req.images.len(), Ordering::SeqCst);
+        Ok(self.backend.ask(req)?)
     }
 
     fn find_target_description(&self, label: &str) -> Option<&str> {
@@ -143,15 +225,22 @@ impl<B: DecisionBackend> VisionDecider<B> {
         img: &PreparedImage,
     ) -> Result<Decision, DeciderError> {
         let state = format_state(goal, history);
+        let active_fill_target = pending_fill_target(history, &self.type_values);
 
         let mut kind_criteria = BTreeMap::new();
         kind_criteria.insert(
             "click".to_string(),
             Some("Click an interactive element on the page".to_string()),
         );
+        if active_fill_target.is_some() {
+            kind_criteria.insert(
+                "type".to_string(),
+                Some("Type text into the currently focused input field".to_string()),
+            );
+        }
         kind_criteria.insert(
-            "type".to_string(),
-            Some("Type text into the currently focused input field".to_string()),
+            "press enter".to_string(),
+            Some("Press Return to confirm the current input".to_string()),
         );
         kind_criteria.insert(
             "scroll".to_string(),
@@ -193,6 +282,12 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 criteria: target_criteria,
             },
         );
+        questions.insert(
+            "results".to_string(),
+            Question::Noul {
+                instructions: RESULTS_QUESTION_INSTRUCTIONS.to_string(),
+            },
+        );
 
         let req1 = Request {
             model: self.model.clone(),
@@ -201,7 +296,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
             questions,
         };
 
-        let resp1 = self.backend.ask(&req1)?;
+        let resp1 = self.ask_backend(&req1)?;
 
         let (kind_choice, kind_conf) = match resp1.answers.get("kind") {
             Some(Answer::Choice {
@@ -217,6 +312,12 @@ impl<B: DecisionBackend> VisionDecider<B> {
             None => None,
         };
 
+        let results_noul = match resp1.answers.get("results") {
+            Some(Answer::Noul { noul }) => *noul,
+            Some(_) => return Err(DeciderError::UnexpectedAnswerType("results".to_string())),
+            None => 0.0,
+        };
+
         let action_kind = ActionKind::from_choice(&kind_choice)
             .ok_or_else(|| DeciderError::UnknownActionKind(kind_choice.clone()))?;
 
@@ -227,12 +328,15 @@ impl<B: DecisionBackend> VisionDecider<B> {
             if tgt == NOTHING_TO_CLICK {
                 return Ok(Decision {
                     kind: ActionKind::Wait,
+                    kind_confidence: kind_conf,
                     target: Some(tgt),
                     click_point_screen_pt: None,
                     bbox: None,
+                    box_confidence: None,
                     confidence: kind_conf,
                     reasked: false,
                     text_to_type: None,
+                    results_noul,
                 });
             }
 
@@ -251,33 +355,44 @@ impl<B: DecisionBackend> VisionDecider<B> {
             }
 
             let pt = map_box_center_to_screen_pt(&bbox, img);
+            let fill_text = self.type_values.get(&tgt).cloned();
             return Ok(Decision {
                 kind: ActionKind::Click,
+                kind_confidence: kind_conf,
                 target: Some(tgt),
                 click_point_screen_pt: Some(pt),
                 bbox: Some(bbox),
+                box_confidence: Some(box_conf),
                 confidence: box_conf,
                 reasked,
-                text_to_type: None,
+                text_to_type: fill_text,
+                results_noul,
             });
         }
 
         let text_to_type = if action_kind == ActionKind::Type {
-            target_choice
-                .as_ref()
+            active_fill_target
                 .and_then(|t| self.type_values.get(t).cloned())
+                .or_else(|| {
+                    target_choice
+                        .as_ref()
+                        .and_then(|t| self.type_values.get(t).cloned())
+                })
         } else {
             None
         };
 
         Ok(Decision {
             kind: action_kind,
+            kind_confidence: kind_conf,
             target: target_choice,
             click_point_screen_pt: None,
             bbox: None,
+            box_confidence: None,
             confidence: kind_conf,
             reasked: false,
             text_to_type,
+            results_noul,
         })
     }
 
@@ -300,7 +415,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
             images: vec![img.data_url.clone()],
             questions,
         };
-        let resp = self.backend.ask(&req)?;
+        let resp = self.ask_backend(&req)?;
         match resp.answers.get("target_box") {
             Some(Answer::Box { bbox, confidence }) => Ok((*bbox, *confidence)),
             Some(_) => Err(DeciderError::UnexpectedAnswerType("target_box".to_string())),

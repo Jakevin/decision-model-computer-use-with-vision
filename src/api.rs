@@ -3,6 +3,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -73,6 +74,9 @@ pub enum Question {
     Box {
         instructions: String,
     },
+    Noul {
+        instructions: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -124,6 +128,9 @@ pub enum Answer {
         bbox: BoundingBox,
         confidence: f64,
     },
+    Noul {
+        noul: f64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -156,6 +163,9 @@ pub struct ErrorDetail {
 
 pub trait DecisionBackend {
     fn ask(&self, req: &Request) -> Result<Response, ApiError>;
+    fn requests_sent(&self) -> usize {
+        0
+    }
 }
 
 pub struct DecisionClient {
@@ -163,6 +173,7 @@ pub struct DecisionClient {
     endpoint: String,
     http: Client,
     max_retries: usize,
+    requests_sent: AtomicUsize,
 }
 
 impl fmt::Debug for DecisionClient {
@@ -171,6 +182,7 @@ impl fmt::Debug for DecisionClient {
             .field("api_key", &self.api_key)
             .field("endpoint", &self.endpoint)
             .field("max_retries", &self.max_retries)
+            .field("requests_sent", &self.requests_sent.load(Ordering::SeqCst))
             .finish()
     }
 }
@@ -191,11 +203,16 @@ impl DecisionClient {
             endpoint: endpoint.into(),
             http,
             max_retries: 2,
+            requests_sent: AtomicUsize::new(0),
         })
     }
 
     pub fn api_key(&self) -> &ApiKey {
         &self.api_key
+    }
+
+    pub fn requests_sent(&self) -> usize {
+        self.requests_sent.load(Ordering::SeqCst)
     }
 }
 
@@ -238,6 +255,7 @@ impl DecisionBackend for DecisionClient {
 
         let mut attempt = 0usize;
         loop {
+            self.requests_sent.fetch_add(1, Ordering::SeqCst);
             let resp_res = self
                 .http
                 .post(&self.endpoint)
@@ -299,6 +317,10 @@ impl DecisionBackend for DecisionClient {
                 details: sanitize_secret(&body_text, secret),
             });
         }
+    }
+
+    fn requests_sent(&self) -> usize {
+        self.requests_sent.load(Ordering::SeqCst)
     }
 }
 

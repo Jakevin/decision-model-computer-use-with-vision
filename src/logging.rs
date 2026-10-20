@@ -21,7 +21,9 @@ pub fn redact(input: &str, current_key: Option<&ApiKey>) -> String {
 }
 
 pub struct RunLogger {
+    run_dir: PathBuf,
     path: PathBuf,
+    summary_path: PathBuf,
     file: File,
     api_key: Option<ApiKey>,
 }
@@ -32,22 +34,34 @@ impl RunLogger {
     }
 
     pub fn new_in_dir(dir: &Path, api_key: Option<ApiKey>) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let path = dir.join(format!("run-{}.jsonl", ts));
+        let run_dir = dir.join(format!("{}", ts));
+        fs::create_dir_all(&run_dir)?;
+        let path = run_dir.join("steps.jsonl");
+        let summary_path = run_dir.join("summary.json");
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
+            run_dir,
             path,
+            summary_path,
             file,
             api_key,
         })
     }
 
+    pub fn run_dir(&self) -> &Path {
+        &self.run_dir
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn summary_path(&self) -> &Path {
+        &self.summary_path
     }
 
     pub fn log_entry<T: Serialize>(&mut self, entry: &T) -> io::Result<String> {
@@ -56,6 +70,14 @@ impl RunLogger {
         let clean = redact(&raw, self.api_key.as_ref());
         writeln!(self.file, "{}", clean)?;
         self.file.flush()?;
+        Ok(clean)
+    }
+
+    pub fn write_summary<T: Serialize>(&self, summary: &T) -> io::Result<String> {
+        let raw = serde_json::to_string_pretty(summary)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let clean = redact(&raw, self.api_key.as_ref());
+        fs::write(&self.summary_path, format!("{}\n", clean))?;
         Ok(clean)
     }
 }

@@ -1,16 +1,25 @@
 use crate::api::DecisionBackend;
-use crate::capture::{CaptureError, Screen};
+use crate::browser::{Browser, DefaultAllowedBrowser};
+use crate::capture::{CaptureError, Rect, Screen};
 use crate::decider::{ActionKind, DeciderError, Decision, VisionDecider};
-use crate::input::{Input, InputError};
+use crate::input::{Input, InputError, KeyCode};
 use crate::logging::RunLogger;
-use crate::privacy::{prepare_image, AuditLog, PrivacyError};
+use crate::privacy::{prepare_image, AuditLog, PreparedImage, PrivacyError};
 use crate::safety::{SafetyError, SafetyPolicy};
 use serde::{Deserialize, Serialize};
+use std::thread;
+use std::time::{Duration, Instant};
 use thiserror::Error;
+
+pub const RESULTS_DONE_CONSECUTIVE_THRESHOLD: f64 = 0.8;
+pub const RESULTS_DONE_CONSECUTIVE_COUNT: usize = 2;
+pub const RESULTS_MODEL_DONE_THRESHOLD: f64 = 0.5;
+pub const MAX_TAB_EVENTS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopReason {
     Done,
+    ResultsPageWithPrices,
     StepLimitReached(usize),
     NoCrop,
     SafetyBlocked(String),
@@ -31,11 +40,54 @@ pub enum AgentError {
     Input(#[from] InputError),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CropBoxPx {
+    pub top: u32,
+    pub left: u32,
+    pub bottom: u32,
+    pub right: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StepRecord {
     pub step: usize,
+    pub url: Option<String>,
+    pub kind: String,
+    pub kind_confidence: f64,
+    pub target: Option<String>,
+    pub box_crop_px: Option<CropBoxPx>,
+    pub box_confidence: Option<f64>,
+    pub reasked: bool,
+    pub click_point: Option<(f64, f64)>,
+    pub seconds: f64,
+    pub results_noul: f64,
+    pub sent_image_crop_rect: Rect,
+    pub sent_size: (u32, u32),
+    pub full_screen_size: (u32, u32),
     pub decision: Decision,
     pub executed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabEventRecord {
+    pub event: String,
+    pub step: usize,
+    pub url: Option<String>,
+    pub restored_to: Option<String>,
+    pub tab_events: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunSummaryJson {
+    pub status: String,
+    pub reason: String,
+    pub steps: usize,
+    pub clicks: usize,
+    pub requests_sent: usize,
+    pub images_sent: usize,
+    pub avg_seconds_per_step: f64,
+    pub all_images_cropped: bool,
+    pub tab_events: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,29 +95,108 @@ pub struct AgentRunSummary {
     pub steps_taken: usize,
     pub stop_reason: StopReason,
     pub history: Vec<String>,
+    pub clicks: usize,
+    pub requests_sent: usize,
+    pub images_sent: usize,
+    pub avg_seconds_per_step: f64,
+    pub all_images_cropped: bool,
+    pub tab_events: usize,
 }
 
-pub struct Agent<S: Screen, B: DecisionBackend, I: Input> {
+impl AgentRunSummary {
+    pub fn to_summary_json(&self) -> RunSummaryJson {
+        let (status, reason) = match &self.stop_reason {
+            StopReason::Done => (
+                "done".to_string(),
+                "Task completed ('done' returned by model)".to_string(),
+            ),
+            StopReason::ResultsPageWithPrices => (
+                "done".to_string(),
+                "results page with prices".to_string(),
+            ),
+            StopReason::StepLimitReached(n) => (
+                "step_limit".to_string(),
+                format!("Reached maximum step limit ({})", n),
+            ),
+            StopReason::MaxWaitsExceeded => (
+                "wait_limit".to_string(),
+                "Exceeded maximum consecutive wait actions".to_string(),
+            ),
+            StopReason::NoCrop => (
+                "blocked".to_string(),
+                "No active Google Chrome window crop available; nothing sent".to_string(),
+            ),
+            StopReason::SafetyBlocked(msg) => ("blocked".to_string(), msg.clone()),
+        };
+
+        RunSummaryJson {
+            status,
+            reason,
+            steps: self.steps_taken,
+            clicks: self.clicks,
+            requests_sent: self.requests_sent,
+            images_sent: self.images_sent,
+            avg_seconds_per_step: self.avg_seconds_per_step,
+            all_images_cropped: self.all_images_cropped,
+            tab_events: self.tab_events,
+        }
+    }
+}
+
+pub struct Agent<S: Screen, B: DecisionBackend, I: Input, Br: Browser = DefaultAllowedBrowser> {
     screen: S,
     decider: VisionDecider<B>,
     input: I,
     policy: SafetyPolicy,
+    browser: Br,
+    start_url: Option<String>,
+    start_url_wait: Duration,
     audit_log: AuditLog,
     logger: Option<RunLogger>,
     dry_run: bool,
 }
 
-impl<S: Screen, B: DecisionBackend, I: Input> Agent<S, B, I> {
+impl<S: Screen, B: DecisionBackend, I: Input> Agent<S, B, I, DefaultAllowedBrowser> {
     pub fn new(screen: S, decider: VisionDecider<B>, input: I, policy: SafetyPolicy) -> Self {
         Self {
             screen,
             decider,
             input,
             policy,
+            browser: DefaultAllowedBrowser::default(),
+            start_url: None,
+            start_url_wait: Duration::from_secs(3),
             audit_log: AuditLog::new(),
             logger: None,
             dry_run: false,
         }
+    }
+}
+
+impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
+    pub fn with_browser<Br2: Browser>(self, browser: Br2) -> Agent<S, B, I, Br2> {
+        Agent {
+            screen: self.screen,
+            decider: self.decider,
+            input: self.input,
+            policy: self.policy,
+            browser,
+            start_url: self.start_url,
+            start_url_wait: self.start_url_wait,
+            audit_log: self.audit_log,
+            logger: self.logger,
+            dry_run: self.dry_run,
+        }
+    }
+
+    pub fn with_start_url(mut self, start_url: Option<String>) -> Self {
+        self.start_url = start_url;
+        self
+    }
+
+    pub fn with_start_url_wait(mut self, wait: Duration) -> Self {
+        self.start_url_wait = wait;
+        self
     }
 
     pub fn with_logger(mut self, logger: RunLogger) -> Self {
@@ -86,28 +217,92 @@ impl<S: Screen, B: DecisionBackend, I: Input> Agent<S, B, I> {
         &self.policy
     }
 
+    pub fn input(&self) -> &I {
+        &self.input
+    }
+
+    pub fn browser(&self) -> &Br {
+        &self.browser
+    }
+
+    pub fn decider(&self) -> &VisionDecider<B> {
+        &self.decider
+    }
+
     pub fn run(&mut self, goal: &str) -> Result<AgentRunSummary, AgentError> {
         let mut history: Vec<String> = Vec::new();
         let max_steps = self.policy.max_steps;
 
+        let mut clicks = 0usize;
+        let mut tab_events = 0usize;
+        let mut total_step_secs = 0.0f64;
+        let mut steps_completed = 0usize;
+        let mut all_images_cropped = true;
+        let mut consecutive_results_high = 0usize;
+
+        if let Some(ref url) = self.start_url {
+            let _ = self.browser.activate_chrome();
+            let _ = self.browser.set_active_tab_url(url);
+            if !self.start_url_wait.is_zero() {
+                thread::sleep(self.start_url_wait);
+            }
+        }
+
+        let mut stop_reason = StopReason::StepLimitReached(max_steps);
+
         for step in 0..max_steps {
+            let step_start = Instant::now();
+
+            // Read active tab URL before capture
+            let current_url = self.browser.active_tab_url();
+            let url_allowed = current_url
+                .as_deref()
+                .map(|u| self.policy.check_url(u).is_ok())
+                .unwrap_or(false);
+
+            if !url_allowed {
+                tab_events += 1;
+                if let Some(ref start_url) = self.start_url {
+                    let _ = self.browser.set_active_tab_url(start_url);
+                }
+                if let Some(ref mut logger) = self.logger {
+                    let evt = TabEventRecord {
+                        event: "tab_event".to_string(),
+                        step,
+                        url: current_url.clone(),
+                        restored_to: self.start_url.clone(),
+                        tab_events,
+                    };
+                    let _ = logger.log_entry(&evt);
+                }
+                if tab_events > MAX_TAB_EVENTS {
+                    stop_reason = StopReason::SafetyBlocked(format!(
+                        "Tab URL off allowed prefix more than {} times (last URL: {:?})",
+                        MAX_TAB_EVENTS, current_url
+                    ));
+                    break;
+                }
+                continue;
+            }
+
             let full = self.screen.capture()?;
+            let full_screen_size = (full.width(), full.height());
             let win_rect = self.screen.chrome_window_rect();
             let scale = self.screen.scale_factor();
 
             let prepared = match prepare_image(&full, win_rect, scale) {
                 Ok(p) => p,
                 Err(PrivacyError::NoCrop) => {
-                    return Ok(AgentRunSummary {
-                        steps_taken: step,
-                        stop_reason: StopReason::NoCrop,
-                        history,
-                    });
+                    stop_reason = StopReason::NoCrop;
+                    break;
                 }
                 Err(e) => return Err(AgentError::Privacy(e)),
             };
 
             let win_rect = win_rect.expect("prepare_image succeeded so win_rect is Some");
+            let is_this_cropped = prepared.crop_size_px.0 > 0 && prepared.crop_size_px.1 > 0;
+            all_images_cropped = all_images_cropped && is_this_cropped;
+
             self.audit_log
                 .record(&prepared, format!("step_{}_decision", step));
 
@@ -119,41 +314,137 @@ impl<S: Screen, B: DecisionBackend, I: Input> Agent<S, B, I> {
                 }
             }
 
+            if decision.results_noul >= RESULTS_DONE_CONSECUTIVE_THRESHOLD {
+                consecutive_results_high += 1;
+            } else {
+                consecutive_results_high = 0;
+            }
+
+            if consecutive_results_high >= RESULTS_DONE_CONSECUTIVE_COUNT {
+                let elapsed = step_start.elapsed().as_secs_f64();
+                total_step_secs += elapsed;
+                steps_completed += 1;
+                history.push("results page with prices".to_string());
+                self.log_step(
+                    step,
+                    current_url,
+                    &decision,
+                    true,
+                    elapsed,
+                    win_rect,
+                    &prepared,
+                    full_screen_size,
+                );
+                stop_reason = StopReason::ResultsPageWithPrices;
+                break;
+            }
+
             let mut executed = false;
 
             match decision.kind {
                 ActionKind::Done => {
-                    history.push("done".to_string());
-                    self.log_step(step, &decision, true);
-                    return Ok(AgentRunSummary {
-                        steps_taken: step + 1,
-                        stop_reason: StopReason::Done,
-                        history,
-                    });
+                    if decision.results_noul >= RESULTS_MODEL_DONE_THRESHOLD {
+                        let elapsed = step_start.elapsed().as_secs_f64();
+                        total_step_secs += elapsed;
+                        steps_completed += 1;
+                        history.push("done".to_string());
+                        self.log_step(
+                            step,
+                            current_url,
+                            &decision,
+                            true,
+                            elapsed,
+                            win_rect,
+                            &prepared,
+                            full_screen_size,
+                        );
+                        stop_reason = StopReason::Done;
+                        break;
+                    } else {
+                        // Only accept model "done" when results noul >= 0.5; otherwise treat as wait
+                        history.push("wait".to_string());
+                        let elapsed = step_start.elapsed().as_secs_f64();
+                        total_step_secs += elapsed;
+                        steps_completed += 1;
+                        self.log_step(
+                            step,
+                            current_url,
+                            &decision,
+                            false,
+                            elapsed,
+                            win_rect,
+                            &prepared,
+                            full_screen_size,
+                        );
+                        if self.policy.on_wait().is_err() {
+                            stop_reason = StopReason::MaxWaitsExceeded;
+                            break;
+                        }
+                    }
                 }
                 ActionKind::Wait => {
                     history.push("wait".to_string());
-                    self.log_step(step, &decision, true);
+                    let elapsed = step_start.elapsed().as_secs_f64();
+                    total_step_secs += elapsed;
+                    steps_completed += 1;
+                    self.log_step(
+                        step,
+                        current_url,
+                        &decision,
+                        true,
+                        elapsed,
+                        win_rect,
+                        &prepared,
+                        full_screen_size,
+                    );
                     if self.policy.on_wait().is_err() {
-                        return Ok(AgentRunSummary {
-                            steps_taken: step + 1,
-                            stop_reason: StopReason::MaxWaitsExceeded,
-                            history,
-                        });
+                        stop_reason = StopReason::MaxWaitsExceeded;
+                        break;
                     }
                 }
                 ActionKind::Click => {
                     self.policy.reset_wait();
                     if let Some(pt) = decision.click_point_screen_pt {
                         self.policy.check_click(pt, win_rect)?;
+                        let tgt = decision.target.as_deref().unwrap_or("unknown");
+                        let fill_val = self.decider.fill_for(tgt).map(|s| s.to_string());
+
+                        if let Some(ref val) = fill_val {
+                            if is_sensitive_text(val) {
+                                return Err(AgentError::Safety(SafetyError::SensitiveTextBlocked));
+                            }
+                        }
+
                         if !self.dry_run {
                             self.input.click(pt.0, pt.1)?;
                             executed = true;
                         }
-                        let tgt = decision.target.as_deref().unwrap_or("unknown");
-                        history.push(format!("click '{}' at ({:.1}, {:.1})", tgt, pt.0, pt.1));
+                        clicks += 1;
+
+                        if let Some(val) = fill_val {
+                            if !self.dry_run {
+                                self.input.select_all()?;
+                                self.input.type_text(&val)?;
+                                self.input.release_modifiers()?;
+                            }
+                            history.push(format!("clicked and typed '{}' into {}", val, tgt));
+                        } else {
+                            history.push(format!("click '{}' at ({:.1}, {:.1})", tgt, pt.0, pt.1));
+                        }
                     }
-                    self.log_step(step, &decision, executed);
+                    let elapsed = step_start.elapsed().as_secs_f64();
+                    total_step_secs += elapsed;
+                    steps_completed += 1;
+                    self.log_step(
+                        step,
+                        current_url,
+                        &decision,
+                        executed,
+                        elapsed,
+                        win_rect,
+                        &prepared,
+                        full_screen_size,
+                    );
                 }
                 ActionKind::Type => {
                     self.policy.reset_wait();
@@ -166,11 +457,46 @@ impl<S: Screen, B: DecisionBackend, I: Input> Agent<S, B, I> {
                     }
                     if !self.dry_run && !text.is_empty() {
                         self.input.type_text(text)?;
+                        self.input.release_modifiers()?;
                         executed = true;
                     }
                     let tgt = decision.target.as_deref().unwrap_or("field");
                     history.push(format!("type into '{}'", tgt));
-                    self.log_step(step, &decision, executed);
+                    let elapsed = step_start.elapsed().as_secs_f64();
+                    total_step_secs += elapsed;
+                    steps_completed += 1;
+                    self.log_step(
+                        step,
+                        current_url,
+                        &decision,
+                        executed,
+                        elapsed,
+                        win_rect,
+                        &prepared,
+                        full_screen_size,
+                    );
+                }
+                ActionKind::PressEnter => {
+                    self.policy.reset_wait();
+                    if !self.dry_run {
+                        self.input.key(KeyCode::Return)?;
+                        self.input.release_modifiers()?;
+                        executed = true;
+                    }
+                    history.push("press enter".to_string());
+                    let elapsed = step_start.elapsed().as_secs_f64();
+                    total_step_secs += elapsed;
+                    steps_completed += 1;
+                    self.log_step(
+                        step,
+                        current_url,
+                        &decision,
+                        executed,
+                        elapsed,
+                        win_rect,
+                        &prepared,
+                        full_screen_size,
+                    );
                 }
                 ActionKind::Scroll => {
                     self.policy.reset_wait();
@@ -179,22 +505,86 @@ impl<S: Screen, B: DecisionBackend, I: Input> Agent<S, B, I> {
                         executed = true;
                     }
                     history.push("scroll down".to_string());
-                    self.log_step(step, &decision, executed);
+                    let elapsed = step_start.elapsed().as_secs_f64();
+                    total_step_secs += elapsed;
+                    steps_completed += 1;
+                    self.log_step(
+                        step,
+                        current_url,
+                        &decision,
+                        executed,
+                        elapsed,
+                        win_rect,
+                        &prepared,
+                        full_screen_size,
+                    );
                 }
             }
         }
 
-        Ok(AgentRunSummary {
-            steps_taken: max_steps,
-            stop_reason: StopReason::StepLimitReached(max_steps),
+        let avg_seconds_per_step = if steps_completed > 0 {
+            total_step_secs / (steps_completed as f64)
+        } else {
+            0.0
+        };
+
+        let summary = AgentRunSummary {
+            steps_taken: steps_completed,
+            stop_reason,
             history,
-        })
+            clicks,
+            requests_sent: self.decider.requests_sent(),
+            images_sent: self.decider.images_sent(),
+            avg_seconds_per_step,
+            all_images_cropped,
+            tab_events,
+        };
+
+        if let Some(ref logger) = self.logger {
+            let summary_json = summary.to_summary_json();
+            let _ = logger.write_summary(&summary_json);
+        }
+
+        Ok(summary)
     }
 
-    fn log_step(&mut self, step: usize, decision: &Decision, executed: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn log_step(
+        &mut self,
+        step: usize,
+        url: Option<String>,
+        decision: &Decision,
+        executed: bool,
+        seconds: f64,
+        sent_image_crop_rect: Rect,
+        prepared: &PreparedImage,
+        full_screen_size: (u32, u32),
+    ) {
         if let Some(ref mut logger) = self.logger {
+            let box_crop_px = decision.bbox.map(|b| {
+                let (cw, ch) = prepared.crop_size_px;
+                CropBoxPx {
+                    top: (b.top * (ch as f64)).round().max(0.0) as u32,
+                    left: (b.left * (cw as f64)).round().max(0.0) as u32,
+                    bottom: (b.bottom * (ch as f64)).round().max(0.0) as u32,
+                    right: (b.right * (cw as f64)).round().max(0.0) as u32,
+                }
+            });
             let rec = StepRecord {
                 step,
+                url,
+                kind: decision.kind.as_str().to_string(),
+                kind_confidence: decision.kind_confidence,
+                target: decision.target.clone(),
+                box_crop_px,
+                box_confidence: decision.box_confidence,
+                reasked: decision.reasked,
+                click_point: decision.click_point_screen_pt,
+                seconds,
+                results_noul: decision.results_noul,
+                sent_image_crop_rect,
+                sent_size: prepared.sent_size_px,
+                full_screen_size,
                 decision: decision.clone(),
                 executed,
             };
