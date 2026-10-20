@@ -75,9 +75,12 @@ impl DecisionBackend for MockBackend {
 #[derive(Default)]
 struct MockInput {
     clicks: Vec<(f64, f64)>,
+    focus_clicks: Vec<(f64, f64)>,
+    moved_to: Vec<(f64, f64)>,
     typed: Vec<String>,
     keys: Vec<KeyCode>,
     scrolls: Vec<i32>,
+    scrolls_at: Vec<(f64, f64, i32)>,
     modifier_releases: usize,
     select_alls: usize,
 }
@@ -86,6 +89,25 @@ impl Input for MockInput {
     fn click(&mut self, x: f64, y: f64) -> Result<(), InputError> {
         self.release_modifiers()?;
         self.clicks.push((x, y));
+        self.release_modifiers()
+    }
+
+    fn focus_click(&mut self, x: f64, y: f64) -> Result<(), InputError> {
+        self.release_modifiers()?;
+        self.focus_clicks.push((x, y));
+        self.release_modifiers()
+    }
+
+    fn move_mouse(&mut self, x: f64, y: f64) -> Result<(), InputError> {
+        self.moved_to.push((x, y));
+        Ok(())
+    }
+
+    fn scroll_vertical_at(&mut self, x: f64, y: f64, amount: i32) -> Result<(), InputError> {
+        self.release_modifiers()?;
+        self.moved_to.push((x, y));
+        self.scrolls.push(amount);
+        self.scrolls_at.push((x, y, amount));
         self.release_modifiers()
     }
 
@@ -1591,16 +1613,16 @@ fn dismiss_popup_refused_when_closeish_low_and_clicked_when_high() {
         make_choice_response_with_results_and_popup("scroll", "nothing to click", 0.1, 0.85),
         // Step 1 (2 reqs): closeish = 0.3 < 0.6 -> refused
         make_choice_response_with_results_and_popup("dismiss popup", "nothing to click", 0.2, 0.80),
-        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.95, 0.3),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.95, 0.3),
         // Step 2 (2 reqs): popup_present = 0.40 < 0.6 (even though closeish = 0.9) -> refused
         make_choice_response_with_results_and_popup("dismiss popup", "nothing to click", 0.2, 0.40),
-        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.95, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.95, 0.9),
         // Step 3 (2 reqs): prev popup_present = 0.40 < 0.6, so click "events menu", popup_present = 0.90
         make_choice_response_with_results_and_popup("click", "events menu", 0.2, 0.90),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.05),
         // Step 4 (2 reqs): prev popup_present = 0.90 >= 0.6, this step popup_present = 0.92 >= 0.6, closeish = 0.9 >= 0.6 -> executed!
         make_choice_response_with_results_and_popup("dismiss popup", "nothing to click", 0.2, 0.92),
-        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.95, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.95, 0.9),
         // Step 5 (1 req)
         make_choice_response_with_results_and_popup("done", "nothing to click", 0.7, 0.1),
     ]);
@@ -1716,10 +1738,13 @@ fn low_box_conf_after_reask_does_not_click_logs_and_excludes_for_two_steps() {
         make_choice_response_with_results("click", "events menu", 0.1),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.12, 0.05),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.15, 0.05),
-        // Step 1 (3 requests: choice + box + re-ask box)
+        // Step 1 (6 requests: choice + box + 2 specific re-asks + 2 corner crop asks)
         make_choice_response_with_results("dismiss popup", "nothing to click", 0.1),
-        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.10, 0.9),
-        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.18, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.10, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.12, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.14, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.16, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.18, 0.9),
         // Step 2 (2 requests: choice + box)
         make_choice_response_with_results("click", "upcoming event card", 0.1),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.05),
@@ -1775,32 +1800,32 @@ fn low_box_conf_after_reask_does_not_click_logs_and_excludes_for_two_steps() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 
     let reqs = agent.decider().backend().requests.borrow();
-    // Step 1 choice request is reqs[3]: "events menu" must be excluded (1st of 2 excluded steps)
+    // Step 1 choice request is reqs[3]: "events menu" must be excluded
     match reqs[3].questions.get("target").unwrap() {
         Question::Choice { criteria, .. } => {
             assert!(!criteria.contains_key("events menu"));
         }
         _ => panic!("Expected target choice question"),
     }
-    // Step 2 choice request is reqs[6]: both "events menu" (2nd of 2 steps) and "popup close" (1st of 2 steps) excluded,
+    // Step 2 choice request is reqs[9]: both "events menu" and "popup close" excluded,
     // and "wait" is omitted from kind criteria because steps 0 and 1 were wait-like non-actions!
-    match reqs[6].questions.get("target").unwrap() {
+    match reqs[9].questions.get("target").unwrap() {
         Question::Choice { criteria, .. } => {
             assert!(!criteria.contains_key("events menu"));
             assert!(!criteria.contains_key("popup close"));
         }
         _ => panic!("Expected target choice question"),
     }
-    match reqs[6].questions.get("kind").unwrap() {
+    match reqs[9].questions.get("kind").unwrap() {
         Question::Choice { criteria, .. } => {
             assert!(!criteria.contains_key("wait"));
         }
         _ => panic!("Expected kind choice question"),
     }
-    // Step 3 choice request is reqs[8]: "events menu" is back after 2 steps, "popup close" still excluded (2nd of 2 steps)
-    match reqs[8].questions.get("target").unwrap() {
+    // Step 3 choice request is reqs[11]: both "events menu" and "popup close" remain excluded for the rest of the run
+    match reqs[11].questions.get("target").unwrap() {
         Question::Choice { criteria, .. } => {
-            assert!(criteria.contains_key("events menu"));
+            assert!(!criteria.contains_key("events menu"));
             assert!(!criteria.contains_key("popup close"));
         }
         _ => panic!("Expected target choice question"),
@@ -1826,7 +1851,7 @@ fn summary_on_error_reports_done_condition_and_requests_sent_and_blocked_steps_h
     // Step 1: click "checkout button" again -> blocked by checkout_once (executed = false)
     // Step 2: click "events menu" -> blocked by sensitive_noul = 0.8 (executed = false)
     // Step 3: dismiss popup -> blocked by closeish_noul = 0.2 (executed = false)
-    // Step 4: click "tickets link", box response fails (no more mock responses -> Transport error after 9 requests sent!)
+    // Step 4: click "tickets link", box response fails (no more mock responses -> Transport error after 10 requests sent!)
     let backend = MockBackend::new(vec![
         // Step 0 (2 reqs)
         make_choice_response_with_results("click", "checkout button", 0.1),
@@ -1839,7 +1864,7 @@ fn summary_on_error_reports_done_condition_and_requests_sent_and_blocked_steps_h
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.80),
         // Step 3 (2 reqs)
         make_choice_response_with_results("dismiss popup", "nothing to click", 0.1),
-        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.95, 0.20),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.95, 0.20),
         // Step 4 (1st req succeeds, 2nd req fails with Transport error)
         make_choice_response_with_results("click", "tickets link", 0.1),
     ]);
@@ -2133,7 +2158,7 @@ fn events_zh_preset_parsing_done_noul_checkout_once_popup_close_and_forbidden_wo
         make_choice_response_with_results_and_popup("click", "下一步按鈕", 0.3, 0.9),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.05),
         make_choice_response_with_results_and_popup("dismiss popup", "nothing to click", 0.3, 0.9),
-        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.95, 0.95),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.95, 0.95),
         make_choice_response_with_results_and_popup("done", "nothing to click", 0.7, 0.1),
     ]);
 
@@ -2296,8 +2321,14 @@ fn acc2_fixes_low_conf_exclusion_noop_cap_scroll_target_and_popup_target_gate() 
         Some("low_box_conf:活動卡片".to_string()),
         None,
         None,
+        None,
+        None,
+        None,
     ];
-    assert!(compute_excluded_targets(&step_events_3).is_empty());
+    assert_eq!(
+        compute_excluded_targets(&step_events_3),
+        vec!["活動卡片".to_string()]
+    );
 
     let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
     let window = Rect {
@@ -2431,10 +2462,10 @@ fn acc2_fixes_low_conf_exclusion_noop_cap_scroll_target_and_popup_target_gate() 
         }
         _ => panic!("Expected target choice question"),
     }
-    // Step 3 choice request (reqs[5]): "活動卡片" is back after 2 excluded steps, "關閉彈窗" NOT offered (step 2 popup_present = 0.1 < 0.6)
+    // Step 3 choice request (reqs[5]): "活動卡片" remains excluded for the rest of the run, "關閉彈窗" NOT offered (step 2 popup_present = 0.1 < 0.6)
     match reqs[5].questions.get("target").unwrap() {
         Question::Choice { criteria, .. } => {
-            assert!(criteria.contains_key("活動卡片"));
+            assert!(!criteria.contains_key("活動卡片"));
             assert!(!criteria.contains_key("關閉彈窗"));
         }
         _ => panic!("Expected target choice question"),
@@ -2454,6 +2485,308 @@ fn acc2_fixes_low_conf_exclusion_noop_cap_scroll_target_and_popup_target_gate() 
         }
         _ => panic!("Expected target choice question"),
     }
+}
+
+struct SequenceScreen {
+    images: RefCell<VecDeque<RgbaImage>>,
+    last_img: RgbaImage,
+    rect: Option<Rect>,
+    scale: f64,
+}
+
+impl SequenceScreen {
+    fn new(images: Vec<RgbaImage>, rect: Option<Rect>, scale: f64) -> Self {
+        let last_img = images
+            .last()
+            .cloned()
+            .unwrap_or_else(|| RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255])));
+        Self {
+            images: RefCell::new(VecDeque::from(images)),
+            last_img,
+            rect,
+            scale,
+        }
+    }
+}
+
+impl Screen for SequenceScreen {
+    fn capture(&self) -> Result<RgbaImage, CaptureError> {
+        Ok(self
+            .images
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| self.last_img.clone()))
+    }
+
+    fn chrome_window_rect(&self) -> Option<Rect> {
+        self.rect
+    }
+
+    fn scale_factor(&self) -> f64 {
+        self.scale
+    }
+}
+
+fn make_changed_img(patch_color: [u8; 4]) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    for y in 200..400 {
+        for x in 200..500 {
+            img.put_pixel(x, y, Rgba(patch_color));
+        }
+    }
+    img
+}
+
+#[test]
+fn f5_scroll_location_and_pagedown_fallback() {
+    use decision_cu::input::DEFAULT_SCROLL_DELTA_PX;
+
+    let base_img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let scrolled_img = make_changed_img([30, 30, 30, 255]);
+    let window = Rect {
+        x: 100.0,
+        y: 50.0,
+        width: 800.0,
+        height: 600.0,
+    };
+
+    let screen = SequenceScreen::new(
+        vec![
+            base_img.clone(),     // Step 0 initial capture
+            scrolled_img.clone(), // Step 0 after wheel scroll (changed!)
+            scrolled_img.clone(), // Step 1 initial capture
+            scrolled_img.clone(), // Step 1 after wheel scroll (unchanged -> triggers PageDown fallback!)
+            base_img.clone(),     // Step 1 after PageDown (changed!)
+            base_img.clone(),     // Step 2 initial capture
+        ],
+        Some(window),
+        2.0,
+    );
+
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results("scroll", "nothing to click", 0.1),
+        make_choice_response_with_results("scroll", "nothing to click", 0.2),
+        make_choice_response_with_results("done", "nothing to click", 0.8),
+    ]);
+    let decider = VisionDecider::new(backend, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage);
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_f5_scroll");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_flights_preset(false)
+        .with_start_url(Some("https://www.accupass.com".to_string()))
+        .with_logger(logger);
+
+    let summary = agent.run("Scroll Accupass homepage").unwrap();
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.steps_taken, 3);
+
+    assert_eq!(
+        agent.input().scrolls_at,
+        vec![
+            (500.0, 390.0, DEFAULT_SCROLL_DELTA_PX),
+            (500.0, 390.0, DEFAULT_SCROLL_DELTA_PX),
+        ]
+    );
+    assert_eq!(DEFAULT_SCROLL_DELTA_PX, -400);
+
+    assert_eq!(agent.input().focus_clicks, vec![(112.0, 390.0)]);
+    assert_eq!(agent.input().keys, vec![KeyCode::PageDown]);
+
+    let log_str = std::fs::read_to_string(&steps_path).unwrap();
+    let scroll_events: Vec<serde_json::Value> = log_str
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("scroll"))
+        .collect();
+    assert_eq!(scroll_events.len(), 2);
+    assert_eq!(scroll_events[0]["method"], "wheel");
+    assert_eq!(scroll_events[0]["screen_changed"], true);
+    assert_eq!(scroll_events[1]["method"], "pagedown_fallback");
+    assert_eq!(scroll_events[1]["screen_changed"], true);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn f5_noop_counting_and_stop_on_scroll_dismiss_alternation_and_rest_of_run_exclusion() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+
+    let screen = MockScreen {
+        img: img.clone(),
+        rect: Some(window),
+        scale: 2.0,
+    };
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results_and_popup("scroll", "向下捲動", 0.1, 0.9),
+        make_choice_response_with_results_and_popup("dismiss popup", "關閉彈窗", 0.1, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.05, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.08, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.11, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.12, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.14, 0.9),
+        make_choice_response_with_results_and_popup("scroll", "向下捲動", 0.1, 0.9),
+    ]);
+    let decider = VisionDecider::new(backend, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage);
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_flights_preset(false)
+        .with_start_url(Some("https://www.accupass.com".to_string()));
+
+    let summary = agent.run("Find Accupass event").unwrap();
+    assert_eq!(
+        summary.stop_reason,
+        StopReason::SafetyBlocked("3 consecutive no-op steps (low box confidence)".to_string())
+    );
+    assert_eq!(summary.steps_taken, 3);
+    assert_eq!(summary.to_summary_json().status, "blocked");
+
+    let events_6_steps = vec![
+        Some("low_box_conf:關閉彈窗".to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ];
+    assert!(
+        decision_cu::decider::compute_excluded_targets(&events_6_steps)
+            .contains(&"關閉彈窗".to_string())
+    );
+}
+
+#[test]
+fn f5_popup_escape_then_specific_reask_then_corner_crop_mapping_and_box_width_guard() {
+    use decision_cu::decider::{
+        POPUP_REASK_AD_CLOSE_DESC, POPUP_REASK_COOKIE_DESC,
+    };
+
+    let base_img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let after_esc_img = make_changed_img([50, 180, 90, 255]);
+    let window = Rect {
+        x: 100.0,
+        y: 50.0,
+        width: 800.0,
+        height: 600.0,
+    };
+
+    let screen_esc = SequenceScreen::new(
+        vec![
+            base_img.clone(),
+            after_esc_img.clone(),
+            after_esc_img.clone(),
+            base_img.clone(),
+            base_img.clone(),
+        ],
+        Some(window),
+        2.0,
+    );
+    let backend_esc = MockBackend::new(vec![
+        make_choice_response_with_results_and_popup("scroll", "向下捲動", 0.1, 0.9),
+        make_choice_response_with_results_and_popup("dismiss popup", "關閉彈窗", 0.2, 0.9),
+        make_choice_response_with_results_and_popup("done", "nothing to click", 0.8, 0.1),
+    ]);
+    let decider_esc = VisionDecider::new(backend_esc, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage);
+    let mut agent_esc = Agent::new(
+        screen_esc,
+        decider_esc,
+        MockInput::default(),
+        SafetyPolicy::default(),
+    )
+    .with_flights_preset(false)
+    .with_start_url(Some("https://www.accupass.com".to_string()));
+    let summary_esc = agent_esc.run("Dismiss via Escape").unwrap();
+    assert_eq!(summary_esc.stop_reason, StopReason::Done);
+    assert_eq!(summary_esc.clicks, 0);
+    assert!(agent_esc.input().keys.contains(&KeyCode::Escape));
+    assert_eq!(agent_esc.decider().requests_sent(), 3);
+
+    let screen_crop = SequenceScreen::new(
+        vec![
+            base_img.clone(),
+            after_esc_img.clone(),
+            after_esc_img.clone(),
+            after_esc_img.clone(),
+            base_img.clone(),
+            base_img.clone(),
+            base_img.clone(),
+            base_img.clone(),
+        ],
+        Some(window),
+        2.0,
+    );
+    let backend_crop = MockBackend::new(vec![
+        make_choice_response_with_results_and_popup("scroll", "向下捲動", 0.1, 0.9),
+        make_choice_response_with_results_and_popup("dismiss popup", "關閉彈窗", 0.2, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.10, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.12, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.15, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.18, 0.9),
+        make_box_response_with_closeish(0.6, 0.1, 0.8, 0.2, 0.88, 0.95),
+        make_choice_response_with_results_and_popup("dismiss popup", "關閉彈窗", 0.3, 0.9),
+        make_box_response_with_closeish(0.7, 0.1, 0.9, 0.4, 0.92, 0.95),
+        make_choice_response_with_results_and_popup("done", "nothing to click", 0.85, 0.1),
+    ]);
+    let decider_crop = VisionDecider::new(backend_crop, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage);
+    let mut agent_crop = Agent::new(
+        screen_crop,
+        decider_crop,
+        MockInput::default(),
+        SafetyPolicy::default(),
+    )
+    .with_flights_preset(false)
+    .with_start_url(Some("https://www.accupass.com".to_string()));
+
+    let summary_crop = agent_crop.run("Dismiss via crop and reject wide ad box").unwrap();
+    assert_eq!(summary_crop.stop_reason, StopReason::Done);
+    assert_eq!(summary_crop.clicks, 1);
+    assert_eq!(agent_crop.input().clicks.len(), 1);
+    let (cx, cy) = agent_crop.input().clicks[0];
+    assert!((cx - 160.0).abs() < 1e-6, "expected cx=160.0, got {}", cx);
+    assert!((cy - 560.0).abs() < 1e-6, "expected cy=560.0, got {}", cy);
+
+    let reqs = agent_crop.decider().backend().requests.borrow();
+    match reqs[3].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => assert_eq!(instructions, POPUP_REASK_COOKIE_DESC),
+        _ => panic!("Expected box question"),
+    }
+    match reqs[4].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => assert_eq!(instructions, POPUP_REASK_AD_CLOSE_DESC),
+        _ => panic!("Expected box question"),
+    }
+    match reqs[5].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => assert_eq!(instructions, POPUP_REASK_COOKIE_DESC),
+        _ => panic!("Expected box question"),
+    }
+    match reqs[6].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => assert_eq!(instructions, POPUP_REASK_AD_CLOSE_DESC),
+        _ => panic!("Expected box question"),
+    }
+    let audit_purposes: Vec<&str> = agent_crop
+        .audit_log()
+        .records()
+        .iter()
+        .map(|r| r.purpose.as_str())
+        .collect();
+    assert!(audit_purposes.contains(&"step_1_popup_bottom_right_2x"));
+    assert!(audit_purposes.contains(&"step_1_popup_bottom_left_2x"));
 }
 
 

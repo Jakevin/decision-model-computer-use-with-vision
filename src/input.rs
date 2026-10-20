@@ -9,7 +9,10 @@ pub enum KeyCode {
     Backspace,
     DownArrow,
     UpArrow,
+    PageDown,
 }
+
+pub const DEFAULT_SCROLL_DELTA_PX: i32 = -400;
 
 #[derive(Debug, Error)]
 pub enum InputError {
@@ -22,6 +25,17 @@ pub trait Input {
     fn type_text(&mut self, text: &str) -> Result<(), InputError>;
     fn key(&mut self, key: KeyCode) -> Result<(), InputError>;
     fn scroll_vertical(&mut self, amount: i32) -> Result<(), InputError>;
+    fn move_mouse(&mut self, x: f64, y: f64) -> Result<(), InputError> {
+        let _ = (x, y);
+        Ok(())
+    }
+    fn scroll_vertical_at(&mut self, x: f64, y: f64, amount: i32) -> Result<(), InputError> {
+        self.move_mouse(x, y)?;
+        self.scroll_vertical(amount)
+    }
+    fn focus_click(&mut self, x: f64, y: f64) -> Result<(), InputError> {
+        self.click(x, y)
+    }
     fn release_modifiers(&mut self) -> Result<(), InputError>;
     fn select_all(&mut self) -> Result<(), InputError> {
         self.release_modifiers()?;
@@ -158,6 +172,7 @@ impl Input for QuartzInput {
             KeyCode::Backspace => 51,
             KeyCode::DownArrow => 125,
             KeyCode::UpArrow => 126,
+            KeyCode::PageDown => 121,
         };
 
         let down = CGEvent::new_keyboard_event(source.clone(), code, true)
@@ -174,6 +189,26 @@ impl Input for QuartzInput {
         Ok(())
     }
 
+    fn move_mouse(&mut self, x: f64, y: f64) -> Result<(), InputError> {
+        use core_graphics::event::{
+            CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton,
+        };
+        use core_graphics::geometry::CGPoint;
+
+        let source = Self::event_source()?;
+        let pt = CGPoint::new(x, y);
+        let moved = CGEvent::new_mouse_event(
+            source,
+            CGEventType::MouseMoved,
+            pt,
+            CGMouseButton::Left,
+        )
+        .map_err(|()| InputError::Platform("Failed to create MouseMoved CGEvent".to_string()))?;
+        moved.set_flags(CGEventFlags::CGEventFlagNull);
+        moved.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+
     fn scroll_vertical(&mut self, amount: i32) -> Result<(), InputError> {
         use core_graphics::event::{
             CGEvent, CGEventFlags, CGEventTapLocation, ScrollEventUnit,
@@ -181,8 +216,61 @@ impl Input for QuartzInput {
 
         self.release_modifiers()?;
         let source = Self::event_source()?;
-        let ev = CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 1, amount, 0, 0)
+        let pixel_delta = if amount.abs() <= 20 {
+            amount * 80
+        } else {
+            amount
+        };
+        let ev = CGEvent::new_scroll_event(source, ScrollEventUnit::PIXEL, 1, pixel_delta, 0, 0)
             .map_err(|()| InputError::Platform("Failed to create scroll CGEvent".to_string()))?;
+        ev.set_flags(CGEventFlags::CGEventFlagNull);
+        ev.post(CGEventTapLocation::HID);
+        let _ = self.release_modifiers();
+        Ok(())
+    }
+
+    fn scroll_vertical_at(&mut self, x: f64, y: f64, amount: i32) -> Result<(), InputError> {
+        use core_graphics::event::{
+            CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, ScrollEventUnit,
+        };
+        use core_graphics::geometry::CGPoint;
+        use std::thread;
+        use std::time::Duration;
+
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventSetLocation(
+                event: core_graphics::sys::CGEventRef,
+                location: CGPoint,
+            );
+        }
+
+        self.release_modifiers()?;
+        let source = Self::event_source()?;
+        let pt = CGPoint::new(x, y);
+
+        let moved = CGEvent::new_mouse_event(
+            source.clone(),
+            CGEventType::MouseMoved,
+            pt,
+            CGMouseButton::Left,
+        )
+        .map_err(|()| InputError::Platform("Failed to create MouseMoved CGEvent".to_string()))?;
+        moved.set_flags(CGEventFlags::CGEventFlagNull);
+        moved.post(CGEventTapLocation::HID);
+        thread::sleep(Duration::from_millis(40));
+
+        let pixel_delta = if amount.abs() <= 20 {
+            amount * 80
+        } else {
+            amount
+        };
+        let ev = CGEvent::new_scroll_event(source, ScrollEventUnit::PIXEL, 1, pixel_delta, 0, 0)
+            .map_err(|()| InputError::Platform("Failed to create scroll CGEvent".to_string()))?;
+        unsafe {
+            let ev_ref = *(&ev as *const CGEvent as *const core_graphics::sys::CGEventRef);
+            CGEventSetLocation(ev_ref, pt);
+        }
         ev.set_flags(CGEventFlags::CGEventFlagNull);
         ev.post(CGEventTapLocation::HID);
         let _ = self.release_modifiers();

@@ -1,7 +1,7 @@
 use crate::api::{
     Answer, ApiError, BoundingBox, DecisionBackend, Question, Request, Response, DEFAULT_MODEL,
 };
-use crate::privacy::PreparedImage;
+use crate::privacy::{prepare_corner_zoom_2x, CornerRegion, PreparedImage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,6 +9,10 @@ use thiserror::Error;
 
 pub const NOTHING_TO_CLICK: &str = "nothing to click";
 pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.2;
+pub const MAX_POPUP_BOX_WIDTH_FRAC: f64 = 0.15;
+pub const POPUP_REASK_COOKIE_DESC: &str =
+    "Cookie 橫幅的 接受 或 我知道了 按鈕 或 右上角 ×";
+pub const POPUP_REASK_AD_CLOSE_DESC: &str = "左下角廣告的 × 關閉按鈕";
 pub const RESULTS_QUESTION_INSTRUCTIONS: &str =
     "Does the image show a Google Flights results list with flight prices?";
 pub const CHECKOUT_QUESTION_INSTRUCTIONS: &str =
@@ -18,7 +22,7 @@ pub const CHECKOUT_ZH_QUESTION_INSTRUCTIONS: &str =
 pub const SENSITIVE_QUESTION_INSTRUCTIONS: &str =
     "Is the element at this target a sign-in, payment, place-order/purchase/pay button, or a personal-info input field (name, email, phone, card)?";
 pub const CLOSEISH_QUESTION_INSTRUCTIONS: &str =
-    "Is this button a Close, X, Reject, Decline or No-thanks control (not Accept, Subscribe or Sign up)?";
+    "Is this button a Close, X, Reject, Decline, Accept-cookie or Got-it button only (never a link, ad body, Subscribe or Sign up)?";
 pub const POPUP_PRESENT_QUESTION_INSTRUCTIONS: &str =
     "Is a popup, modal dialog, cookie banner or overlay currently covering part of the page?";
 pub const POPUP_PRESENT_THRESHOLD: f64 = 0.6;
@@ -429,6 +433,21 @@ pub fn map_box_center_to_screen_pt(bbox: &BoundingBox, img: &PreparedImage) -> (
     (screen_x_px / scale, screen_y_px / scale)
 }
 
+pub fn map_corner_box_to_window_box(bbox: &BoundingBox, corner: CornerRegion) -> BoundingBox {
+    let (left_off, top_off, w_scale, h_scale) = corner.offset_and_scale_frac();
+    BoundingBox {
+        top: top_off + bbox.top * h_scale,
+        left: left_off + bbox.left * w_scale,
+        bottom: top_off + bbox.bottom * h_scale,
+        right: left_off + bbox.right * w_scale,
+    }
+}
+
+pub fn is_popup_box_width_ok(bbox: &BoundingBox) -> bool {
+    let width_frac = bbox.right - bbox.left;
+    width_frac >= 0.0 && width_frac <= MAX_POPUP_BOX_WIDTH_FRAC + 1e-9
+}
+
 pub fn extract_clicked_target(history_entry: &str) -> Option<String> {
     if let Some(rest) = history_entry.strip_prefix("click '") {
         let end = rest.find('\'')?;
@@ -475,7 +494,7 @@ pub fn compute_excluded_targets(step_clicks: &[Option<String>]) -> Vec<String> {
             }
         }
     }
-    for entry in step_clicks.iter().rev().take(2).flatten() {
+    for entry in step_clicks.iter().flatten() {
         if let Some(tgt) = extract_low_box_conf_target(entry) {
             if !excluded.contains(&tgt) {
                 excluded.push(tgt);
@@ -701,6 +720,347 @@ impl<B: DecisionBackend> VisionDecider<B> {
         self.decide_with_excluded(goal, history, img, &auto_excluded)
     }
 
+    pub fn decide_with_excluded_defer_popup(
+        &self,
+        goal: &str,
+        history: &[String],
+        img: &PreparedImage,
+        excluded_targets: &[String],
+    ) -> Result<Decision, DeciderError> {
+        let state = format_state(goal, history);
+        let active_fill_target = pending_fill_target(history, &self.type_values);
+        let prev_popup_present = self
+            .last_popup_present
+            .lock()
+            .unwrap()
+            .unwrap_or(0.0);
+
+        let popup_close = self.popup_close_label();
+        let popup_close_excluded = excluded_targets.iter().any(|ex| ex == popup_close);
+
+        let mut kind_criteria = BTreeMap::new();
+        kind_criteria.insert(
+            "click".to_string(),
+            Some("Click an interactive element on the page".to_string()),
+        );
+        if self.allow_dismiss_popup()
+            && prev_popup_present >= POPUP_PRESENT_THRESHOLD
+            && !popup_close_excluded
+        {
+            kind_criteria.insert(
+                "dismiss popup".to_string(),
+                Some("Close a cookie, newsletter or promo popup".to_string()),
+            );
+        }
+        if active_fill_target.is_some() {
+            kind_criteria.insert(
+                "type".to_string(),
+                Some("Type text into the currently focused input field".to_string()),
+            );
+        }
+        kind_criteria.insert(
+            "press enter".to_string(),
+            Some("Press Return to confirm the current input".to_string()),
+        );
+        kind_criteria.insert(
+            "scroll".to_string(),
+            Some("Scroll down the page to reveal more content".to_string()),
+        );
+        let last_two_are_waits =
+            history.len() >= 2 && history.iter().rev().take(2).all(|h| h == "wait");
+        if !last_two_are_waits {
+            kind_criteria.insert(
+                "wait".to_string(),
+                Some("Wait for the page to finish loading".to_string()),
+            );
+        }
+        kind_criteria.insert(
+            "done".to_string(),
+            Some("The goal has been achieved or no further action is needed".to_string()),
+        );
+
+        let mut target_criteria = BTreeMap::new();
+        for t in &self.targets {
+            if self.is_popup_close_target(&t.label) && prev_popup_present < POPUP_PRESENT_THRESHOLD {
+                continue;
+            }
+            if !excluded_targets.iter().any(|ex| ex == &t.label) {
+                target_criteria.insert(t.label.clone(), t.description.clone());
+            }
+        }
+        target_criteria.insert(
+            NOTHING_TO_CLICK.to_string(),
+            Some("No relevant target is visible to click".to_string()),
+        );
+
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "kind".to_string(),
+            Question::Choice {
+                instructions: "Choose the next action kind required to progress toward the goal."
+                    .to_string(),
+                criteria: kind_criteria,
+            },
+        );
+        questions.insert(
+            "target".to_string(),
+            Question::Choice {
+                instructions:
+                    "Choose the UI element to interact with, or 'nothing to click' if none applies."
+                        .to_string(),
+                criteria: target_criteria,
+            },
+        );
+        if let Some(instructions) = self.done_condition.noul_instructions_for_preset(self.preset) {
+            questions.insert(
+                "results".to_string(),
+                Question::Noul {
+                    instructions: instructions.to_string(),
+                },
+            );
+        }
+        if self.allow_dismiss_popup() {
+            questions.insert(
+                "popup_present".to_string(),
+                Question::Noul {
+                    instructions: POPUP_PRESENT_QUESTION_INSTRUCTIONS.to_string(),
+                },
+            );
+        }
+
+        let req1 = Request {
+            model: self.model.clone(),
+            state: state.clone(),
+            images: vec![img.data_url.clone()],
+            questions,
+        };
+
+        let resp1 = self.ask_backend(&req1)?;
+
+        let (kind_choice, kind_conf) = match resp1.answers.get("kind") {
+            Some(Answer::Choice {
+                choice, confidence, ..
+            }) => (choice.clone(), *confidence),
+            Some(_) => return Err(DeciderError::UnexpectedAnswerType("kind".to_string())),
+            None => return Err(DeciderError::MissingAnswer("kind".to_string())),
+        };
+
+        let target_choice = match resp1.answers.get("target") {
+            Some(Answer::Choice { choice, .. }) => Some(choice.clone()),
+            Some(_) => return Err(DeciderError::UnexpectedAnswerType("target".to_string())),
+            None => None,
+        };
+
+        let results_noul = match resp1.answers.get("results") {
+            Some(Answer::Noul { noul }) => *noul,
+            Some(_) => return Err(DeciderError::UnexpectedAnswerType("results".to_string())),
+            None => 0.0,
+        };
+
+        let popup_present_noul = match resp1.answers.get("popup_present") {
+            Some(Answer::Noul { noul }) => Some(*noul),
+            Some(_) => return Err(DeciderError::UnexpectedAnswerType("popup_present".to_string())),
+            None => None,
+        };
+        *self.last_popup_present.lock().unwrap() = popup_present_noul;
+
+        let action_kind = ActionKind::from_choice(&kind_choice)
+            .ok_or_else(|| DeciderError::UnknownActionKind(kind_choice.clone()))?;
+
+        if action_kind == ActionKind::DismissPopup {
+            return Ok(Decision {
+                kind: ActionKind::DismissPopup,
+                kind_confidence: kind_conf,
+                target: Some(self.popup_close_label().to_string()),
+                click_point_screen_pt: None,
+                bbox: None,
+                box_confidence: None,
+                confidence: kind_conf,
+                reasked: false,
+                text_to_type: None,
+                results_noul,
+                sensitive_noul: None,
+                closeish_noul: None,
+                popup_present_noul,
+            });
+        }
+
+        if action_kind == ActionKind::Click {
+            let tgt = target_choice
+                .clone()
+                .unwrap_or_else(|| NOTHING_TO_CLICK.to_string());
+            if tgt == NOTHING_TO_CLICK {
+                return Ok(Decision {
+                    kind: ActionKind::Wait,
+                    kind_confidence: kind_conf,
+                    target: Some(tgt),
+                    click_point_screen_pt: None,
+                    bbox: None,
+                    box_confidence: None,
+                    confidence: kind_conf,
+                    reasked: false,
+                    text_to_type: None,
+                    results_noul,
+                    sensitive_noul: None,
+                    closeish_noul: None,
+                    popup_present_noul,
+                });
+            }
+
+            let (mut bbox, mut box_conf, mut sensitive_noul) = self.ask_box(&state, img, &tgt)?;
+            let mut reasked = false;
+
+            if box_conf < LOW_CONFIDENCE_THRESHOLD {
+                let longer = self
+                    .find_target_description(&tgt)
+                    .map(|desc| format!("{} ({})", tgt, desc))
+                    .unwrap_or_else(|| format!("Locate the interactive element: {}", tgt));
+                let (bbox2, conf2, sens2) = self.ask_box(&state, img, &longer)?;
+                bbox = bbox2;
+                box_conf = conf2;
+                sensitive_noul = sens2.or(sensitive_noul);
+                reasked = true;
+            }
+
+            let pt = if box_conf < LOW_CONFIDENCE_THRESHOLD {
+                None
+            } else {
+                Some(map_box_center_to_screen_pt(&bbox, img))
+            };
+            let fill_text = if box_conf < LOW_CONFIDENCE_THRESHOLD {
+                None
+            } else {
+                self.type_values.get(&tgt).cloned()
+            };
+            return Ok(Decision {
+                kind: ActionKind::Click,
+                kind_confidence: kind_conf,
+                target: Some(tgt),
+                click_point_screen_pt: pt,
+                bbox: Some(bbox),
+                box_confidence: Some(box_conf),
+                confidence: box_conf,
+                reasked,
+                text_to_type: fill_text,
+                results_noul,
+                sensitive_noul,
+                closeish_noul: None,
+                popup_present_noul,
+            });
+        }
+
+        let text_to_type = if action_kind == ActionKind::Type {
+            active_fill_target
+                .and_then(|t| self.type_values.get(t).cloned())
+                .or_else(|| {
+                    target_choice
+                        .as_ref()
+                        .and_then(|t| self.type_values.get(t).cloned())
+                })
+        } else {
+            None
+        };
+
+        let final_target = if action_kind == ActionKind::Scroll {
+            Some(self.scroll_target_label().to_string())
+        } else {
+            target_choice
+        };
+
+        Ok(Decision {
+            kind: action_kind,
+            kind_confidence: kind_conf,
+            target: final_target,
+            click_point_screen_pt: None,
+            bbox: None,
+            box_confidence: None,
+            confidence: kind_conf,
+            reasked: false,
+            text_to_type,
+            results_noul,
+            sensitive_noul: None,
+            closeish_noul: None,
+            popup_present_noul,
+        })
+    }
+
+    pub fn resolve_dismiss_popup(
+        &self,
+        state: &str,
+        img: &PreparedImage,
+        decision: &mut Decision,
+        mut audit_log: Option<(&mut crate::privacy::AuditLog, usize)>,
+    ) -> Result<(), DeciderError> {
+        let tgt = decision
+            .target
+            .clone()
+            .unwrap_or_else(|| self.popup_close_label().to_string());
+        let (mut bbox, mut box_conf, mut closeish_noul) =
+            self.ask_dismiss_popup_box(state, img, &tgt)?;
+        let mut reasked = false;
+
+        if box_conf < LOW_CONFIDENCE_THRESHOLD {
+            reasked = true;
+            for desc in [POPUP_REASK_COOKIE_DESC, POPUP_REASK_AD_CLOSE_DESC] {
+                let (b, c, cl) = self.ask_dismiss_popup_box(state, img, desc)?;
+                bbox = b;
+                box_conf = c;
+                closeish_noul = cl.or(closeish_noul);
+                if box_conf >= LOW_CONFIDENCE_THRESHOLD {
+                    break;
+                }
+            }
+        }
+
+        if box_conf < LOW_CONFIDENCE_THRESHOLD {
+            for (corner, desc, suffix) in [
+                (
+                    CornerRegion::BottomRight,
+                    POPUP_REASK_COOKIE_DESC,
+                    "bottom_right_2x",
+                ),
+                (
+                    CornerRegion::BottomLeft,
+                    POPUP_REASK_AD_CLOSE_DESC,
+                    "bottom_left_2x",
+                ),
+            ] {
+                if let Ok(corner_img) = prepare_corner_zoom_2x(img, corner) {
+                    if let Some((ref mut log, step)) = audit_log {
+                        log.record(&corner_img, format!("step_{}_popup_{}", step, suffix));
+                    }
+                    let (cb, cc, cl) = self.ask_dismiss_popup_box(state, &corner_img, desc)?;
+                    let mapped_box = map_corner_box_to_window_box(&cb, corner);
+                    bbox = mapped_box;
+                    box_conf = cc;
+                    closeish_noul = cl.or(closeish_noul);
+                    if box_conf >= LOW_CONFIDENCE_THRESHOLD {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let valid = box_conf >= LOW_CONFIDENCE_THRESHOLD && is_popup_box_width_ok(&bbox);
+        if !valid && box_conf >= LOW_CONFIDENCE_THRESHOLD {
+            // Reject boxes larger than 15% of window width (never click link or ad body)
+            box_conf = 0.0;
+        }
+
+        let pt = if valid {
+            Some(map_box_center_to_screen_pt(&bbox, img))
+        } else {
+            None
+        };
+        decision.bbox = Some(bbox);
+        decision.box_confidence = Some(box_conf);
+        decision.confidence = box_conf;
+        decision.reasked = reasked;
+        decision.click_point_screen_pt = pt;
+        decision.closeish_noul = closeish_noul;
+        Ok(())
+    }
+
     pub fn decide_with_excluded(
         &self,
         goal: &str,
@@ -849,44 +1209,23 @@ impl<B: DecisionBackend> VisionDecider<B> {
             .ok_or_else(|| DeciderError::UnknownActionKind(kind_choice.clone()))?;
 
         if action_kind == ActionKind::DismissPopup {
-            let tgt = self.popup_close_label().to_string();
-            let (mut bbox, mut box_conf, mut closeish_noul) =
-                self.ask_dismiss_popup_box(&state, img, &tgt)?;
-            let mut reasked = false;
-
-            if box_conf < LOW_CONFIDENCE_THRESHOLD {
-                let longer = self
-                    .find_target_description(&tgt)
-                    .map(|desc| format!("{} ({})", tgt, desc))
-                    .unwrap_or_else(|| format!("Locate the interactive element: {}", tgt));
-                let (bbox2, conf2, closeish2) =
-                    self.ask_dismiss_popup_box(&state, img, &longer)?;
-                bbox = bbox2;
-                box_conf = conf2;
-                closeish_noul = closeish2.or(closeish_noul);
-                reasked = true;
-            }
-
-            let pt = if box_conf < LOW_CONFIDENCE_THRESHOLD {
-                None
-            } else {
-                Some(map_box_center_to_screen_pt(&bbox, img))
-            };
-            return Ok(Decision {
+            let mut decision = Decision {
                 kind: ActionKind::DismissPopup,
                 kind_confidence: kind_conf,
-                target: Some(tgt),
-                click_point_screen_pt: pt,
-                bbox: Some(bbox),
-                box_confidence: Some(box_conf),
-                confidence: box_conf,
-                reasked,
+                target: Some(self.popup_close_label().to_string()),
+                click_point_screen_pt: None,
+                bbox: None,
+                box_confidence: None,
+                confidence: kind_conf,
+                reasked: false,
                 text_to_type: None,
                 results_noul,
                 sensitive_noul: None,
-                closeish_noul,
+                closeish_noul: None,
                 popup_present_noul,
-            });
+            };
+            self.resolve_dismiss_popup(&state, img, &mut decision, None)?;
+            return Ok(decision);
         }
 
         if action_kind == ActionKind::Click {

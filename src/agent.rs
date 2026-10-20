@@ -2,10 +2,10 @@ use crate::api::DecisionBackend;
 use crate::browser::{Browser, DefaultAllowedBrowser};
 use crate::capture::{changed_fraction, is_changed, CaptureError, Rect, Screen};
 use crate::decider::{
-    compute_excluded_targets, ActionKind, DeciderError, Decision, DoneCondition, VisionDecider,
-    LOW_CONFIDENCE_THRESHOLD, POPUP_PRESENT_THRESHOLD,
+    compute_excluded_targets, format_state, ActionKind, DeciderError, Decision, DoneCondition,
+    VisionDecider, LOW_CONFIDENCE_THRESHOLD, POPUP_PRESENT_THRESHOLD,
 };
-use crate::input::{Input, InputError, KeyCode};
+use crate::input::{Input, InputError, KeyCode, DEFAULT_SCROLL_DELTA_PX};
 use crate::logging::RunLogger;
 use crate::privacy::{prepare_image, AuditLog, PreparedImage, PrivacyError};
 use crate::safety::{
@@ -22,7 +22,7 @@ pub const RESULTS_DONE_CONSECUTIVE_COUNT: usize = 2;
 pub const RESULTS_MODEL_DONE_THRESHOLD: f64 = 0.5;
 pub const SENSITIVE_BLOCK_THRESHOLD: f64 = 0.5;
 pub const SENSITIVE_EXCLUDE_STEPS: usize = 3;
-pub const LOW_BOX_CONF_EXCLUDE_STEPS: usize = 2;
+pub const LOW_BOX_CONF_EXCLUDE_STEPS: usize = 1000;
 pub const MAX_CONSECUTIVE_NOOP_STEPS: usize = 3;
 pub const DISMISS_CLOSEISH_THRESHOLD: f64 = 0.6;
 pub const MAX_TAB_EVENTS: usize = 2;
@@ -192,6 +192,23 @@ pub struct LowBoxConfEventRecord {
     pub point: Option<(f64, f64)>,
     pub confidence: f64,
     pub box_confidence: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScrollEventRecord {
+    pub event: String,
+    pub step: usize,
+    pub method: String,
+    pub scroll_point: (f64, f64),
+    pub focus_click_point: Option<(f64, f64)>,
+    pub screen_changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PopupEscapeEventRecord {
+    pub event: String,
+    pub step: usize,
+    pub screen_changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -577,9 +594,9 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             }
             sensitive_excluded.retain(|(_, r)| *r > 0);
 
-            let decision = match self
+            let mut decision = match self
                 .decider
-                .decide_with_excluded(goal, &history, &prepared, &excluded_targets)
+                .decide_with_excluded_defer_popup(goal, &history, &prepared, &excluded_targets)
             {
                 Ok(d) => d,
                 Err(e) => {
@@ -712,138 +729,37 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     }
                 }
                 ActionKind::DismissPopup => {
-                    let box_conf = decision.box_confidence.unwrap_or(0.0);
-                    let closeish = decision.closeish_noul.unwrap_or(0.0);
-                    let popup_present = decision.popup_present_noul.unwrap_or(0.0);
                     let default_popup_close = self.decider.popup_close_label();
-                    let tgt = decision.target.as_deref().unwrap_or(default_popup_close);
-                    if box_conf < LOW_CONFIDENCE_THRESHOLD {
-                        if let Some(ref mut logger) = self.logger {
-                            let evt = LowBoxConfEventRecord {
-                                event: "low_box_conf".to_string(),
-                                step,
-                                target: tgt.to_string(),
-                                point: decision.click_point_screen_pt,
-                                confidence: box_conf,
-                                box_confidence: box_conf,
-                            };
-                            let _ = logger.log_entry(&evt);
-                        }
-                        if let Some(entry) =
-                            sensitive_excluded.iter_mut().find(|(l, _)| l == tgt)
-                        {
-                            entry.1 = entry.1.max(LOW_BOX_CONF_EXCLUDE_STEPS);
-                        } else {
-                            sensitive_excluded.push((tgt.to_string(), LOW_BOX_CONF_EXCLUDE_STEPS));
-                        }
-                        clicked_this_step = Some(format!("low_box_conf:{}", tgt));
-                        history.push("wait".to_string());
-                        let elapsed = step_start.elapsed().as_secs_f64();
-                        total_step_secs += elapsed;
-                        steps_completed += 1;
-                        self.log_step(
-                            step,
-                            current_url,
-                            &decision,
-                            false,
-                            elapsed,
-                            win_rect,
-                            &prepared,
-                            full_screen_size,
-                        );
-                        consecutive_noop_steps += 1;
-                        if consecutive_noop_steps >= MAX_CONSECUTIVE_NOOP_STEPS {
-                            stop_reason = StopReason::SafetyBlocked(
-                                "3 consecutive no-op steps (low box confidence)".to_string(),
-                            );
-                            break;
-                        }
-                    } else if popup_present < POPUP_PRESENT_THRESHOLD
-                        || closeish < DISMISS_CLOSEISH_THRESHOLD
-                    {
-                        consecutive_noop_steps = 0;
-                        if let Some(ref mut logger) = self.logger {
-                            let evt = DismissRefusedEventRecord {
-                                event: "dismiss_refused".to_string(),
-                                step,
-                                target: tgt.to_string(),
-                                point: decision.click_point_screen_pt,
-                                closeish_noul: closeish,
-                                popup_present_noul: decision.popup_present_noul,
-                            };
-                            let _ = logger.log_entry(&evt);
-                        }
-                        history.push("wait".to_string());
-                        let elapsed = step_start.elapsed().as_secs_f64();
-                        total_step_secs += elapsed;
-                        steps_completed += 1;
-                        self.log_step(
-                            step,
-                            current_url,
-                            &decision,
-                            false,
-                            elapsed,
-                            win_rect,
-                            &prepared,
-                            full_screen_size,
-                        );
-                        if self.policy.on_wait().is_err() {
-                            stop_reason = StopReason::MaxWaitsExceeded;
-                            break;
-                        }
-                    } else {
-                        consecutive_noop_steps = 0;
-                        self.policy.reset_wait();
-                        if let Some(pt) = decision.click_point_screen_pt {
-                            if let Err(e) = self.policy.check_click(pt, win_rect) {
-                                let elapsed = step_start.elapsed().as_secs_f64();
-                                total_step_secs += elapsed;
-                                steps_completed += 1;
-                                self.log_step(
-                                    step,
-                                    current_url,
-                                    &decision,
-                                    false,
-                                    elapsed,
-                                    win_rect,
-                                    &prepared,
-                                    full_screen_size,
-                                );
-                                run_err = Some(AgentError::Safety(e));
-                                break;
-                            }
-                            if let Err(reason) = self.check_unoccluded_at(step, pt) {
-                                let elapsed = step_start.elapsed().as_secs_f64();
-                                total_step_secs += elapsed;
-                                steps_completed += 1;
-                                self.log_step(
-                                    step,
-                                    current_url,
-                                    &decision,
-                                    false,
-                                    elapsed,
-                                    win_rect,
-                                    &prepared,
-                                    full_screen_size,
-                                );
-                                stop_reason = StopReason::SafetyBlocked(reason);
-                                break;
-                            }
-                            if !self.dry_run {
-                                self.input.click(pt.0, pt.1)?;
-                                executed = true;
-                            }
-                            clicks += 1;
-                            clicked_this_step = Some(tgt.to_string());
-                            last_click_point = Some(pt);
-                            if executed && !self.timing.post_action_wait.is_zero() {
-                                thread::sleep(self.timing.post_action_wait);
-                            }
-                            history.push(format!("click '{}' at ({:.1}, {:.1})", tgt, pt.0, pt.1));
-                        }
-                        if executed && !self.timing.post_action_wait.is_zero() {
+                    let tgt = decision
+                        .target
+                        .clone()
+                        .unwrap_or_else(|| default_popup_close.to_string());
+
+                    let mut escaped_changed = false;
+                    if !self.dry_run {
+                        self.input.key(KeyCode::Escape)?;
+                        self.input.release_modifiers()?;
+                        if !self.timing.post_action_wait.is_zero() {
                             thread::sleep(self.timing.post_action_wait);
                         }
+                        if let Ok(after_esc) = self.screen.capture() {
+                            escaped_changed = is_changed(&full, &after_esc);
+                        }
+                    }
+                    if let Some(ref mut logger) = self.logger {
+                        let evt = PopupEscapeEventRecord {
+                            event: "popup_escape".to_string(),
+                            step,
+                            screen_changed: escaped_changed,
+                        };
+                        let _ = logger.log_entry(&evt);
+                    }
+
+                    if escaped_changed {
+                        consecutive_noop_steps = 0;
+                        self.policy.reset_wait();
+                        executed = true;
+                        history.push("dismiss popup via Escape".to_string());
                         let elapsed = step_start.elapsed().as_secs_f64();
                         total_step_secs += elapsed;
                         steps_completed += 1;
@@ -857,6 +773,177 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             &prepared,
                             full_screen_size,
                         );
+                    } else {
+                        let state = format_state(goal, &history);
+                        if let Err(e) = self.decider.resolve_dismiss_popup(
+                            &state,
+                            &prepared,
+                            &mut decision,
+                            Some((&mut self.audit_log, step)),
+                        ) {
+                            run_err = Some(AgentError::Decider(e));
+                            break;
+                        }
+                        let box_conf = decision.box_confidence.unwrap_or(0.0);
+                        let closeish = decision.closeish_noul.unwrap_or(0.0);
+                        let popup_present = decision.popup_present_noul.unwrap_or(0.0);
+                        if box_conf < LOW_CONFIDENCE_THRESHOLD {
+                            if let Some(ref mut logger) = self.logger {
+                                let evt = LowBoxConfEventRecord {
+                                    event: "low_box_conf".to_string(),
+                                    step,
+                                    target: tgt.clone(),
+                                    point: decision.click_point_screen_pt,
+                                    confidence: box_conf,
+                                    box_confidence: box_conf,
+                                };
+                                let _ = logger.log_entry(&evt);
+                            }
+                            if let Some(entry) =
+                                sensitive_excluded.iter_mut().find(|(l, _)| l == &tgt)
+                            {
+                                entry.1 = entry.1.max(LOW_BOX_CONF_EXCLUDE_STEPS);
+                            } else {
+                                sensitive_excluded.push((tgt.clone(), LOW_BOX_CONF_EXCLUDE_STEPS));
+                            }
+                            clicked_this_step = Some(format!("low_box_conf:{}", tgt));
+                            history.push("wait".to_string());
+                            let elapsed = step_start.elapsed().as_secs_f64();
+                            total_step_secs += elapsed;
+                            steps_completed += 1;
+                            self.log_step(
+                                step,
+                                current_url,
+                                &decision,
+                                false,
+                                elapsed,
+                                win_rect,
+                                &prepared,
+                                full_screen_size,
+                            );
+                            consecutive_noop_steps += 1;
+                            if consecutive_noop_steps >= MAX_CONSECUTIVE_NOOP_STEPS {
+                                stop_reason = StopReason::SafetyBlocked(
+                                    "3 consecutive no-op steps (low box confidence)".to_string(),
+                                );
+                                break;
+                            }
+                        } else if popup_present < POPUP_PRESENT_THRESHOLD
+                            || closeish < DISMISS_CLOSEISH_THRESHOLD
+                        {
+                            if let Some(ref mut logger) = self.logger {
+                                let evt = DismissRefusedEventRecord {
+                                    event: "dismiss_refused".to_string(),
+                                    step,
+                                    target: tgt.clone(),
+                                    point: decision.click_point_screen_pt,
+                                    closeish_noul: closeish,
+                                    popup_present_noul: decision.popup_present_noul,
+                                };
+                                let _ = logger.log_entry(&evt);
+                            }
+                            history.push("wait".to_string());
+                            let elapsed = step_start.elapsed().as_secs_f64();
+                            total_step_secs += elapsed;
+                            steps_completed += 1;
+                            self.log_step(
+                                step,
+                                current_url,
+                                &decision,
+                                false,
+                                elapsed,
+                                win_rect,
+                                &prepared,
+                                full_screen_size,
+                            );
+                            if self.policy.on_wait().is_err() {
+                                stop_reason = StopReason::MaxWaitsExceeded;
+                                break;
+                            }
+                        } else {
+                            self.policy.reset_wait();
+                            if let Some(pt) = decision.click_point_screen_pt {
+                                if let Err(e) = self.policy.check_click(pt, win_rect) {
+                                    let elapsed = step_start.elapsed().as_secs_f64();
+                                    total_step_secs += elapsed;
+                                    steps_completed += 1;
+                                    self.log_step(
+                                        step,
+                                        current_url,
+                                        &decision,
+                                        false,
+                                        elapsed,
+                                        win_rect,
+                                        &prepared,
+                                        full_screen_size,
+                                    );
+                                    run_err = Some(AgentError::Safety(e));
+                                    break;
+                                }
+                                if let Err(reason) = self.check_unoccluded_at(step, pt) {
+                                    let elapsed = step_start.elapsed().as_secs_f64();
+                                    total_step_secs += elapsed;
+                                    steps_completed += 1;
+                                    self.log_step(
+                                        step,
+                                        current_url,
+                                        &decision,
+                                        false,
+                                        elapsed,
+                                        win_rect,
+                                        &prepared,
+                                        full_screen_size,
+                                    );
+                                    stop_reason = StopReason::SafetyBlocked(reason);
+                                    break;
+                                }
+                                let mut click_changed = true;
+                                if !self.dry_run {
+                                    self.input.click(pt.0, pt.1)?;
+                                    executed = true;
+                                    if !self.timing.post_action_wait.is_zero() {
+                                        thread::sleep(self.timing.post_action_wait);
+                                    }
+                                    if let Ok(after_click) = self.screen.capture() {
+                                        click_changed = is_changed(&full, &after_click);
+                                    }
+                                }
+                                if click_changed {
+                                    consecutive_noop_steps = 0;
+                                } else {
+                                    consecutive_noop_steps += 1;
+                                }
+                                clicks += 1;
+                                clicked_this_step = Some(tgt.clone());
+                                last_click_point = Some(pt);
+                                history.push(format!(
+                                    "click '{}' at ({:.1}, {:.1})",
+                                    tgt, pt.0, pt.1
+                                ));
+                            }
+                            if executed && !self.timing.post_action_wait.is_zero() {
+                                thread::sleep(self.timing.post_action_wait);
+                            }
+                            let elapsed = step_start.elapsed().as_secs_f64();
+                            total_step_secs += elapsed;
+                            steps_completed += 1;
+                            self.log_step(
+                                step,
+                                current_url,
+                                &decision,
+                                executed,
+                                elapsed,
+                                win_rect,
+                                &prepared,
+                                full_screen_size,
+                            );
+                            if consecutive_noop_steps >= MAX_CONSECUTIVE_NOOP_STEPS {
+                                stop_reason = StopReason::SafetyBlocked(
+                                    "3 consecutive no-op steps (low box confidence)".to_string(),
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
                 ActionKind::Click => {
@@ -1194,15 +1281,129 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     );
                 }
                 ActionKind::Scroll => {
-                    consecutive_noop_steps = 0;
                     self.policy.reset_wait();
+                    let content_top = win_rect.y + self.policy.tab_strip_pt;
+                    let content_h = (win_rect.height - self.policy.tab_strip_pt).max(1.0);
+                    let scroll_pt = (
+                        win_rect.x + win_rect.width / 2.0,
+                        content_top + content_h / 2.0,
+                    );
+                    if let Err(e) = self.policy.check_click(scroll_pt, win_rect) {
+                        let elapsed = step_start.elapsed().as_secs_f64();
+                        total_step_secs += elapsed;
+                        steps_completed += 1;
+                        self.log_step(
+                            step,
+                            current_url,
+                            &decision,
+                            false,
+                            elapsed,
+                            win_rect,
+                            &prepared,
+                            full_screen_size,
+                        );
+                        run_err = Some(AgentError::Safety(e));
+                        break;
+                    }
+                    if let Err(reason) = self.check_unoccluded_at(step, scroll_pt) {
+                        let elapsed = step_start.elapsed().as_secs_f64();
+                        total_step_secs += elapsed;
+                        steps_completed += 1;
+                        self.log_step(
+                            step,
+                            current_url,
+                            &decision,
+                            false,
+                            elapsed,
+                            win_rect,
+                            &prepared,
+                            full_screen_size,
+                        );
+                        stop_reason = StopReason::SafetyBlocked(reason);
+                        break;
+                    }
+
+                    let mut method = "wheel".to_string();
+                    let mut focus_click_pt: Option<(f64, f64)> = None;
+                    let mut screen_changed = false;
+
                     if !self.dry_run {
-                        self.input.scroll_vertical(-5)?;
+                        self.input.scroll_vertical_at(
+                            scroll_pt.0,
+                            scroll_pt.1,
+                            DEFAULT_SCROLL_DELTA_PX,
+                        )?;
                         executed = true;
                         if !self.timing.post_action_wait.is_zero() {
                             thread::sleep(self.timing.post_action_wait);
                         }
+                        let after_wheel = self.screen.capture()?;
+                        screen_changed = is_changed(&full, &after_wheel);
+                        if !screen_changed {
+                            // Fall back: safe click on blank space in the page content margin, then Page Down (keycode 121)
+                            let blank_pt = (
+                                win_rect.x + 12.0,
+                                content_top + content_h / 2.0,
+                            );
+                            if let Err(e) = self.policy.check_click(blank_pt, win_rect) {
+                                let elapsed = step_start.elapsed().as_secs_f64();
+                                total_step_secs += elapsed;
+                                steps_completed += 1;
+                                self.log_step(
+                                    step,
+                                    current_url,
+                                    &decision,
+                                    false,
+                                    elapsed,
+                                    win_rect,
+                                    &prepared,
+                                    full_screen_size,
+                                );
+                                run_err = Some(AgentError::Safety(e));
+                                break;
+                            }
+                            if let Err(reason) = self.check_unoccluded_at(step, blank_pt) {
+                                let elapsed = step_start.elapsed().as_secs_f64();
+                                total_step_secs += elapsed;
+                                steps_completed += 1;
+                                self.log_step(
+                                    step,
+                                    current_url,
+                                    &decision,
+                                    false,
+                                    elapsed,
+                                    win_rect,
+                                    &prepared,
+                                    full_screen_size,
+                                );
+                                stop_reason = StopReason::SafetyBlocked(reason);
+                                break;
+                            }
+                            self.input.focus_click(blank_pt.0, blank_pt.1)?;
+                            self.input.key(KeyCode::PageDown)?;
+                            self.input.release_modifiers()?;
+                            if !self.timing.post_action_wait.is_zero() {
+                                thread::sleep(self.timing.post_action_wait);
+                            }
+                            let after_pgdn = self.screen.capture()?;
+                            screen_changed = is_changed(&full, &after_pgdn);
+                            method = "pagedown_fallback".to_string();
+                            focus_click_pt = Some(blank_pt);
+                        }
                     }
+
+                    if let Some(ref mut logger) = self.logger {
+                        let evt = ScrollEventRecord {
+                            event: "scroll".to_string(),
+                            step,
+                            method,
+                            scroll_point: scroll_pt,
+                            focus_click_point: focus_click_pt,
+                            screen_changed,
+                        };
+                        let _ = logger.log_entry(&evt);
+                    }
+
                     history.push("scroll down".to_string());
                     let elapsed = step_start.elapsed().as_secs_f64();
                     total_step_secs += elapsed;
@@ -1217,6 +1418,18 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         &prepared,
                         full_screen_size,
                     );
+
+                    if screen_changed {
+                        consecutive_noop_steps = 0;
+                    } else {
+                        consecutive_noop_steps += 1;
+                        if consecutive_noop_steps >= MAX_CONSECUTIVE_NOOP_STEPS {
+                            stop_reason = StopReason::SafetyBlocked(
+                                "3 consecutive no-op steps (low box confidence)".to_string(),
+                            );
+                            break;
+                        }
+                    }
                 }
             }
             step_clicks.push(clicked_this_step);
