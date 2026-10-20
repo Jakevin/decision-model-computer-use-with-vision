@@ -5,9 +5,10 @@ use decision_cu::api::{
 };
 use decision_cu::capture::{CaptureError, Rect, Screen};
 use decision_cu::decider::{
-    events_preset_targets, flights_preset_targets, generic_preset_targets, load_targets_file,
-    map_box_center_to_screen_pt, ActionKind, DoneCondition, Preset, TargetSpec, VisionDecider,
-    CHECKOUT_QUESTION_INSTRUCTIONS, CLOSEISH_QUESTION_INSTRUCTIONS,
+    events_preset_targets, events_zh_preset_targets, flights_preset_targets,
+    generic_preset_targets, load_targets_file, map_box_center_to_screen_pt, ActionKind,
+    DoneCondition, Preset, TargetSpec, VisionDecider, CHECKOUT_QUESTION_INSTRUCTIONS,
+    CHECKOUT_ZH_QUESTION_INSTRUCTIONS, CLOSEISH_QUESTION_INSTRUCTIONS,
     POPUP_PRESENT_QUESTION_INSTRUCTIONS, SENSITIVE_QUESTION_INSTRUCTIONS,
 };
 use decision_cu::input::{Input, InputError, KeyCode};
@@ -321,7 +322,9 @@ fn key_never_in_logs() {
     assert!(!disp_key.contains(fake_key_str));
 
     // Debug on DecisionClient
-    let client = DecisionClient::with_endpoint(key.clone(), "http://127.0.0.1:1/invalid").unwrap();
+    let client = DecisionClient::with_endpoint(key.clone(), "http://127.0.0.1:1/invalid")
+        .unwrap()
+        .with_transport_retry_delay(std::time::Duration::ZERO);
     let dbg_client = format!("{:?}", client);
     assert!(!dbg_client.contains(fake_key_str));
     assert!(dbg_client.contains("ApiKey(***)"));
@@ -795,7 +798,9 @@ fn summary_counters_and_step_log_fields() {
     assert_eq!(step0["full_screen_size"], serde_json::json!([1600, 1200]));
 
     let key = ApiKey::new("sk-vsr-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefG");
-    let client = DecisionClient::with_endpoint(key, "http://127.0.0.1:1/invalid").unwrap();
+    let client = DecisionClient::with_endpoint(key, "http://127.0.0.1:1/invalid")
+        .unwrap()
+        .with_transport_retry_delay(std::time::Duration::ZERO);
     assert_eq!(client.requests_sent(), 0);
     let mut q = BTreeMap::new();
     q.insert(
@@ -811,7 +816,7 @@ fn summary_counters_and_step_log_fields() {
         questions: q,
     };
     let _ = client.ask(&req);
-    assert_eq!(client.requests_sent(), 1);
+    assert_eq!(client.requests_sent(), 2);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -2042,5 +2047,234 @@ fn stops_on_new_tab_when_tab_count_increases_or_window_changes() {
     assert_eq!(summary2.steps_taken, 0);
     assert_eq!(summary2.requests_sent, 0);
 }
+
+#[test]
+fn events_zh_preset_parsing_done_noul_checkout_once_popup_close_and_forbidden_words() {
+    assert_eq!(Preset::from_name("events-zh").unwrap(), Preset::EventsZh);
+    assert_eq!(Preset::EventsZh.as_str(), "events-zh");
+    assert_eq!(
+        Preset::EventsZh.default_done_condition(),
+        DoneCondition::CheckoutPage
+    );
+    assert_eq!(Preset::EventsZh.checkout_once_label(), "下一步按鈕");
+    assert_eq!(Preset::EventsZh.popup_close_label(), "關閉彈窗");
+
+    let targets = Preset::EventsZh.default_targets();
+    assert_eq!(targets, events_zh_preset_targets());
+    let map: BTreeMap<&str, Option<&str>> = targets
+        .iter()
+        .map(|t| (t.label.as_str(), t.description.as_deref()))
+        .collect();
+    assert_eq!(
+        map.get("活動卡片").copied().flatten(),
+        Some("列表中顯示日期與標題的即將舉辦活動卡片")
+    );
+    assert_eq!(
+        map.get("立即報名按鈕").copied().flatten(),
+        Some("活動頁上的「立即報名」「購票」「報名」按鈕")
+    );
+    assert_eq!(
+        map.get("票種選項").copied().flatten(),
+        Some("票種列表中價格最低的那一列或其選擇按鈕")
+    );
+    assert_eq!(
+        map.get("數量加號").copied().flatten(),
+        Some("把票數設為 1 的「+」按鈕")
+    );
+    assert_eq!(
+        map.get("下一步按鈕").copied().flatten(),
+        Some("前往結帳的「下一步」「結帳」「確認」按鈕")
+    );
+    assert_eq!(
+        map.get("關閉彈窗").copied().flatten(),
+        Some("彈窗的「關閉」「X」「不用了」「拒絕」按鈕")
+    );
+    assert_eq!(
+        map.get("搜尋或活動分類").copied().flatten(),
+        Some("首頁的活動分類或「近期活動」連結")
+    );
+
+    // Forbidden Chinese words
+    let policy = SafetyPolicy::default();
+    for forbidden in ["登入", "註冊", "付款", "結帳完成", "送出訂單"] {
+        assert!(
+            policy.check_target(forbidden).is_err(),
+            "Expected '{}' to be blocked",
+            forbidden
+        );
+    }
+    for t in &targets {
+        assert!(
+            policy.check_target(&t.label).is_ok(),
+            "Expected preset target '{}' to be allowed",
+            t.label
+        );
+    }
+
+    // Verify events-zh done noul text, checkout-once for "下一步按鈕", and popup close for "關閉彈窗"
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    // Step 0: click "下一步按鈕" (1st time -> executed, popup_present = 0.9)
+    // Step 1: click "下一步按鈕" (2nd time -> checkout_once blocked, popup_present = 0.9)
+    // Step 2: dismiss popup -> queries "關閉彈窗" + closeish = 0.95 -> executed
+    // Step 3: done
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results_and_popup("click", "下一步按鈕", 0.2, 0.9),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.05),
+        make_choice_response_with_results_and_popup("click", "下一步按鈕", 0.3, 0.9),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.05),
+        make_choice_response_with_results_and_popup("dismiss popup", "nothing to click", 0.3, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.95, 0.95),
+        make_choice_response_with_results_and_popup("done", "nothing to click", 0.7, 0.1),
+    ]);
+
+    let decider = VisionDecider::new(backend, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(Preset::EventsZh.default_done_condition());
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default());
+    let summary = agent.run("搜尋活動票券").unwrap();
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.steps_taken, 4);
+    assert_eq!(summary.clicks, 2);
+    assert!(summary.history[0].starts_with("click '下一步按鈕'"));
+    assert_eq!(summary.history[1], "checkout_once '下一步按鈕'");
+    assert!(summary.history[2].starts_with("click '關閉彈窗'"));
+
+    let reqs = agent.decider().backend().requests.borrow();
+    // Verify Chinese done noul text in 1st request
+    match reqs[0].questions.get("results").unwrap() {
+        Question::Noul { instructions } => {
+            assert_eq!(instructions, CHECKOUT_ZH_QUESTION_INSTRUCTIONS);
+            assert_eq!(instructions, "畫面是否為顯示票價的選擇票種或結帳頁面？");
+        }
+        _ => panic!("Expected results noul question"),
+    }
+    // Verify dismiss popup box query uses "關閉彈窗"
+    match reqs[5].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => {
+            assert_eq!(instructions, "關閉彈窗");
+        }
+        _ => panic!("Expected target_box question"),
+    }
+}
+
+#[test]
+fn retry_on_transport_error_once_and_no_transport_retry_on_http_status() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Barrier};
+
+    let key = ApiKey::new("sk-vsr-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefG");
+    let default_client = DecisionClient::new(key.clone()).unwrap();
+    assert_eq!(
+        default_client.timeout(),
+        std::time::Duration::from_secs(decision_cu::api::DEFAULT_TIMEOUT_SECS)
+    );
+    assert_eq!(default_client.timeout(), std::time::Duration::from_secs(60));
+    assert_eq!(
+        default_client.transport_retry_delay(),
+        std::time::Duration::from_secs(decision_cu::api::TRANSPORT_RETRY_DELAY_SECS)
+    );
+    assert_eq!(
+        default_client.transport_retry_delay(),
+        std::time::Duration::from_secs(2)
+    );
+
+    // Mock server 1: drops 1st TCP connection immediately (transport error), serves 200 OK on 2nd connection (retry once succeeds)
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier_bg = Arc::clone(&barrier);
+
+    let handle = std::thread::spawn(move || {
+        barrier_bg.wait();
+        // 1st connection: read start of request then close immediately without sending HTTP headers -> connection reset / unexpected EOF transport error
+        if let Ok((mut stream1, _)) = listener.accept() {
+            let mut buf = [0u8; 256];
+            let _ = stream1.read(&mut buf);
+            drop(stream1);
+        }
+        // 2nd connection: return valid 200 OK JSON response
+        if let Ok((mut stream2, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = stream2.read(&mut buf);
+            let body = r#"{"answers":{"results":{"type":"noul","noul":0.88}},"model":"vllm-sr/d3-turbo","usage":{"input_tokens":10,"output_tokens":0}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream2.write_all(resp.as_bytes());
+            let _ = stream2.flush();
+        }
+    });
+
+    barrier.wait();
+    let client = DecisionClient::with_endpoint(key.clone(), format!("http://{}/v1/systemone", addr))
+        .unwrap()
+        .with_transport_retry_delay(std::time::Duration::from_millis(10));
+
+    let mut q = BTreeMap::new();
+    q.insert(
+        "results".to_string(),
+        Question::Noul {
+            instructions: "test?".to_string(),
+        },
+    );
+    let req = Request {
+        model: DEFAULT_MODEL.to_string(),
+        state: "Goal: test".to_string(),
+        images: vec![],
+        questions: q,
+    };
+
+    let resp = client.ask(&req).unwrap();
+    assert_eq!(client.requests_sent(), 2);
+    match resp.answers.get("results").unwrap() {
+        Answer::Noul { noul } => assert!((*noul - 0.88).abs() < 1e-6),
+        _ => panic!("Expected noul answer"),
+    }
+    let _ = handle.join();
+
+    // Mock server 2: HTTP 400 status error must NOT be retried (only 1 request sent)
+    let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr2 = listener2.local_addr().unwrap();
+    let handle2 = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener2.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"error":{"type":"invalid_request_error","code":"bad_request","message":"invalid field"}}"#;
+            let resp = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let client2 =
+        DecisionClient::with_endpoint(key, format!("http://{}/v1/systemone", addr2))
+            .unwrap()
+            .with_transport_retry_delay(std::time::Duration::from_millis(10));
+    let err = client2.ask(&req).unwrap_err();
+    assert!(matches!(err, ApiError::RemoteError { status: 400, .. }));
+    assert_eq!(client2.requests_sent(), 1);
+    let _ = handle2.join();
+}
+
 
 

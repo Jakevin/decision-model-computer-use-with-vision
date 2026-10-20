@@ -10,6 +10,9 @@ use thiserror::Error;
 
 pub const DEFAULT_MODEL: &str = "vllm-sr/d3-turbo";
 pub const DEFAULT_ENDPOINT: &str = "https://decision.vllm-sr.ai/v1/systemone";
+pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
+pub const TRANSPORT_RETRY_DELAY_SECS: u64 = 2;
+pub const MAX_TRANSPORT_RETRIES: usize = 1;
 pub const MAX_RETRY_AFTER_SECS: u64 = 60;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -172,6 +175,9 @@ pub struct DecisionClient {
     api_key: ApiKey,
     endpoint: String,
     http: Client,
+    timeout: Duration,
+    transport_retry_delay: Duration,
+    max_transport_retries: usize,
     max_retries: usize,
     requests_sent: AtomicUsize,
 }
@@ -181,6 +187,9 @@ impl fmt::Debug for DecisionClient {
         f.debug_struct("DecisionClient")
             .field("api_key", &self.api_key)
             .field("endpoint", &self.endpoint)
+            .field("timeout", &self.timeout)
+            .field("transport_retry_delay", &self.transport_retry_delay)
+            .field("max_transport_retries", &self.max_transport_retries)
             .field("max_retries", &self.max_retries)
             .field("requests_sent", &self.requests_sent.load(Ordering::SeqCst))
             .finish()
@@ -194,17 +203,34 @@ impl DecisionClient {
 
     pub fn with_endpoint(api_key: ApiKey, endpoint: impl Into<String>) -> Result<Self, ApiError> {
         let secret = api_key.expose_secret().to_string();
+        let timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
         let http = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(timeout)
             .build()
             .map_err(|e| ApiError::Transport(sanitize_secret(&e.to_string(), &secret)))?;
         Ok(Self {
             api_key,
             endpoint: endpoint.into(),
             http,
+            timeout,
+            transport_retry_delay: Duration::from_secs(TRANSPORT_RETRY_DELAY_SECS),
+            max_transport_retries: MAX_TRANSPORT_RETRIES,
             max_retries: 2,
             requests_sent: AtomicUsize::new(0),
         })
+    }
+
+    pub fn with_transport_retry_delay(mut self, delay: Duration) -> Self {
+        self.transport_retry_delay = delay;
+        self
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub fn transport_retry_delay(&self) -> Duration {
+        self.transport_retry_delay
     }
 
     pub fn api_key(&self) -> &ApiKey {
@@ -254,6 +280,7 @@ impl DecisionBackend for DecisionClient {
         let auth_value = format!("Bearer {}", secret);
 
         let mut attempt = 0usize;
+        let mut transport_attempt = 0usize;
         loop {
             self.requests_sent.fetch_add(1, Ordering::SeqCst);
             let resp_res = self
@@ -267,6 +294,13 @@ impl DecisionBackend for DecisionClient {
             let resp = match resp_res {
                 Ok(r) => r,
                 Err(e) => {
+                    if transport_attempt < self.max_transport_retries {
+                        transport_attempt += 1;
+                        if !self.transport_retry_delay.is_zero() {
+                            thread::sleep(self.transport_retry_delay);
+                        }
+                        continue;
+                    }
                     return Err(ApiError::Transport(sanitize_secret(&e.to_string(), secret)));
                 }
             };
@@ -278,9 +312,19 @@ impl DecisionBackend for DecisionClient {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.trim().parse::<u64>().ok());
 
-            let body_text = resp
-                .text()
-                .map_err(|e| ApiError::Transport(sanitize_secret(&e.to_string(), secret)))?;
+            let body_text = match resp.text() {
+                Ok(t) => t,
+                Err(e) => {
+                    if transport_attempt < self.max_transport_retries {
+                        transport_attempt += 1;
+                        if !self.transport_retry_delay.is_zero() {
+                            thread::sleep(self.transport_retry_delay);
+                        }
+                        continue;
+                    }
+                    return Err(ApiError::Transport(sanitize_secret(&e.to_string(), secret)));
+                }
+            };
 
             if (200..300).contains(&status) {
                 let parsed: Response = serde_json::from_str(&body_text).map_err(|e| {

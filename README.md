@@ -82,7 +82,7 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 - `--start-url <URL>`: Activate Chrome and navigate active tab to this URL before step 0.
 - `--start-url-preset <PRESET>`: Best-effort start URL preset (e.g. `one-way`, mapping to `https://www.google.com/travel/flights?hl=en&q=one%20way%20flights`), mutually exclusive with `--start-url`.
 - `--allow-url-prefix <PREFIX>`: Repeatable allowed URL prefix (https scheme, exact host or `*.domain`, path prefix).
-- `--preset <PRESET>`: Target preset: `flights`, `events`, or `generic` (default `flights`).
+- `--preset <PRESET>`: Target preset: `flights`, `events`, `events-zh`, or `generic` (default `flights`).
 - `--targets-file <PATH>`: Path to a JSON file containing custom targets (`[{"label":..,"description":..}]`).
 - `--done-when <CONDITION>`: Done condition: `flights-results`, `checkout-page`, or `model` (defaults from `--preset`).
 - `--fill <KEY=VALUE>`: Repeatable target-to-text fill mapping (e.g. `--fill "origin field=Osaka"`).
@@ -127,9 +127,11 @@ Enforced by `SafetyPolicy` (`src/safety.rs`), `VisionDecider` (`src/decider.rs`)
 - **Protected Tab & Address Bar Strip**: Any click with `y < window.y + 80.0` points is blocked with `SafetyError::ClickInTabStrip`, preventing the agent from switching tabs, typing arbitrary URLs in the address bar, or closing the browser window.
 - **Window Bounds & Unoccluded Frontmost Checks**: Clicks outside the Chrome window rectangle are rejected, and before every click/type/key action `Google Chrome` must be both the frontmost app and the topmost window at the target screen point.
 - **Allowed URL Prefix Check (`--allow-url-prefix`)**: URL verification parses `https://` URLs and matches against repeatable `--allow-url-prefix` entries (exact host or `*.domain` subdomain wildcard, plus path prefix). The `flights` preset defaults to `https://www.google.com/travel/flights`; if neither `--allow-url-prefix` nor a preset provides an allowlist, it is derived from `--start-url`'s host.
-- **Read-Only, Sensitive-Target Gate & Forbidden Target Filter**: Refuses targets containing forbidden words (`"sign in"`, `"login"`, `"password"`, `"book"`, `"purchase"`, `"pay"`, `"place order"`, `"buy"`, `"credit card"`), refuses `--fill` for personal-info labels (`name`, `email`, `phone`, `card`, `password`), and asks a `"sensitive"` `noul` question alongside every click `box` query—blocking the click (`blocked_sensitive`) and excluding that target for the next 3 steps whenever `sensitive >= 0.5`.
-- **Checkout-Once & Dismiss-Popup Gates**: Target `"checkout button"` may be clicked at most once per run (subsequent attempts log `checkout_once` and do not click). Action kind `"dismiss popup"` (available in `events` and `generic` presets) queries `"popup close"` together with a `"closeish"` `noul` check and clicks only if `closeish >= 0.6` (otherwise logging `dismiss_refused` and treating the step as `wait`).
-- **Loop Termination Limits**: Automatically halts when the configured `--done-when` condition (`flights-results`, `checkout-page`, or `model`) is satisfied, when `max_steps` (default `30`) is reached, or after `> 2` consecutive `"wait"` actions.
+- **Read-Only, Sensitive-Target Gate & Forbidden Target Filter**: Refuses targets containing forbidden words (`"sign in"`, `"signin"`, `"log in"`, `"login"`, `"password"`, `"book"`, `"purchase"`, `"pay"`, `"place order"`, `"buy"`, `"credit card"`, `"登入"`, `"註冊"`, `"付款"`, `"結帳完成"`, `"送出訂單"`), refuses `--fill` for personal-info labels (`name`, `email`, `phone`, `card`, `password`), and asks a `"sensitive"` `noul` question alongside every click `box` query—blocking the click (`blocked_sensitive`) and excluding that target for the next 3 steps whenever `sensitive >= 0.5`.
+- **Checkout-Once, Dismiss-Popup & Low-Confidence Gates**: Target `"checkout button"` (or `"下一步按鈕"` in `events-zh`) may be clicked at most once per run (subsequent attempts log `checkout_once` and do not click). Action kind `"dismiss popup"` (available in `events`, `events-zh`, and `generic` presets when the previous step's `popup_present` `noul` was `>= 0.6`) queries `"popup close"` (or `"關閉彈窗"` in `events-zh`) together with a `"closeish"` `noul` check and clicks only if both `popup_present >= 0.6` and `closeish >= 0.6` (otherwise logging `dismiss_refused` and treating the step as `wait`). If a `box` confidence remains `< 0.2` after re-asking, the click is skipped (`low_box_conf`) and the target is excluded for 2 steps.
+- **Single-Tab / Single-Window Guard**: Before each capture, if Chrome's tab count increases or the front window ID changes (`new_tab`), `decision-cu` stops immediately with `status: "blocked"` without navigating or closing any user tabs.
+- **API Timeout & Transport Retry**: Requests use a `60s` timeout and retry once after `2s` on connection/transport errors (in addition to `Retry-After` handling for HTTP `429`/`5xx`).
+- **Loop Termination Limits**: Automatically halts when the configured `--done-when` condition (`flights-results`, `checkout-page`, or `model`; for `events-zh`, `checkout-page` asks `"畫面是否為顯示票價的選擇票種或結帳頁面？"`) is satisfied, when `max_steps` (default `30`) is reached, or after `> 2` consecutive `"wait"` actions.
 
 ### Privacy Note
 
@@ -229,7 +231,7 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 - `--start-url <URL>`：於第 0 步前喚醒 Chrome 並將前景視窗使用中分頁導向此網址。
 - `--start-url-preset <PRESET>`：盡力而為（best-effort）的起始網址預設集（例如 `one-way` 對應 `https://www.google.com/travel/flights?hl=en&q=one%20way%20flights`），與 `--start-url` 互斥。
 - `--allow-url-prefix <PREFIX>`：可重複指定的允許網址前綴（僅限 `https`、精確網域或 `*.domain` 子網域萬用字元、以及路徑前綴）。
-- `--preset <PRESET>`：目標預設集：`flights`、`events` 或 `generic`（預設為 `flights`）。
+- `--preset <PRESET>`：目標預設集：`flights`、`events`、`events-zh` 或 `generic`（預設為 `flights`）。
 - `--targets-file <PATH>`：自訂目標 JSON 檔案路徑（格式為 `[{"label":..,"description":..}]`）。
 - `--done-when <CONDITION>`：完成條件：`flights-results`、`checkout-page` 或 `model`（預設依 `--preset` 自動決定）。
 - `--fill <KEY=VALUE>`：可重複指定的目標欄位填入文字對應（例如 `--fill "origin field=Osaka"`）。
@@ -265,9 +267,11 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 - **分頁列與網址列保護（Tab Strip Protection）**：任何位於 `y < window.y + 80.0` 點座標的點擊都會被 `ClickInTabStrip` 攔截，防止代理程式切換分頁、修改網址列或關閉視窗。
 - **視窗範圍與遮擋檢查（Frontmost & Unoccluded Checks）**：拒絕視窗範圍外的點擊，且每次點擊或輸入前皆確認 `Google Chrome` 為前景應用且目標座標未被其他視窗遮擋。
 - **允許網址前綴檢查（`--allow-url-prefix`）**：僅允許 `https://` 網址並比對網域（支援精確網域或 `*.domain` 子網域）與路徑前綴；`flights` 預設為 `https://www.google.com/travel/flights`，若未指定則由 `--start-url` 的網域自動推導。
-- **唯讀與敏感目標雙重攔截**：禁止點擊包含 `"sign in"`、`"book"`、`"purchase"`、`"pay"`、`"place order"`、`"buy"`、`"credit card"` 等字詞的目標，拒絕為 `name`/`email`/`phone`/`card`/`password` 欄位設定 `--fill`，並在每次 `box` 定位查詢時同步詢問 `"sensitive"` `noul`（若 `>= 0.5` 則記錄 `blocked_sensitive`、不執行點擊，並在接下來 3 步排除該目標）。
-- **結帳按鈕單次限制與彈窗關閉守門（Checkout-Once & Dismiss-Popup Gate）**：`"checkout button"` 每次執行最多僅允許點擊一次（第二次記錄 `checkout_once` 並略過）；`"dismiss popup"` 動作（僅於 `events` 與 `generic` 預設集提供）會同步詢問 `"closeish"` `noul`，僅在 `closeish >= 0.6` 時點擊 `"popup close"`（否則記錄 `dismiss_refused` 並視為 `wait`）。
-- **自動停止條件**：當達成 `--done-when` 完成條件（`flights-results`、`checkout-page` 或 `model`）、達到步數上限（預設 30 步）或連續等待（`wait`）超過 2 次時自動停止。
+- **唯讀與敏感目標雙重攔截**：禁止點擊包含 `"sign in"`、`"signin"`、`"log in"`、`"login"`、`"password"`、`"book"`、`"purchase"`、`"pay"`、`"place order"`、`"buy"`、`"credit card"`、`"登入"`、`"註冊"`、`"付款"`、`"結帳完成"`、`"送出訂單"` 等字詞的目標，拒絕為 `name`/`email`/`phone`/`card`/`password` 欄位設定 `--fill`，並在每次 `box` 定位查詢時同步詢問 `"sensitive"` `noul`（若 `>= 0.5` 則記錄 `blocked_sensitive`、不執行點擊，並在接下來 3 步排除該目標）。
+- **結帳按鈕單次限制、彈窗關閉與低信心度守門（Checkout-Once, Dismiss-Popup & Low-Confidence Gates）**：`"checkout button"`（於 `events-zh` 為 `"下一步按鈕"`）每次執行最多僅允許點擊一次（第二次記錄 `checkout_once` 並略過）；`"dismiss popup"` 動作（於 `events`、`events-zh` 與 `generic` 預設集提供，且須前一步 `popup_present >= 0.6` 才會納入選項）會針對 `"popup close"`（於 `events-zh` 為 `"關閉彈窗"`）同步詢問 `"closeish"` `noul`，僅在當步 `popup_present >= 0.6` 且 `closeish >= 0.6` 時點擊（否則記錄 `dismiss_refused` 並視為 `wait`）。若重問後 `box` 信心度仍 `< 0.2`，則記錄 `low_box_conf`、不執行點擊，並於接下來 2 步排除該目標。
+- **新分頁／新視窗偵測（Single-Tab Guard）**：每步擷取畫面之前若偵測到 Chrome 分頁數增加或前景視窗改變（`new_tab`），立即以 `blocked` 狀態停止，絕不自動關閉或切換使用者的分頁。
+- **API 逾時與傳輸重試**：API 請求逾時設為 `60` 秒；若發生連線或傳輸層錯誤（非 HTTP 狀態碼錯誤），會等待 `2` 秒後自動重試一次。
+- **自動停止條件**：當達成 `--done-when` 完成條件（`flights-results`、`checkout-page` 或 `model`；`events-zh` 預設為 `checkout-page` 並詢問 `"畫面是否為顯示票價的選擇票種或結帳頁面？"`）、達到步數上限（預設 30 步）或連續等待（`wait`）超過 2 次時自動停止。
 
 ### 隱私聲明 (Privacy Note)
 

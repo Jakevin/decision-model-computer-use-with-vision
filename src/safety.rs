@@ -207,6 +207,11 @@ impl Default for SafetyPolicy {
                 "place order".to_string(),
                 "buy".to_string(),
                 "credit card".to_string(),
+                "登入".to_string(),
+                "註冊".to_string(),
+                "付款".to_string(),
+                "結帳完成".to_string(),
+                "送出訂單".to_string(),
             ],
             consecutive_waits: 0,
         }
@@ -394,7 +399,14 @@ mod tests {
         assert!(policy.check_target("Pay Now").is_err());
         assert!(policy.check_target("Purchase ticket").is_err());
         assert!(policy.check_target("Book flight").is_err());
+        assert!(policy.check_target("會員登入按鈕").is_err());
+        assert!(policy.check_target("立即註冊").is_err());
+        assert!(policy.check_target("前往付款").is_err());
+        assert!(policy.check_target("結帳完成按鈕").is_err());
+        assert!(policy.check_target("送出訂單").is_err());
         assert!(policy.check_target("checkout button").is_ok());
+        assert!(policy.check_target("下一步按鈕").is_ok());
+        assert!(policy.check_target("立即報名按鈕").is_ok());
         assert!(policy.check_target("origin field").is_ok());
     }
 }

@@ -52,7 +52,7 @@ pub enum Commands {
         #[arg(long = "allow-url-prefix", value_name = "PREFIX")]
         allow_url_prefix: Vec<String>,
 
-        /// Target preset: flights, events, or generic
+        /// Target preset: flights, events, events-zh, or generic
         #[arg(long = "preset", default_value = "flights", value_name = "PRESET")]
         preset: String,
 
@@ -441,7 +441,8 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use decision_cu::decider::{
-        events_preset_targets, flights_preset_targets, generic_preset_targets,
+        events_preset_targets, events_zh_preset_targets, flights_preset_targets,
+        generic_preset_targets,
     };
 
     #[test]
@@ -575,6 +576,7 @@ mod tests {
     fn preset_targets_and_targets_file_loading() {
         assert_eq!(Preset::from_name("flights").unwrap(), Preset::Flights);
         assert_eq!(Preset::from_name("events").unwrap(), Preset::Events);
+        assert_eq!(Preset::from_name("events-zh").unwrap(), Preset::EventsZh);
         assert_eq!(Preset::from_name("generic").unwrap(), Preset::Generic);
         assert!(Preset::from_name("unknown").is_err());
 
@@ -595,6 +597,27 @@ mod tests {
                 "popup close",
             ]
         );
+
+        let events_zh = events_zh_preset_targets();
+        let events_zh_labels: Vec<&str> = events_zh.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(
+            events_zh_labels,
+            vec![
+                "搜尋或活動分類",
+                "活動卡片",
+                "立即報名按鈕",
+                "票種選項",
+                "數量加號",
+                "下一步按鈕",
+                "關閉彈窗",
+            ]
+        );
+        assert_eq!(
+            Preset::EventsZh.default_done_condition(),
+            DoneCondition::CheckoutPage
+        );
+        assert_eq!(Preset::EventsZh.checkout_once_label(), "下一步按鈕");
+        assert_eq!(Preset::EventsZh.popup_close_label(), "關閉彈窗");
 
         let generic = generic_preset_targets();
         let generic_labels: Vec<&str> = generic.iter().map(|t| t.label.as_str()).collect();

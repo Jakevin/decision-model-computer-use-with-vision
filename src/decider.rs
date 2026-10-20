@@ -13,6 +13,8 @@ pub const RESULTS_QUESTION_INSTRUCTIONS: &str =
     "Does the image show a Google Flights results list with flight prices?";
 pub const CHECKOUT_QUESTION_INSTRUCTIONS: &str =
     "Does the image show a ticket checkout or ticket selection page with ticket prices visible?";
+pub const CHECKOUT_ZH_QUESTION_INSTRUCTIONS: &str =
+    "畫面是否為顯示票價的選擇票種或結帳頁面？";
 pub const SENSITIVE_QUESTION_INSTRUCTIONS: &str =
     "Is the element at this target a sign-in, payment, place-order/purchase/pay button, or a personal-info input field (name, email, phone, card)?";
 pub const CLOSEISH_QUESTION_INSTRUCTIONS: &str =
@@ -59,9 +61,19 @@ impl DoneCondition {
     }
 
     pub fn noul_instructions(&self) -> Option<&'static str> {
+        self.noul_instructions_for_preset(None)
+    }
+
+    pub fn noul_instructions_for_preset(&self, preset: Option<Preset>) -> Option<&'static str> {
         match self {
             Self::FlightsResults => Some(RESULTS_QUESTION_INSTRUCTIONS),
-            Self::CheckoutPage => Some(CHECKOUT_QUESTION_INSTRUCTIONS),
+            Self::CheckoutPage => {
+                if preset == Some(Preset::EventsZh) {
+                    Some(CHECKOUT_ZH_QUESTION_INSTRUCTIONS)
+                } else {
+                    Some(CHECKOUT_QUESTION_INSTRUCTIONS)
+                }
+            }
             Self::Model => None,
         }
     }
@@ -83,10 +95,14 @@ impl TargetSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum Preset {
+    #[serde(rename = "flights")]
     Flights,
+    #[serde(rename = "events")]
     Events,
+    #[serde(rename = "events-zh")]
+    EventsZh,
+    #[serde(rename = "generic")]
     Generic,
 }
 
@@ -101,9 +117,10 @@ impl Preset {
         match name.trim().to_lowercase().as_str() {
             "flights" => Ok(Self::Flights),
             "events" => Ok(Self::Events),
+            "events-zh" => Ok(Self::EventsZh),
             "generic" => Ok(Self::Generic),
             other => Err(format!(
-                "Invalid --preset '{}': expected flights, events, or generic",
+                "Invalid --preset '{}': expected flights, events, events-zh, or generic",
                 other
             )),
         }
@@ -113,6 +130,7 @@ impl Preset {
         match self {
             Self::Flights => "flights",
             Self::Events => "events",
+            Self::EventsZh => "events-zh",
             Self::Generic => "generic",
         }
     }
@@ -121,6 +139,7 @@ impl Preset {
         match self {
             Self::Flights => flights_preset_targets(),
             Self::Events => events_preset_targets(),
+            Self::EventsZh => events_zh_preset_targets(),
             Self::Generic => generic_preset_targets(),
         }
     }
@@ -128,8 +147,22 @@ impl Preset {
     pub fn default_done_condition(&self) -> DoneCondition {
         match self {
             Self::Flights => DoneCondition::FlightsResults,
-            Self::Events => DoneCondition::CheckoutPage,
+            Self::Events | Self::EventsZh => DoneCondition::CheckoutPage,
             Self::Generic => DoneCondition::Model,
+        }
+    }
+
+    pub fn popup_close_label(&self) -> &'static str {
+        match self {
+            Self::EventsZh => "關閉彈窗",
+            _ => "popup close",
+        }
+    }
+
+    pub fn checkout_once_label(&self) -> &'static str {
+        match self {
+            Self::EventsZh => "下一步按鈕",
+            _ => "checkout button",
         }
     }
 }
@@ -226,6 +259,39 @@ pub fn events_preset_targets() -> Vec<TargetSpec> {
             Some(
                 "Close/X/Reject/Decline button of a cookie, newsletter or promo popup".to_string(),
             ),
+        ),
+    ]
+}
+
+pub fn events_zh_preset_targets() -> Vec<TargetSpec> {
+    vec![
+        TargetSpec::new(
+            "搜尋或活動分類",
+            Some("首頁的活動分類或「近期活動」連結".to_string()),
+        ),
+        TargetSpec::new(
+            "活動卡片",
+            Some("列表中顯示日期與標題的即將舉辦活動卡片".to_string()),
+        ),
+        TargetSpec::new(
+            "立即報名按鈕",
+            Some("活動頁上的「立即報名」「購票」「報名」按鈕".to_string()),
+        ),
+        TargetSpec::new(
+            "票種選項",
+            Some("票種列表中價格最低的那一列或其選擇按鈕".to_string()),
+        ),
+        TargetSpec::new(
+            "數量加號",
+            Some("把票數設為 1 的「+」按鈕".to_string()),
+        ),
+        TargetSpec::new(
+            "下一步按鈕",
+            Some("前往結帳的「下一步」「結帳」「確認」按鈕".to_string()),
+        ),
+        TargetSpec::new(
+            "關閉彈窗",
+            Some("彈窗的「關閉」「X」「不用了」「拒絕」按鈕".to_string()),
         ),
     ]
 }
@@ -490,10 +556,31 @@ impl<B: DecisionBackend> VisionDecider<B> {
 
     pub fn allow_dismiss_popup(&self) -> bool {
         match self.preset {
-            Some(Preset::Events | Preset::Generic) => true,
+            Some(Preset::Events | Preset::EventsZh | Preset::Generic) => true,
             Some(Preset::Flights) => false,
-            None => self.targets.iter().any(|t| t.label == "popup close"),
+            None => self
+                .targets
+                .iter()
+                .any(|t| t.label == "popup close" || t.label == "關閉彈窗"),
         }
+    }
+
+    pub fn popup_close_label(&self) -> &'static str {
+        match self.preset {
+            Some(p) => p.popup_close_label(),
+            None => {
+                if self.targets.iter().any(|t| t.label == "關閉彈窗") {
+                    "關閉彈窗"
+                } else {
+                    "popup close"
+                }
+            }
+        }
+    }
+
+    pub fn is_checkout_once_target(&self, label: &str) -> bool {
+        let trimmed = label.trim();
+        trimmed.eq_ignore_ascii_case("checkout button") || trimmed == "下一步按鈕"
     }
 
     pub fn with_done_condition(mut self, done_condition: DoneCondition) -> Self {
@@ -644,7 +731,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 criteria: target_criteria,
             },
         );
-        if let Some(instructions) = self.done_condition.noul_instructions() {
+        if let Some(instructions) = self.done_condition.noul_instructions_for_preset(self.preset) {
             questions.insert(
                 "results".to_string(),
                 Question::Noul {
@@ -701,7 +788,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
             .ok_or_else(|| DeciderError::UnknownActionKind(kind_choice.clone()))?;
 
         if action_kind == ActionKind::DismissPopup {
-            let tgt = "popup close".to_string();
+            let tgt = self.popup_close_label().to_string();
             let (mut bbox, mut box_conf, mut closeish_noul) =
                 self.ask_dismiss_popup_box(&state, img, &tgt)?;
             let mut reasked = false;

@@ -711,7 +711,8 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     let box_conf = decision.box_confidence.unwrap_or(0.0);
                     let closeish = decision.closeish_noul.unwrap_or(0.0);
                     let popup_present = decision.popup_present_noul.unwrap_or(0.0);
-                    let tgt = decision.target.as_deref().unwrap_or("popup close");
+                    let default_popup_close = self.decider.popup_close_label();
+                    let tgt = decision.target.as_deref().unwrap_or(default_popup_close);
                     if box_conf < LOW_CONFIDENCE_THRESHOLD {
                         if let Some(ref mut logger) = self.logger {
                             let evt = LowBoxConfEventRecord {
@@ -973,7 +974,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             }
                         }
 
-                        if tgt.eq_ignore_ascii_case("checkout button") {
+                        if self.decider.is_checkout_once_target(tgt) {
                             if checkout_clicked {
                                 if let Some(ref mut logger) = self.logger {
                                     let evt = CheckoutOnceEventRecord {
