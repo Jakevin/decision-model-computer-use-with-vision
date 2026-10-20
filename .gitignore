@@ -1,0 +1,6 @@
+target/
+runs/
+*.png
+*.jpg
+screenshots/
+.env
