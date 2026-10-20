@@ -108,6 +108,17 @@ impl CliResultOutput {
         }
     }
 
+    pub fn with_done_condition(mut self, done_condition: DoneCondition) -> Self {
+        self.done_condition = done_condition.as_str().to_string();
+        self
+    }
+
+    pub fn with_counters(mut self, requests_sent: usize, images_sent: usize) -> Self {
+        self.requests_sent = requests_sent;
+        self.images_sent = images_sent;
+        self
+    }
+
     pub fn exit_code(&self) -> u8 {
         match self.status.as_str() {
             "done" => 0,
@@ -181,7 +192,13 @@ fn execute_run(
     let targets = match targets_file {
         Some(path) => match load_targets_file(path) {
             Ok(t) => t,
-            Err(e) => return (CliResultOutput::error_or_blocked("error", e), None),
+            Err(e) => {
+                return (
+                    CliResultOutput::error_or_blocked("error", e)
+                        .with_done_condition(done_condition),
+                    None,
+                )
+            }
         },
         None => preset.default_targets(),
     };
@@ -190,21 +207,33 @@ fn execute_run(
         (Some(u), _) => Some(u),
         (None, Some(sp)) => match resolve_start_url_preset(&sp) {
             Ok(u) => Some(u),
-            Err(e) => return (CliResultOutput::error_or_blocked("error", e), None),
+            Err(e) => {
+                return (
+                    CliResultOutput::error_or_blocked("error", e)
+                        .with_done_condition(done_condition),
+                    None,
+                )
+            }
         },
         (None, None) => None,
     };
 
     let type_values = match parse_fills(fills) {
         Ok(m) => m,
-        Err(e) => return (CliResultOutput::error_or_blocked("error", e), None),
+        Err(e) => {
+            return (
+                CliResultOutput::error_or_blocked("error", e).with_done_condition(done_condition),
+                None,
+            )
+        }
     };
 
     let api_key = match ApiKey::from_env() {
         Ok(k) => k,
         Err(e) => {
             return (
-                CliResultOutput::error_or_blocked("error", e.to_string()),
+                CliResultOutput::error_or_blocked("error", e.to_string())
+                    .with_done_condition(done_condition),
                 None,
             );
         }
@@ -217,7 +246,8 @@ fn execute_run(
                 CliResultOutput::error_or_blocked(
                     "error",
                     redact(&e.to_string(), Some(&api_key)),
-                ),
+                )
+                .with_done_condition(done_condition),
                 Some(api_key),
             );
         }
@@ -247,7 +277,8 @@ fn execute_run(
                 CliResultOutput::error_or_blocked(
                     "error",
                     redact(&e.to_string(), Some(&api_key)),
-                ),
+                )
+                .with_done_condition(done_condition),
                 Some(api_key),
             );
         }
@@ -267,7 +298,8 @@ fn execute_run(
                     CliResultOutput::error_or_blocked(
                         "error",
                         redact(&e.to_string(), Some(&api_key)),
-                    ),
+                    )
+                    .with_done_condition(done_condition),
                     Some(api_key),
                 );
             }
@@ -304,6 +336,11 @@ fn execute_run(
                 CliResultOutput::error_or_blocked(
                     "blocked",
                     redact(&s.to_string(), Some(&api_key)),
+                )
+                .with_done_condition(done_condition)
+                .with_counters(
+                    agent.decider().requests_sent(),
+                    agent.decider().images_sent(),
                 ),
                 Some(api_key),
             ),
@@ -311,6 +348,11 @@ fn execute_run(
                 CliResultOutput::error_or_blocked(
                     "blocked",
                     redact(&p.to_string(), Some(&api_key)),
+                )
+                .with_done_condition(done_condition)
+                .with_counters(
+                    agent.decider().requests_sent(),
+                    agent.decider().images_sent(),
                 ),
                 Some(api_key),
             ),
@@ -318,6 +360,11 @@ fn execute_run(
                 CliResultOutput::error_or_blocked(
                     "error",
                     redact(&other.to_string(), Some(&api_key)),
+                )
+                .with_done_condition(done_condition)
+                .with_counters(
+                    agent.decider().requests_sent(),
+                    agent.decider().images_sent(),
                 ),
                 Some(api_key),
             ),
@@ -331,7 +378,8 @@ fn execute_run(
             CliResultOutput::error_or_blocked(
                 "error",
                 "decision-cu live execution requires macOS",
-            ),
+            )
+            .with_done_condition(done_condition),
             Some(api_key),
         )
     }

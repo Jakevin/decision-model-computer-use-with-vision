@@ -693,12 +693,16 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 reasked = true;
             }
 
-            let pt = map_box_center_to_screen_pt(&bbox, img);
+            let pt = if box_conf < LOW_CONFIDENCE_THRESHOLD {
+                None
+            } else {
+                Some(map_box_center_to_screen_pt(&bbox, img))
+            };
             return Ok(Decision {
                 kind: ActionKind::DismissPopup,
                 kind_confidence: kind_conf,
                 target: Some(tgt),
-                click_point_screen_pt: Some(pt),
+                click_point_screen_pt: pt,
                 bbox: Some(bbox),
                 box_confidence: Some(box_conf),
                 confidence: box_conf,
@@ -746,13 +750,21 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 reasked = true;
             }
 
-            let pt = map_box_center_to_screen_pt(&bbox, img);
-            let fill_text = self.type_values.get(&tgt).cloned();
+            let pt = if box_conf < LOW_CONFIDENCE_THRESHOLD {
+                None
+            } else {
+                Some(map_box_center_to_screen_pt(&bbox, img))
+            };
+            let fill_text = if box_conf < LOW_CONFIDENCE_THRESHOLD {
+                None
+            } else {
+                self.type_values.get(&tgt).cloned()
+            };
             return Ok(Decision {
                 kind: ActionKind::Click,
                 kind_confidence: kind_conf,
                 target: Some(tgt),
-                click_point_screen_pt: Some(pt),
+                click_point_screen_pt: pt,
                 bbox: Some(bbox),
                 box_confidence: Some(box_conf),
                 confidence: box_conf,

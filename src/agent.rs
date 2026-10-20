@@ -3,6 +3,7 @@ use crate::browser::{Browser, DefaultAllowedBrowser};
 use crate::capture::{changed_fraction, is_changed, CaptureError, Rect, Screen};
 use crate::decider::{
     compute_excluded_targets, ActionKind, DeciderError, Decision, DoneCondition, VisionDecider,
+    LOW_CONFIDENCE_THRESHOLD,
 };
 use crate::input::{Input, InputError, KeyCode};
 use crate::logging::RunLogger;
@@ -21,6 +22,7 @@ pub const RESULTS_DONE_CONSECUTIVE_COUNT: usize = 2;
 pub const RESULTS_MODEL_DONE_THRESHOLD: f64 = 0.5;
 pub const SENSITIVE_BLOCK_THRESHOLD: f64 = 0.5;
 pub const SENSITIVE_EXCLUDE_STEPS: usize = 3;
+pub const LOW_BOX_CONF_EXCLUDE_STEPS: usize = 2;
 pub const DISMISS_CLOSEISH_THRESHOLD: f64 = 0.6;
 pub const MAX_TAB_EVENTS: usize = 2;
 pub const MAX_FRONTMOST_FAILURES: usize = 2;
@@ -169,6 +171,16 @@ pub struct DismissRefusedEventRecord {
     pub target: String,
     pub point: Option<(f64, f64)>,
     pub closeish_noul: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LowBoxConfEventRecord {
+    pub event: String,
+    pub step: usize,
+    pub target: String,
+    pub point: Option<(f64, f64)>,
+    pub confidence: f64,
+    pub box_confidence: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -394,6 +406,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         }
 
         let mut stop_reason = StopReason::StepLimitReached(max_steps);
+        let mut run_err: Option<AgentError> = None;
 
         for step in 0..max_steps {
             let step_start = Instant::now();
@@ -482,7 +495,13 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                 continue;
             }
 
-            let full = self.screen.capture()?;
+            let full = match self.screen.capture() {
+                Ok(f) => f,
+                Err(e) => {
+                    run_err = Some(AgentError::Capture(e));
+                    break;
+                }
+            };
             let full_screen_size = (full.width(), full.height());
             let win_rect = self.screen.chrome_window_rect();
             let scale = self.screen.scale_factor();
@@ -493,7 +512,10 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     stop_reason = StopReason::NoCrop;
                     break;
                 }
-                Err(e) => return Err(AgentError::Privacy(e)),
+                Err(e) => {
+                    run_err = Some(AgentError::Privacy(e));
+                    break;
+                }
             };
 
             let win_rect = win_rect.expect("prepare_image succeeded so win_rect is Some");
@@ -516,13 +538,34 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             }
             sensitive_excluded.retain(|(_, r)| *r > 0);
 
-            let decision =
-                self.decider
-                    .decide_with_excluded(goal, &history, &prepared, &excluded_targets)?;
+            let decision = match self
+                .decider
+                .decide_with_excluded(goal, &history, &prepared, &excluded_targets)
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    run_err = Some(AgentError::Decider(e));
+                    break;
+                }
+            };
 
             if let Some(ref target_label) = decision.target {
                 if let Err(e) = self.policy.check_target(target_label) {
-                    return Err(AgentError::Safety(e));
+                    let elapsed = step_start.elapsed().as_secs_f64();
+                    total_step_secs += elapsed;
+                    steps_completed += 1;
+                    self.log_step(
+                        step,
+                        current_url,
+                        &decision,
+                        false,
+                        elapsed,
+                        win_rect,
+                        &prepared,
+                        full_screen_size,
+                    );
+                    run_err = Some(AgentError::Safety(e));
+                    break;
                 }
             }
 
@@ -550,7 +593,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         step,
                         current_url,
                         &decision,
-                        true,
+                        false,
                         elapsed,
                         win_rect,
                         &prepared,
@@ -577,7 +620,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             step,
                             current_url,
                             &decision,
-                            true,
+                            false,
                             elapsed,
                             win_rect,
                             &prepared,
@@ -628,9 +671,47 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     }
                 }
                 ActionKind::DismissPopup => {
+                    let box_conf = decision.box_confidence.unwrap_or(0.0);
                     let closeish = decision.closeish_noul.unwrap_or(0.0);
                     let tgt = decision.target.as_deref().unwrap_or("popup close");
-                    if closeish < DISMISS_CLOSEISH_THRESHOLD {
+                    if box_conf < LOW_CONFIDENCE_THRESHOLD {
+                        if let Some(ref mut logger) = self.logger {
+                            let evt = LowBoxConfEventRecord {
+                                event: "low_box_conf".to_string(),
+                                step,
+                                target: tgt.to_string(),
+                                point: decision.click_point_screen_pt,
+                                confidence: box_conf,
+                                box_confidence: box_conf,
+                            };
+                            let _ = logger.log_entry(&evt);
+                        }
+                        if let Some(entry) =
+                            sensitive_excluded.iter_mut().find(|(l, _)| l == tgt)
+                        {
+                            entry.1 = entry.1.max(LOW_BOX_CONF_EXCLUDE_STEPS);
+                        } else {
+                            sensitive_excluded.push((tgt.to_string(), LOW_BOX_CONF_EXCLUDE_STEPS));
+                        }
+                        history.push("wait".to_string());
+                        let elapsed = step_start.elapsed().as_secs_f64();
+                        total_step_secs += elapsed;
+                        steps_completed += 1;
+                        self.log_step(
+                            step,
+                            current_url,
+                            &decision,
+                            false,
+                            elapsed,
+                            win_rect,
+                            &prepared,
+                            full_screen_size,
+                        );
+                        if self.policy.on_wait().is_err() {
+                            stop_reason = StopReason::MaxWaitsExceeded;
+                            break;
+                        }
+                    } else if closeish < DISMISS_CLOSEISH_THRESHOLD {
                         if let Some(ref mut logger) = self.logger {
                             let evt = DismissRefusedEventRecord {
                                 event: "dismiss_refused".to_string(),
@@ -662,8 +743,37 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     } else {
                         self.policy.reset_wait();
                         if let Some(pt) = decision.click_point_screen_pt {
-                            self.policy.check_click(pt, win_rect)?;
+                            if let Err(e) = self.policy.check_click(pt, win_rect) {
+                                let elapsed = step_start.elapsed().as_secs_f64();
+                                total_step_secs += elapsed;
+                                steps_completed += 1;
+                                self.log_step(
+                                    step,
+                                    current_url,
+                                    &decision,
+                                    false,
+                                    elapsed,
+                                    win_rect,
+                                    &prepared,
+                                    full_screen_size,
+                                );
+                                run_err = Some(AgentError::Safety(e));
+                                break;
+                            }
                             if let Err(reason) = self.check_unoccluded_at(step, pt) {
+                                let elapsed = step_start.elapsed().as_secs_f64();
+                                total_step_secs += elapsed;
+                                steps_completed += 1;
+                                self.log_step(
+                                    step,
+                                    current_url,
+                                    &decision,
+                                    false,
+                                    elapsed,
+                                    win_rect,
+                                    &prepared,
+                                    full_screen_size,
+                                );
                                 stop_reason = StopReason::SafetyBlocked(reason);
                                 break;
                             }
@@ -698,14 +808,87 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     }
                 }
                 ActionKind::Click => {
+                    let box_conf = decision.box_confidence.unwrap_or(0.0);
+                    let tgt = decision.target.as_deref().unwrap_or("unknown");
+                    if box_conf < LOW_CONFIDENCE_THRESHOLD {
+                        if let Some(ref mut logger) = self.logger {
+                            let evt = LowBoxConfEventRecord {
+                                event: "low_box_conf".to_string(),
+                                step,
+                                target: tgt.to_string(),
+                                point: decision.click_point_screen_pt,
+                                confidence: box_conf,
+                                box_confidence: box_conf,
+                            };
+                            let _ = logger.log_entry(&evt);
+                        }
+                        if let Some(entry) =
+                            sensitive_excluded.iter_mut().find(|(l, _)| l == tgt)
+                        {
+                            entry.1 = entry.1.max(LOW_BOX_CONF_EXCLUDE_STEPS);
+                        } else {
+                            sensitive_excluded.push((tgt.to_string(), LOW_BOX_CONF_EXCLUDE_STEPS));
+                        }
+                        history.push("wait".to_string());
+                        let elapsed = step_start.elapsed().as_secs_f64();
+                        total_step_secs += elapsed;
+                        steps_completed += 1;
+                        self.log_step(
+                            step,
+                            current_url,
+                            &decision,
+                            false,
+                            elapsed,
+                            win_rect,
+                            &prepared,
+                            full_screen_size,
+                        );
+                        if self.policy.on_wait().is_err() {
+                            stop_reason = StopReason::MaxWaitsExceeded;
+                            break;
+                        }
+                        step_clicks.push(None);
+                        if !self.timing.step_wait.is_zero() {
+                            thread::sleep(self.timing.step_wait);
+                        }
+                        continue;
+                    }
                     self.policy.reset_wait();
                     if let Some(pt) = decision.click_point_screen_pt {
-                        self.policy.check_click(pt, win_rect)?;
+                        if let Err(e) = self.policy.check_click(pt, win_rect) {
+                            let elapsed = step_start.elapsed().as_secs_f64();
+                            total_step_secs += elapsed;
+                            steps_completed += 1;
+                            self.log_step(
+                                step,
+                                current_url,
+                                &decision,
+                                false,
+                                elapsed,
+                                win_rect,
+                                &prepared,
+                                full_screen_size,
+                            );
+                            run_err = Some(AgentError::Safety(e));
+                            break;
+                        }
                         if let Err(reason) = self.check_unoccluded_at(step, pt) {
+                            let elapsed = step_start.elapsed().as_secs_f64();
+                            total_step_secs += elapsed;
+                            steps_completed += 1;
+                            self.log_step(
+                                step,
+                                current_url,
+                                &decision,
+                                false,
+                                elapsed,
+                                win_rect,
+                                &prepared,
+                                full_screen_size,
+                            );
                             stop_reason = StopReason::SafetyBlocked(reason);
                             break;
                         }
-                        let tgt = decision.target.as_deref().unwrap_or("unknown");
 
                         if let Some(sens) = decision.sensitive_noul {
                             if sens >= SENSITIVE_BLOCK_THRESHOLD {
@@ -787,7 +970,21 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
 
                         if let Some(ref val) = fill_val {
                             if is_sensitive_fill_label(tgt) || is_sensitive_text(val) {
-                                return Err(AgentError::Safety(SafetyError::SensitiveTextBlocked));
+                                let elapsed = step_start.elapsed().as_secs_f64();
+                                total_step_secs += elapsed;
+                                steps_completed += 1;
+                                self.log_step(
+                                    step,
+                                    current_url,
+                                    &decision,
+                                    false,
+                                    elapsed,
+                                    win_rect,
+                                    &prepared,
+                                    full_screen_size,
+                                );
+                                run_err = Some(AgentError::Safety(SafetyError::SensitiveTextBlocked));
+                                break;
                             }
                         }
 
@@ -974,6 +1171,30 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         } else {
             0.0
         };
+
+        if let Some(err) = run_err {
+            if let Some(ref logger) = self.logger {
+                let (status, reason) = match &err {
+                    AgentError::Safety(s) => ("blocked".to_string(), s.to_string()),
+                    AgentError::Privacy(p) => ("blocked".to_string(), p.to_string()),
+                    other => ("error".to_string(), other.to_string()),
+                };
+                let summary_json = RunSummaryJson {
+                    status,
+                    reason,
+                    done_condition: self.decider.done_condition().as_str().to_string(),
+                    steps: steps_completed,
+                    clicks,
+                    requests_sent: self.decider.requests_sent(),
+                    images_sent: self.decider.images_sent(),
+                    avg_seconds_per_step,
+                    all_images_cropped,
+                    tab_events,
+                };
+                let _ = logger.write_summary(&summary_json);
+            }
+            return Err(err);
+        }
 
         let summary = AgentRunSummary {
             steps_taken: steps_completed,

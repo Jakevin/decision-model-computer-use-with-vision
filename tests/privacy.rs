@@ -64,6 +64,10 @@ impl DecisionBackend for MockBackend {
             .pop_front()
             .ok_or_else(|| ApiError::Transport("No more mock responses".to_string()))
     }
+
+    fn requests_sent(&self) -> usize {
+        self.requests.borrow().len()
+    }
 }
 
 #[derive(Default)]
@@ -989,6 +993,12 @@ fn occluded_click_blocked_with_no_input_events_and_logs_occluded() {
     let log_str = std::fs::read_to_string(&steps_path).unwrap();
     assert!(log_str.contains("\"occluded\""));
     assert!(log_str.contains("\"iTerm2\""));
+    let step_rec: serde_json::Value = log_str
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|e| e.get("kind").is_some())
+        .unwrap();
+    assert_eq!(step_rec["executed"], false);
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
@@ -1328,6 +1338,7 @@ fn checkout_page_done_after_two_consecutive_and_logs_noul_and_done_condition() {
     assert_eq!(s1["results_noul"], 0.40);
     assert_eq!(s2["results_noul"], 0.82);
     assert_eq!(s3["results_noul"], 0.91);
+    assert_eq!(s3["executed"], false);
 
     let summary_str = std::fs::read_to_string(&summary_path).unwrap();
     let summary_val: serde_json::Value = serde_json::from_str(&summary_str).unwrap();
@@ -1604,3 +1615,197 @@ fn dismiss_popup_refused_when_closeish_low_and_clicked_when_high() {
         _ => panic!("Expected closeish noul question"),
     }
 }
+
+#[test]
+fn low_box_conf_after_reask_does_not_click_logs_and_excludes_for_two_steps() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    // Step 0: click "events menu", 1st box conf 0.12 (< 0.2), re-ask conf 0.15 (< 0.2)
+    //         -> do NOT click, log 'low_box_conf', exclude "events menu" for next 2 steps (steps 1 and 2), count as wait
+    // Step 1: dismiss popup ("popup close"), 1st box conf 0.10 (< 0.2), re-ask conf 0.18 (< 0.2)
+    //         -> do NOT click, log 'low_box_conf', exclude "popup close" for next 2 steps (steps 2 and 3), count as wait
+    // Step 2: click "upcoming event card" (high conf 0.95) -> clicked! (resets consecutive waits)
+    // Step 3: done ("events menu" is included again at step 3; "popup close" still excluded at step 3)
+    let backend = MockBackend::new(vec![
+        // Step 0 (3 requests: choice + box + re-ask box)
+        make_choice_response_with_results("click", "events menu", 0.1),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.12, 0.05),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.15, 0.05),
+        // Step 1 (3 requests: choice + box + re-ask box)
+        make_choice_response_with_results("dismiss popup", "nothing to click", 0.1),
+        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.10, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.18, 0.9),
+        // Step 2 (2 requests: choice + box)
+        make_choice_response_with_results("click", "upcoming event card", 0.1),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.05),
+        // Step 3 (1 request: choice)
+        make_choice_response_with_results("done", "nothing to click", 0.7),
+    ]);
+
+    let decider = VisionDecider::new(backend, Preset::Events.default_targets())
+        .with_preset(Preset::Events)
+        .with_done_condition(DoneCondition::CheckoutPage);
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_low_box_conf");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_logger(logger);
+    let summary = agent.run("Find events").unwrap();
+
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.steps_taken, 4);
+    assert_eq!(summary.clicks, 1);
+    assert_eq!(agent.input().clicks.len(), 1);
+    assert_eq!(summary.history[0], "wait");
+    assert_eq!(summary.history[1], "wait");
+    assert!(summary.history[2].starts_with("click 'upcoming event card'"));
+
+    let log_str = std::fs::read_to_string(&steps_path).unwrap();
+    let entries: Vec<serde_json::Value> = log_str
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let low_conf_events: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("low_box_conf"))
+        .collect();
+    assert_eq!(low_conf_events.len(), 2);
+    assert_eq!(low_conf_events[0]["target"], "events menu");
+    assert!((low_conf_events[0]["confidence"].as_f64().unwrap() - 0.15).abs() < 1e-6);
+    assert_eq!(low_conf_events[1]["target"], "popup close");
+    assert!((low_conf_events[1]["confidence"].as_f64().unwrap() - 0.18).abs() < 1e-6);
+
+    let step_records: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| e.get("kind").is_some())
+        .collect();
+    assert_eq!(step_records.len(), 4);
+    assert_eq!(step_records[0]["executed"], false);
+    assert_eq!(step_records[1]["executed"], false);
+    assert_eq!(step_records[2]["executed"], true);
+    assert_eq!(step_records[3]["executed"], false);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    let reqs = agent.decider().backend().requests.borrow();
+    // Step 1 choice request is reqs[3]: "events menu" must be excluded (1st of 2 excluded steps)
+    match reqs[3].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("events menu"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+    // Step 2 choice request is reqs[6]: both "events menu" (2nd of 2 steps) and "popup close" (1st of 2 steps) excluded,
+    // and "wait" is omitted from kind criteria because steps 0 and 1 were wait-like non-actions!
+    match reqs[6].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("events menu"));
+            assert!(!criteria.contains_key("popup close"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+    match reqs[6].questions.get("kind").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("wait"));
+        }
+        _ => panic!("Expected kind choice question"),
+    }
+    // Step 3 choice request is reqs[8]: "events menu" is back after 2 steps, "popup close" still excluded (2nd of 2 steps)
+    match reqs[8].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(criteria.contains_key("events menu"));
+            assert!(!criteria.contains_key("popup close"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+}
+
+#[test]
+fn summary_on_error_reports_done_condition_and_requests_sent_and_blocked_steps_have_executed_false() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 100.0,
+        y: 50.0,
+        width: 1200.0,
+        height: 800.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    // Step 0: click "checkout button" -> allowed and executed (executed = true)
+    // Step 1: click "checkout button" again -> blocked by checkout_once (executed = false)
+    // Step 2: click "events menu" -> blocked by sensitive_noul = 0.8 (executed = false)
+    // Step 3: dismiss popup -> blocked by closeish_noul = 0.2 (executed = false)
+    // Step 4: click "tickets link", box response fails (no more mock responses -> Transport error after 9 requests sent!)
+    let backend = MockBackend::new(vec![
+        // Step 0 (2 reqs)
+        make_choice_response_with_results("click", "checkout button", 0.1),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.05),
+        // Step 1 (2 reqs)
+        make_choice_response_with_results("click", "checkout button", 0.1),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.05),
+        // Step 2 (2 reqs)
+        make_choice_response_with_results("click", "events menu", 0.1),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.80),
+        // Step 3 (2 reqs)
+        make_choice_response_with_results("dismiss popup", "nothing to click", 0.1),
+        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.95, 0.20),
+        // Step 4 (1st req succeeds, 2nd req fails with Transport error)
+        make_choice_response_with_results("click", "tickets link", 0.1),
+    ]);
+
+    let decider = VisionDecider::new(backend, Preset::Events.default_targets())
+        .with_preset(Preset::Events)
+        .with_done_condition(DoneCondition::CheckoutPage);
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_error_summary_and_executed");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+    let summary_path = logger.summary_path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_logger(logger);
+    let err = agent.run("Buy event ticket").unwrap_err();
+    assert!(matches!(err, AgentError::Decider(_)));
+    assert_eq!(agent.decider().requests_sent(), 10);
+
+    // Summary file written even on error exit must report effective done_condition ("checkout-page") and client counter (10)
+    let summary_str = std::fs::read_to_string(&summary_path).unwrap();
+    let summary_json: serde_json::Value = serde_json::from_str(&summary_str).unwrap();
+    assert_eq!(summary_json["status"], "error");
+    assert_eq!(summary_json["done_condition"], "checkout-page");
+    assert_eq!(summary_json["requests_sent"], 10);
+
+    // Verify step records' executed flags
+    let steps_str = std::fs::read_to_string(&steps_path).unwrap();
+    let step_records: Vec<serde_json::Value> = steps_str
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e.get("kind").is_some())
+        .collect();
+    assert_eq!(step_records.len(), 4);
+    assert_eq!(step_records[0]["executed"], true); // 1st checkout click executed
+    assert_eq!(step_records[1]["executed"], false); // 2nd checkout click blocked (checkout_once)
+    assert_eq!(step_records[2]["executed"], false); // blocked_sensitive
+    assert_eq!(step_records[3]["executed"], false); // dismiss_refused
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
