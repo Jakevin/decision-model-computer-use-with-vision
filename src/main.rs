@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
-use decision_cu::agent::{Agent, AgentError, Timing};
+use decision_cu::agent::{Agent, AgentError, Timing, FLIGHTS_DEFAULT_URL_PREFIX};
 use decision_cu::api::{ApiKey, DecisionClient};
 use decision_cu::decider::{TargetSpec, VisionDecider};
 use decision_cu::logging::{redact, RunLogger};
-use decision_cu::safety::SafetyPolicy;
+use decision_cu::safety::{resolve_allowed_url_prefixes, SafetyPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -46,6 +46,10 @@ pub enum Commands {
             conflicts_with = "start_url"
         )]
         start_url_preset: Option<String>,
+
+        /// Repeatable allowed URL prefix (https scheme, exact host or *.domain, path prefix)
+        #[arg(long = "allow-url-prefix", value_name = "PREFIX")]
+        allow_url_prefix: Vec<String>,
 
         /// Repeatable target-to-text fill mapping (e.g. --fill "origin field=Osaka")
         #[arg(long = "fill", value_name = "KEY=VALUE")]
@@ -188,6 +192,7 @@ fn execute_run(
     max_steps: usize,
     start_url: Option<String>,
     start_url_preset: Option<String>,
+    allow_url_prefix: &[String],
     fills: &[String],
     dry_run: bool,
 ) -> (CliResultOutput, Option<ApiKey>) {
@@ -231,7 +236,12 @@ fn execute_run(
     let targets = flights_preset_targets();
     let decider = VisionDecider::new(client, targets).with_type_values(type_values);
 
-    let mut policy = SafetyPolicy::default();
+    let preset_prefixes = vec![FLIGHTS_DEFAULT_URL_PREFIX.to_string()];
+    let mut policy = SafetyPolicy::default().with_allowed_prefixes(resolve_allowed_url_prefixes(
+        allow_url_prefix,
+        &preset_prefixes,
+        resolved_start_url.as_deref(),
+    ));
     policy.max_steps = max_steps;
 
     let logger = match RunLogger::new_in_runs_dir(Some(api_key.clone())) {
@@ -338,6 +348,7 @@ fn main() -> ExitCode {
             max_steps,
             start_url,
             start_url_preset,
+            allow_url_prefix,
             fill,
             dry_run,
             json,
@@ -347,6 +358,7 @@ fn main() -> ExitCode {
                 max_steps,
                 start_url,
                 start_url_preset,
+                &allow_url_prefix,
                 &fill,
                 dry_run,
             );
@@ -388,6 +400,10 @@ mod tests {
             "12",
             "--start-url",
             "https://www.google.com/travel/flights",
+            "--allow-url-prefix",
+            "https://techcrunch.com",
+            "--allow-url-prefix",
+            "https://*.bizzabo.com",
             "--fill",
             "origin field=Osaka",
             "--fill",
@@ -402,6 +418,7 @@ mod tests {
                 max_steps,
                 start_url,
                 start_url_preset,
+                allow_url_prefix,
                 fill,
                 dry_run,
                 json,
@@ -413,6 +430,13 @@ mod tests {
                     Some("https://www.google.com/travel/flights")
                 );
                 assert!(start_url_preset.is_none());
+                assert_eq!(
+                    allow_url_prefix,
+                    vec![
+                        "https://techcrunch.com".to_string(),
+                        "https://*.bizzabo.com".to_string()
+                    ]
+                );
                 assert_eq!(fill.len(), 2);
                 let parsed = parse_fills(&fill).unwrap();
                 assert_eq!(parsed.get("origin field").unwrap(), "Osaka");
@@ -437,6 +461,7 @@ mod tests {
                 max_steps,
                 start_url,
                 start_url_preset,
+                allow_url_prefix,
                 fill,
                 dry_run,
                 json,
@@ -449,6 +474,7 @@ mod tests {
                     resolve_start_url_preset("one-way").unwrap(),
                     "https://www.google.com/travel/flights?hl=en&q=one%20way%20flights"
                 );
+                assert!(allow_url_prefix.is_empty());
                 assert!(fill.is_empty());
                 assert!(!dry_run);
                 assert!(!json);

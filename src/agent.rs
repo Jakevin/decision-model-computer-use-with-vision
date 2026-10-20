@@ -7,12 +7,13 @@ use crate::decider::{
 use crate::input::{Input, InputError, KeyCode};
 use crate::logging::RunLogger;
 use crate::privacy::{prepare_image, AuditLog, PreparedImage, PrivacyError};
-use crate::safety::{SafetyError, SafetyPolicy};
+use crate::safety::{resolve_allowed_url_prefixes, SafetyError, SafetyPolicy};
 use serde::{Deserialize, Serialize};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+pub const FLIGHTS_DEFAULT_URL_PREFIX: &str = "https://www.google.com/travel/flights";
 pub const RESULTS_DONE_CONSECUTIVE_THRESHOLD: f64 = 0.8;
 pub const RESULTS_DONE_CONSECUTIVE_COUNT: usize = 2;
 pub const RESULTS_MODEL_DONE_THRESHOLD: f64 = 0.5;
@@ -210,6 +211,7 @@ pub struct Agent<S: Screen, B: DecisionBackend, I: Input, Br: Browser = DefaultA
     policy: SafetyPolicy,
     browser: Br,
     start_url: Option<String>,
+    flights_preset: bool,
     timing: Timing,
     audit_log: AuditLog,
     logger: Option<RunLogger>,
@@ -225,6 +227,7 @@ impl<S: Screen, B: DecisionBackend, I: Input> Agent<S, B, I, DefaultAllowedBrows
             policy,
             browser: DefaultAllowedBrowser::default(),
             start_url: None,
+            flights_preset: true,
             timing: Timing::zero(),
             audit_log: AuditLog::new(),
             logger: None,
@@ -242,11 +245,17 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             policy: self.policy,
             browser,
             start_url: self.start_url,
+            flights_preset: self.flights_preset,
             timing: self.timing,
             audit_log: self.audit_log,
             logger: self.logger,
             dry_run: self.dry_run,
         }
+    }
+
+    pub fn with_flights_preset(mut self, flights_preset: bool) -> Self {
+        self.flights_preset = flights_preset;
+        self
     }
 
     pub fn with_start_url(mut self, start_url: Option<String>) -> Self {
@@ -312,6 +321,19 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         let mut step_clicks: Vec<Option<String>> = Vec::new();
         let mut last_click_point: Option<(f64, f64)> = None;
 
+        if self.policy.allowed_hosts.is_empty() {
+            let preset_prefixes = if self.flights_preset {
+                vec![FLIGHTS_DEFAULT_URL_PREFIX.to_string()]
+            } else {
+                Vec::new()
+            };
+            self.policy.allowed_hosts = resolve_allowed_url_prefixes(
+                &[],
+                &preset_prefixes,
+                self.start_url.as_deref(),
+            );
+        }
+
         if let Some(ref url) = self.start_url {
             let _ = self.browser.activate_chrome();
             let _ = self.browser.set_active_tab_url(url);
@@ -344,10 +366,11 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
 
             // Read active tab URL before capture
             let current_url = self.browser.active_tab_url();
-            if current_url
-                .as_deref()
-                .map(|u| u.trim().starts_with("https://www.google.com/travel/explore"))
-                .unwrap_or(false)
+            if self.flights_preset
+                && current_url
+                    .as_deref()
+                    .map(|u| u.trim().starts_with("https://www.google.com/travel/explore"))
+                    .unwrap_or(false)
             {
                 tab_events += 1;
                 let _ = self.browser.go_back();
