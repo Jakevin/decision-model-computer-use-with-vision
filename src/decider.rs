@@ -28,6 +28,189 @@ impl TargetSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Preset {
+    Flights,
+    Events,
+    Generic,
+}
+
+impl Default for Preset {
+    fn default() -> Self {
+        Self::Flights
+    }
+}
+
+impl Preset {
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        match name.trim().to_lowercase().as_str() {
+            "flights" => Ok(Self::Flights),
+            "events" => Ok(Self::Events),
+            "generic" => Ok(Self::Generic),
+            other => Err(format!(
+                "Invalid --preset '{}': expected flights, events, or generic",
+                other
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Flights => "flights",
+            Self::Events => "events",
+            Self::Generic => "generic",
+        }
+    }
+
+    pub fn default_targets(&self) -> Vec<TargetSpec> {
+        match self {
+            Self::Flights => flights_preset_targets(),
+            Self::Events => events_preset_targets(),
+            Self::Generic => generic_preset_targets(),
+        }
+    }
+}
+
+pub fn flights_preset_targets() -> Vec<TargetSpec> {
+    vec![
+        TargetSpec::new(
+            "trip type dropdown",
+            Some(
+                "the small dropdown labelled 'Round trip' at the top left of the search form"
+                    .to_string(),
+            ),
+        ),
+        TargetSpec::new(
+            "one way option",
+            Some("the menu item that reads 'One way' in the open trip-type list".to_string()),
+        ),
+        TargetSpec::new(
+            "origin field",
+            Some("the left text field of the search form, showing the origin city".to_string()),
+        ),
+        TargetSpec::new(
+            "origin suggestion",
+            Some(
+                "the suggestion row reading 'Kansai International Airport' with code KIX"
+                    .to_string(),
+            ),
+        ),
+        TargetSpec::new(
+            "destination field",
+            Some(
+                "the text field labelled 'Where to?' to the right of the origin field".to_string(),
+            ),
+        ),
+        TargetSpec::new(
+            "destination suggestion",
+            Some(
+                "the suggestion row reading 'Taiwan Taoyuan International Airport' with code TPE"
+                    .to_string(),
+            ),
+        ),
+        TargetSpec::new(
+            "departure date",
+            Some("the date field labelled 'Departure' at the right of the search form".to_string()),
+        ),
+        TargetSpec::new(
+            "departure date option",
+            Some("the number 3 under November 2026 in the open date picker".to_string()),
+        ),
+        TargetSpec::new(
+            "done button",
+            Some("the blue 'Done' button at the bottom right of the date picker".to_string()),
+        ),
+        TargetSpec::new(
+            "search button",
+            Some("the blue 'Search' button under the search form".to_string()),
+        ),
+    ]
+}
+
+pub fn events_preset_targets() -> Vec<TargetSpec> {
+    vec![
+        TargetSpec::new(
+            "events menu",
+            Some("the 'Events' link in the site header/navigation".to_string()),
+        ),
+        TargetSpec::new(
+            "upcoming event card",
+            Some(
+                "the card or link for the next upcoming event, nearest future date".to_string(),
+            ),
+        ),
+        TargetSpec::new(
+            "tickets link",
+            Some(
+                "a 'Tickets', 'Buy tickets', 'Get tickets' or 'Register' button/link for that event"
+                    .to_string(),
+            ),
+        ),
+        TargetSpec::new(
+            "cheapest ticket option",
+            Some("the lowest-priced ticket type row or its select/add button".to_string()),
+        ),
+        TargetSpec::new(
+            "quantity increase",
+            Some("the '+' button to set ticket quantity to 1".to_string()),
+        ),
+        TargetSpec::new(
+            "checkout button",
+            Some("a 'Checkout', 'Continue' or 'Next' button that proceeds to checkout".to_string()),
+        ),
+        TargetSpec::new(
+            "popup close",
+            Some(
+                "Close/X/Reject/Decline button of a cookie, newsletter or promo popup".to_string(),
+            ),
+        ),
+    ]
+}
+
+pub fn generic_preset_targets() -> Vec<TargetSpec> {
+    vec![
+        TargetSpec::new(
+            "navigation link toward the goal",
+            Some("a navigation link or menu item that leads toward the goal".to_string()),
+        ),
+        TargetSpec::new(
+            "primary call-to-action button toward the goal",
+            Some(
+                "the primary call-to-action button or control that progresses toward the goal"
+                    .to_string(),
+            ),
+        ),
+        TargetSpec::new(
+            "popup close",
+            Some(
+                "Close/X/Reject/Decline button of a cookie, newsletter or promo popup".to_string(),
+            ),
+        ),
+    ]
+}
+
+pub fn load_targets_file(path: &std::path::Path) -> Result<Vec<TargetSpec>, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read targets file '{}': {}", path.display(), e))?;
+    parse_targets_json(&raw)
+        .map_err(|e| format!("Invalid targets JSON in '{}': {}", path.display(), e))
+}
+
+pub fn parse_targets_json(raw: &str) -> Result<Vec<TargetSpec>, String> {
+    let specs: Vec<TargetSpec> =
+        serde_json::from_str(raw).map_err(|e| format!("JSON parse error: {}", e))?;
+    if specs.is_empty() {
+        return Err("Targets list cannot be empty".to_string());
+    }
+    for s in &specs {
+        if s.label.trim().is_empty() {
+            return Err("Target label cannot be empty".to_string());
+        }
+    }
+    Ok(specs)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActionKind {
     #[serde(rename = "click")]
     Click,

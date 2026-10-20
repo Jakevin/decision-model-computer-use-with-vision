@@ -1,11 +1,12 @@
 use clap::{Parser, Subcommand};
 use decision_cu::agent::{Agent, AgentError, Timing, FLIGHTS_DEFAULT_URL_PREFIX};
 use decision_cu::api::{ApiKey, DecisionClient};
-use decision_cu::decider::{TargetSpec, VisionDecider};
+use decision_cu::decider::{load_targets_file, Preset, VisionDecider};
 use decision_cu::logging::{redact, RunLogger};
 use decision_cu::safety::{resolve_allowed_url_prefixes, SafetyPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Debug, Parser)]
@@ -50,6 +51,14 @@ pub enum Commands {
         /// Repeatable allowed URL prefix (https scheme, exact host or *.domain, path prefix)
         #[arg(long = "allow-url-prefix", value_name = "PREFIX")]
         allow_url_prefix: Vec<String>,
+
+        /// Target preset: flights, events, or generic
+        #[arg(long = "preset", default_value = "flights", value_name = "PRESET")]
+        preset: String,
+
+        /// Path to a JSON file containing custom targets ([{"label":..,"description":..}])
+        #[arg(long = "targets-file", value_name = "PATH")]
+        targets_file: Option<PathBuf>,
 
         /// Repeatable target-to-text fill mapping (e.g. --fill "origin field=Osaka")
         #[arg(long = "fill", value_name = "KEY=VALUE")]
@@ -131,74 +140,33 @@ pub fn resolve_start_url_preset(preset: &str) -> Result<String, String> {
     }
 }
 
-pub fn flights_preset_targets() -> Vec<TargetSpec> {
-    vec![
-        TargetSpec::new(
-            "trip type dropdown",
-            Some(
-                "the small dropdown labelled 'Round trip' at the top left of the search form"
-                    .to_string(),
-            ),
-        ),
-        TargetSpec::new(
-            "one way option",
-            Some("the menu item that reads 'One way' in the open trip-type list".to_string()),
-        ),
-        TargetSpec::new(
-            "origin field",
-            Some("the left text field of the search form, showing the origin city".to_string()),
-        ),
-        TargetSpec::new(
-            "origin suggestion",
-            Some(
-                "the suggestion row reading 'Kansai International Airport' with code KIX"
-                    .to_string(),
-            ),
-        ),
-        TargetSpec::new(
-            "destination field",
-            Some(
-                "the text field labelled 'Where to?' to the right of the origin field".to_string(),
-            ),
-        ),
-        TargetSpec::new(
-            "destination suggestion",
-            Some(
-                "the suggestion row reading 'Taiwan Taoyuan International Airport' with code TPE"
-                    .to_string(),
-            ),
-        ),
-        TargetSpec::new(
-            "departure date",
-            Some("the date field labelled 'Departure' at the right of the search form".to_string()),
-        ),
-        TargetSpec::new(
-            "departure date option",
-            Some("the number 3 under November 2026 in the open date picker".to_string()),
-        ),
-        TargetSpec::new(
-            "done button",
-            Some("the blue 'Done' button at the bottom right of the date picker".to_string()),
-        ),
-        TargetSpec::new(
-            "search button",
-            Some("the blue 'Search' button under the search form".to_string()),
-        ),
-    ]
-}
-
 fn execute_run(
     task: &str,
     max_steps: usize,
     start_url: Option<String>,
     start_url_preset: Option<String>,
     allow_url_prefix: &[String],
+    preset_str: &str,
+    targets_file: Option<&std::path::Path>,
     fills: &[String],
     dry_run: bool,
 ) -> (CliResultOutput, Option<ApiKey>) {
+    let preset = match Preset::from_name(preset_str) {
+        Ok(p) => p,
+        Err(e) => return (CliResultOutput::error_or_blocked("error", e), None),
+    };
+
+    let targets = match targets_file {
+        Some(path) => match load_targets_file(path) {
+            Ok(t) => t,
+            Err(e) => return (CliResultOutput::error_or_blocked("error", e), None),
+        },
+        None => preset.default_targets(),
+    };
+
     let resolved_start_url = match (start_url, start_url_preset) {
         (Some(u), _) => Some(u),
-        (None, Some(preset)) => match resolve_start_url_preset(&preset) {
+        (None, Some(sp)) => match resolve_start_url_preset(&sp) {
             Ok(u) => Some(u),
             Err(e) => return (CliResultOutput::error_or_blocked("error", e), None),
         },
@@ -233,10 +201,13 @@ fn execute_run(
         }
     };
 
-    let targets = flights_preset_targets();
     let decider = VisionDecider::new(client, targets).with_type_values(type_values);
 
-    let preset_prefixes = vec![FLIGHTS_DEFAULT_URL_PREFIX.to_string()];
+    let preset_prefixes = if preset == Preset::Flights {
+        vec![FLIGHTS_DEFAULT_URL_PREFIX.to_string()]
+    } else {
+        Vec::new()
+    };
     let mut policy = SafetyPolicy::default().with_allowed_prefixes(resolve_allowed_url_prefixes(
         allow_url_prefix,
         &preset_prefixes,
@@ -279,6 +250,7 @@ fn execute_run(
 
         let mut agent = Agent::new(screen, decider, input, policy)
             .with_browser(MacBrowser::new())
+            .with_flights_preset(preset == Preset::Flights)
             .with_timing(Timing::default())
             .with_start_url(resolved_start_url)
             .with_logger(logger)
@@ -349,6 +321,8 @@ fn main() -> ExitCode {
             start_url,
             start_url_preset,
             allow_url_prefix,
+            preset,
+            targets_file,
             fill,
             dry_run,
             json,
@@ -359,6 +333,8 @@ fn main() -> ExitCode {
                 start_url,
                 start_url_preset,
                 &allow_url_prefix,
+                &preset,
+                targets_file.as_deref(),
                 &fill,
                 dry_run,
             );
@@ -388,6 +364,9 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use decision_cu::decider::{
+        events_preset_targets, flights_preset_targets, generic_preset_targets,
+    };
 
     #[test]
     fn cli_parses_task_and_goal_alias_and_new_flags() {
@@ -404,6 +383,10 @@ mod tests {
             "https://techcrunch.com",
             "--allow-url-prefix",
             "https://*.bizzabo.com",
+            "--preset",
+            "events",
+            "--targets-file",
+            "/tmp/custom_targets.json",
             "--fill",
             "origin field=Osaka",
             "--fill",
@@ -419,6 +402,8 @@ mod tests {
                 start_url,
                 start_url_preset,
                 allow_url_prefix,
+                preset,
+                targets_file,
                 fill,
                 dry_run,
                 json,
@@ -436,6 +421,11 @@ mod tests {
                         "https://techcrunch.com".to_string(),
                         "https://*.bizzabo.com".to_string()
                     ]
+                );
+                assert_eq!(preset, "events");
+                assert_eq!(
+                    targets_file.as_deref(),
+                    Some(std::path::Path::new("/tmp/custom_targets.json"))
                 );
                 assert_eq!(fill.len(), 2);
                 let parsed = parse_fills(&fill).unwrap();
@@ -462,6 +452,8 @@ mod tests {
                 start_url,
                 start_url_preset,
                 allow_url_prefix,
+                preset,
+                targets_file,
                 fill,
                 dry_run,
                 json,
@@ -475,6 +467,8 @@ mod tests {
                     "https://www.google.com/travel/flights?hl=en&q=one%20way%20flights"
                 );
                 assert!(allow_url_prefix.is_empty());
+                assert_eq!(preset, "flights");
+                assert!(targets_file.is_none());
                 assert!(fill.is_empty());
                 assert!(!dry_run);
                 assert!(!json);
@@ -493,6 +487,57 @@ mod tests {
             "one-way",
         ]);
         assert!(conflict.is_err());
+    }
+
+    #[test]
+    fn preset_targets_and_targets_file_loading() {
+        assert_eq!(Preset::from_name("flights").unwrap(), Preset::Flights);
+        assert_eq!(Preset::from_name("events").unwrap(), Preset::Events);
+        assert_eq!(Preset::from_name("generic").unwrap(), Preset::Generic);
+        assert!(Preset::from_name("unknown").is_err());
+
+        let flights = flights_preset_targets();
+        assert_eq!(flights.len(), 10);
+
+        let events = events_preset_targets();
+        let event_labels: Vec<&str> = events.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(
+            event_labels,
+            vec![
+                "events menu",
+                "upcoming event card",
+                "tickets link",
+                "cheapest ticket option",
+                "quantity increase",
+                "checkout button",
+                "popup close",
+            ]
+        );
+
+        let generic = generic_preset_targets();
+        let generic_labels: Vec<&str> = generic.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(
+            generic_labels,
+            vec![
+                "navigation link toward the goal",
+                "primary call-to-action button toward the goal",
+                "popup close",
+            ]
+        );
+
+        let temp_path = std::env::temp_dir().join("decision_cu_test_targets.json");
+        std::fs::write(
+            &temp_path,
+            r#"[{"label":"custom btn","description":"a custom button"},{"label":"other link","description":null}]"#,
+        )
+        .unwrap();
+        let loaded = load_targets_file(&temp_path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].label, "custom btn");
+        assert_eq!(loaded[0].description.as_deref(), Some("a custom button"));
+        assert_eq!(loaded[1].label, "other link");
+        assert_eq!(loaded[1].description, None);
+        let _ = std::fs::remove_file(&temp_path);
     }
 
     #[test]

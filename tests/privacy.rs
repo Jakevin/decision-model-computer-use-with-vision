@@ -5,7 +5,8 @@ use decision_cu::api::{
 };
 use decision_cu::capture::{CaptureError, Rect, Screen};
 use decision_cu::decider::{
-    map_box_center_to_screen_pt, ActionKind, TargetSpec, VisionDecider,
+    events_preset_targets, flights_preset_targets, generic_preset_targets, load_targets_file,
+    map_box_center_to_screen_pt, ActionKind, Preset, TargetSpec, VisionDecider,
 };
 use decision_cu::input::{Input, InputError, KeyCode};
 use decision_cu::logging::{redact, RunLogger};
@@ -1139,4 +1140,94 @@ fn repeated_target_excluded_after_two_consecutive_steps_and_dropdown_reclicked_w
         }
         _ => panic!("Expected target choice question"),
     }
+}
+
+#[test]
+fn events_and_generic_preset_target_criteria_and_targets_file() {
+    let prepared = PreparedImage {
+        data_url: "data:image/jpeg;base64,AA==".to_string(),
+        crop_origin_px: (0, 0),
+        crop_size_px: (1000, 800),
+        sent_size_px: (1000, 800),
+        scale_factor: 2.0,
+    };
+
+    let events_targets = Preset::Events.default_targets();
+    assert_eq!(events_targets, events_preset_targets());
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results("click", "events menu", 0.1),
+        make_box_response(0.1, 0.2, 0.2, 0.3, 0.9),
+    ]);
+    let decider = VisionDecider::new(backend, events_targets);
+    let decision = decider
+        .decide("Find next TechCrunch event tickets", &[], &prepared)
+        .unwrap();
+    assert_eq!(decision.kind, ActionKind::Click);
+    assert_eq!(decision.target.as_deref(), Some("events menu"));
+
+    let reqs = decider.backend().requests.borrow();
+    match reqs[0].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert_eq!(
+                criteria.get("events menu").unwrap().as_deref(),
+                Some("the 'Events' link in the site header/navigation")
+            );
+            assert_eq!(
+                criteria.get("upcoming event card").unwrap().as_deref(),
+                Some("the card or link for the next upcoming event, nearest future date")
+            );
+            assert_eq!(
+                criteria.get("tickets link").unwrap().as_deref(),
+                Some("a 'Tickets', 'Buy tickets', 'Get tickets' or 'Register' button/link for that event")
+            );
+            assert_eq!(
+                criteria.get("cheapest ticket option").unwrap().as_deref(),
+                Some("the lowest-priced ticket type row or its select/add button")
+            );
+            assert_eq!(
+                criteria.get("quantity increase").unwrap().as_deref(),
+                Some("the '+' button to set ticket quantity to 1")
+            );
+            assert_eq!(
+                criteria.get("checkout button").unwrap().as_deref(),
+                Some("a 'Checkout', 'Continue' or 'Next' button that proceeds to checkout")
+            );
+            assert_eq!(
+                criteria.get("popup close").unwrap().as_deref(),
+                Some("Close/X/Reject/Decline button of a cookie, newsletter or promo popup")
+            );
+            assert!(criteria.contains_key("nothing to click"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+
+    let generic_targets = Preset::Generic.default_targets();
+    assert_eq!(generic_targets, generic_preset_targets());
+    let generic_labels: Vec<&str> = generic_targets.iter().map(|t| t.label.as_str()).collect();
+    assert_eq!(
+        generic_labels,
+        vec![
+            "navigation link toward the goal",
+            "primary call-to-action button toward the goal",
+            "popup close",
+        ]
+    );
+
+    assert_eq!(Preset::Flights.default_targets(), flights_preset_targets());
+
+    let temp_path = std::env::temp_dir().join("decision_cu_privacy_targets_file.json");
+    std::fs::write(
+        &temp_path,
+        r#"[{"label":"register button","description":"main register CTA"}]"#,
+    )
+    .unwrap();
+    let from_file = load_targets_file(&temp_path).unwrap();
+    assert_eq!(
+        from_file,
+        vec![TargetSpec::new(
+            "register button",
+            Some("main register CTA".to_string())
+        )]
+    );
+    let _ = std::fs::remove_file(&temp_path);
 }
