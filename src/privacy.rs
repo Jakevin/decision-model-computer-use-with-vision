@@ -10,6 +10,7 @@ use thiserror::Error;
 pub const MAX_PIXELS: u64 = 1_600_000;
 pub const MIN_CROP_PX: u32 = 50;
 pub const JPEG_QUALITY: u8 = 85;
+pub const DEFAULT_TOOLBAR_PT: f64 = 80.0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PrivacyError {
@@ -211,6 +212,81 @@ pub fn prepare_corner_zoom_2x(
         window_img.crop_origin_px.1 + ((window_img.crop_size_px.1 as f64) * top_frac).round() as u32;
     let crop_w_px = ((window_img.crop_size_px.0 as f64) * w_frac).round().max(1.0) as u32;
     let crop_h_px = ((window_img.crop_size_px.1 as f64) * h_frac).round().max(1.0) as u32;
+
+    Ok(PreparedImage {
+        data_url,
+        crop_origin_px: (origin_x_px, origin_y_px),
+        crop_size_px: (crop_w_px, crop_h_px),
+        sent_size_px: (zoom_w, zoom_h),
+        scale_factor: window_img.scale_factor,
+    })
+}
+
+pub fn content_region_offset_and_scale_frac(window_img: &PreparedImage) -> (f64, f64, f64, f64) {
+    let scale = if window_img.scale_factor <= 0.0 {
+        1.0
+    } else {
+        window_img.scale_factor
+    };
+    let toolbar_px = (DEFAULT_TOOLBAR_PT * scale).round();
+    let total_h = (window_img.crop_size_px.1.max(1)) as f64;
+    let top_frac = (toolbar_px / total_h).clamp(0.0, 0.5);
+    (0.0, top_frac, 1.0, 1.0 - top_frac)
+}
+
+pub fn prepare_content_zoom_2x(window_img: &PreparedImage) -> Result<PreparedImage, PrivacyError> {
+    let b64_str = window_img
+        .data_url
+        .strip_prefix("data:image/jpeg;base64,")
+        .or_else(|| window_img.data_url.split_once(',').map(|(_, b)| b))
+        .unwrap_or(&window_img.data_url);
+    let decoded_bytes = BASE64_STANDARD
+        .decode(b64_str.trim())
+        .map_err(|e| PrivacyError::EncodeError(format!("base64 decode error: {}", e)))?;
+
+    let rgba = if let Ok(dyn_img) = image::load_from_memory(&decoded_bytes) {
+        dyn_img.to_rgba8()
+    } else {
+        let w = window_img.sent_size_px.0.max(100);
+        let h = window_img.sent_size_px.1.max(100);
+        RgbaImage::from_pixel(w, h, image::Rgba([240, 240, 240, 255]))
+    };
+
+    let full_w = rgba.width().max(2);
+    let full_h = rgba.height().max(2);
+    let (left_frac, top_frac, w_frac, h_frac) = content_region_offset_and_scale_frac(window_img);
+    let sub_x = ((full_w as f64) * left_frac).round() as u32;
+    let sub_y = (((full_h as f64) * top_frac).round() as u32).min(full_h - 1);
+    let sub_w = (((full_w as f64) * w_frac).round() as u32)
+        .min(full_w.saturating_sub(sub_x))
+        .max(1);
+    let sub_h = (full_h - sub_y).max(1);
+
+    let sub_crop = crop_imm(&rgba, sub_x, sub_y, sub_w, sub_h).to_image();
+    let zoom_w = (sub_w * 2).max(1);
+    let zoom_h = (sub_h * 2).max(1);
+    let zoomed = resize(&sub_crop, zoom_w, zoom_h, FilterType::Triangle);
+
+    let rgb = DynamicImage::ImageRgba8(zoomed).into_rgb8();
+    let mut jpeg_bytes = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, JPEG_QUALITY);
+    encoder
+        .encode_image(&rgb)
+        .map_err(|e| PrivacyError::EncodeError(e.to_string()))?;
+
+    let b64 = BASE64_STANDARD.encode(&jpeg_bytes);
+    let data_url = format!("data:image/jpeg;base64,{}", b64);
+
+    let origin_x_px = window_img.crop_origin_px.0
+        + ((window_img.crop_size_px.0 as f64) * left_frac).round() as u32;
+    let origin_y_px = window_img.crop_origin_px.1
+        + ((window_img.crop_size_px.1 as f64) * top_frac).round() as u32;
+    let crop_w_px = ((window_img.crop_size_px.0 as f64) * w_frac)
+        .round()
+        .max(1.0) as u32;
+    let crop_h_px = ((window_img.crop_size_px.1 as f64) * h_frac)
+        .round()
+        .max(1.0) as u32;
 
     Ok(PreparedImage {
         data_url,

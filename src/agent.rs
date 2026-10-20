@@ -2,8 +2,8 @@ use crate::api::DecisionBackend;
 use crate::browser::{Browser, DefaultAllowedBrowser};
 use crate::capture::{changed_fraction, is_changed, CaptureError, Rect, Screen};
 use crate::decider::{
-    compute_excluded_targets, format_state, ActionKind, DeciderError, Decision, DoneCondition,
-    VisionDecider, LOW_CONFIDENCE_THRESHOLD, POPUP_PRESENT_THRESHOLD,
+    compute_excluded_targets, format_state, low_box_conf_exclude_steps, ActionKind, DeciderError,
+    Decision, DoneCondition, VisionDecider, LOW_CONFIDENCE_THRESHOLD, POPUP_PRESENT_THRESHOLD,
 };
 use crate::input::{Input, InputError, KeyCode, DEFAULT_SCROLL_DELTA_PX};
 use crate::logging::RunLogger;
@@ -594,10 +594,15 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             }
             sensitive_excluded.retain(|(_, r)| *r > 0);
 
-            let mut decision = match self
-                .decider
-                .decide_with_excluded_defer_popup(goal, &history, &prepared, &excluded_targets)
-            {
+            let no_available_targets = !self.decider.has_available_targets(&excluded_targets);
+
+            let mut decision = match self.decider.decide_with_excluded_defer_popup_with_audit(
+                goal,
+                &history,
+                &prepared,
+                &excluded_targets,
+                Some((&mut self.audit_log, step)),
+            ) {
                 Ok(d) => d,
                 Err(e) => {
                     run_err = Some(AgentError::Decider(e));
@@ -686,7 +691,6 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         break;
                     } else {
                         // Only accept model "done" when results noul >= 0.5; otherwise treat as wait
-                        consecutive_noop_steps = 0;
                         history.push("wait".to_string());
                         let elapsed = step_start.elapsed().as_secs_f64();
                         total_step_secs += elapsed;
@@ -701,6 +705,14 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             &prepared,
                             full_screen_size,
                         );
+                        if no_available_targets {
+                            consecutive_noop_steps += 1;
+                            let _ = consecutive_noop_steps;
+                            stop_reason =
+                                StopReason::SafetyBlocked("no available targets".to_string());
+                            break;
+                        }
+                        consecutive_noop_steps = 0;
                         if self.policy.on_wait().is_err() {
                             stop_reason = StopReason::MaxWaitsExceeded;
                             break;
@@ -708,7 +720,6 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     }
                 }
                 ActionKind::Wait => {
-                    consecutive_noop_steps = 0;
                     history.push("wait".to_string());
                     let elapsed = step_start.elapsed().as_secs_f64();
                     total_step_secs += elapsed;
@@ -717,12 +728,19 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         step,
                         current_url,
                         &decision,
-                        true,
+                        !no_available_targets,
                         elapsed,
                         win_rect,
                         &prepared,
                         full_screen_size,
                     );
+                    if no_available_targets {
+                        consecutive_noop_steps += 1;
+                        let _ = consecutive_noop_steps;
+                        stop_reason = StopReason::SafetyBlocked("no available targets".to_string());
+                        break;
+                    }
+                    consecutive_noop_steps = 0;
                     if self.policy.on_wait().is_err() {
                         stop_reason = StopReason::MaxWaitsExceeded;
                         break;
@@ -799,12 +817,13 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                                 };
                                 let _ = logger.log_entry(&evt);
                             }
+                            let excl_steps = low_box_conf_exclude_steps(&tgt);
                             if let Some(entry) =
                                 sensitive_excluded.iter_mut().find(|(l, _)| l == &tgt)
                             {
-                                entry.1 = entry.1.max(LOW_BOX_CONF_EXCLUDE_STEPS);
+                                entry.1 = entry.1.max(excl_steps);
                             } else {
-                                sensitive_excluded.push((tgt.clone(), LOW_BOX_CONF_EXCLUDE_STEPS));
+                                sensitive_excluded.push((tgt.clone(), excl_steps));
                             }
                             clicked_this_step = Some(format!("low_box_conf:{}", tgt));
                             history.push("wait".to_string());
@@ -961,12 +980,13 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             };
                             let _ = logger.log_entry(&evt);
                         }
+                        let excl_steps = low_box_conf_exclude_steps(tgt);
                         if let Some(entry) =
                             sensitive_excluded.iter_mut().find(|(l, _)| l == tgt)
                         {
-                            entry.1 = entry.1.max(LOW_BOX_CONF_EXCLUDE_STEPS);
+                            entry.1 = entry.1.max(excl_steps);
                         } else {
-                            sensitive_excluded.push((tgt.to_string(), LOW_BOX_CONF_EXCLUDE_STEPS));
+                            sensitive_excluded.push((tgt.to_string(), excl_steps));
                         }
                         history.push("wait".to_string());
                         let elapsed = step_start.elapsed().as_secs_f64();

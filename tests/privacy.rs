@@ -1738,12 +1738,16 @@ fn low_box_conf_after_reask_does_not_click_logs_and_excludes_for_two_steps() {
         make_choice_response_with_results("click", "events menu", 0.1),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.12, 0.05),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.15, 0.05),
-        // Step 1 (6 requests: choice + box + 2 specific re-asks + 2 corner crop asks)
+        // Step 1 (10 requests: choice + box + 6 specific re-asks + 2 corner crop asks)
         make_choice_response_with_results("dismiss popup", "nothing to click", 0.1),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.10, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.11, 0.9),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.12, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.13, 0.9),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.14, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.15, 0.9),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.16, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.17, 0.9),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.18, 0.9),
         // Step 2 (2 requests: choice + box)
         make_choice_response_with_results("click", "upcoming event card", 0.1),
@@ -1807,23 +1811,23 @@ fn low_box_conf_after_reask_does_not_click_logs_and_excludes_for_two_steps() {
         }
         _ => panic!("Expected target choice question"),
     }
-    // Step 2 choice request is reqs[9]: both "events menu" and "popup close" excluded,
+    // Step 2 choice request is reqs[13]: both "events menu" and "popup close" excluded,
     // and "wait" is omitted from kind criteria because steps 0 and 1 were wait-like non-actions!
-    match reqs[9].questions.get("target").unwrap() {
+    match reqs[13].questions.get("target").unwrap() {
         Question::Choice { criteria, .. } => {
             assert!(!criteria.contains_key("events menu"));
             assert!(!criteria.contains_key("popup close"));
         }
         _ => panic!("Expected target choice question"),
     }
-    match reqs[9].questions.get("kind").unwrap() {
+    match reqs[13].questions.get("kind").unwrap() {
         Question::Choice { criteria, .. } => {
             assert!(!criteria.contains_key("wait"));
         }
         _ => panic!("Expected kind choice question"),
     }
-    // Step 3 choice request is reqs[11]: both "events menu" and "popup close" remain excluded for the rest of the run
-    match reqs[11].questions.get("target").unwrap() {
+    // Step 3 choice request is reqs[15]: both "events menu" and "popup close" remain excluded for the rest of the run
+    match reqs[15].questions.get("target").unwrap() {
         Question::Choice { criteria, .. } => {
             assert!(!criteria.contains_key("events menu"));
             assert!(!criteria.contains_key("popup close"));
@@ -2303,7 +2307,7 @@ fn retry_on_transport_error_once_and_no_transport_retry_on_http_status() {
 fn acc2_fixes_low_conf_exclusion_noop_cap_scroll_target_and_popup_target_gate() {
     use decision_cu::decider::compute_excluded_targets;
 
-    // 1. Verify compute_excluded_targets is fed by low_box_conf events and excludes for at least 2 steps
+    // 1. Verify compute_excluded_targets is fed by low_box_conf events and excludes primary targets for 3 steps
     let step_events = vec![Some("low_box_conf:活動卡片".to_string())];
     assert_eq!(
         compute_excluded_targets(&step_events),
@@ -2321,14 +2325,18 @@ fn acc2_fixes_low_conf_exclusion_noop_cap_scroll_target_and_popup_target_gate() 
         Some("low_box_conf:活動卡片".to_string()),
         None,
         None,
-        None,
-        None,
-        None,
     ];
     assert_eq!(
         compute_excluded_targets(&step_events_3),
         vec!["活動卡片".to_string()]
     );
+    let step_events_4 = vec![
+        Some("low_box_conf:活動卡片".to_string()),
+        None,
+        None,
+        None,
+    ];
+    assert!(compute_excluded_targets(&step_events_4).is_empty());
 
     let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
     let window = Rect {
@@ -2343,23 +2351,12 @@ fn acc2_fixes_low_conf_exclusion_noop_cap_scroll_target_and_popup_target_gate() 
         scale: 2.0,
     };
 
-    // Scenario A (events-zh):
-    // Step 0: popup_present not yet confirmed -> "關閉彈窗" NOT offered in target choices.
-    //         Model chooses click "活動卡片", box conf 0.11 / re-ask 0.14 (< 0.2) -> low_box_conf (1st no-op).
-    // Step 1: "活動卡片" is excluded (1st of 2 steps), "關閉彈窗" still NOT offered (step 0 popup_present = 0.2 < 0.6).
-    //         Model chooses scroll (even if raw target choice was "關閉彈窗") -> Decision.target and step log target MUST be "向下捲動", resets no-op counter.
-    //         Step 1 returns popup_present = 0.85 (>= 0.6).
-    // Step 2: "活動卡片" is STILL excluded (2nd of 2 steps); "關閉彈窗" IS now offered because step 1 popup_present = 0.85 >= 0.6.
-    //         Model chooses wait (1st wait; note step 0 low_box_conf did NOT count toward wait limit!).
-    // Step 3: "活動卡片" is back in target choices after 2 excluded steps.
-    //         Model chooses wait (2nd consecutive wait; still <= max_consecutive_waits = 2, proving step 0 low_box_conf did not count as wait!).
-    // Step 4: Model chooses click "搜尋或活動分類" (low_box_conf, 1st consecutive no-op).
-    // Step 5: Model chooses click "立即報名按鈕" (low_box_conf, 2nd consecutive no-op).
-    // Step 6: Model chooses click "票種選項" (low_box_conf, 3rd consecutive no-op) -> stops with status "blocked" and reason "3 consecutive no-op steps (low box confidence)".
     let backend = MockBackend::new(vec![
-        // Step 0: click "活動卡片" -> low_box_conf (popup_present = 0.2)
+        // Step 0: click "活動卡片" -> low_box_conf (popup_present = 0.2) (4 box asks: initial + 2 specific + content 2x crop)
         make_choice_response_with_results_and_popup("click", "活動卡片", 0.1, 0.2),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.11, 0.05),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.12, 0.05),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.13, 0.05),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.14, 0.05),
         // Step 1: scroll with raw target "關閉彈窗" -> normalized to "向下捲動" (popup_present = 0.85)
         make_choice_response_with_results_and_popup("scroll", "關閉彈窗", 0.1, 0.85),
@@ -2367,17 +2364,21 @@ fn acc2_fixes_low_conf_exclusion_noop_cap_scroll_target_and_popup_target_gate() 
         make_choice_response_with_results_and_popup("wait", "nothing to click", 0.1, 0.1),
         // Step 3: wait (popup_present = 0.1)
         make_choice_response_with_results_and_popup("wait", "nothing to click", 0.1, 0.1),
-        // Step 4: click "搜尋或活動分類" -> low_box_conf (1st consecutive no-op)
+        // Step 4: click "搜尋或活動分類" -> low_box_conf (1st consecutive no-op; auxiliary target: 2 box asks)
         make_choice_response_with_results_and_popup("click", "搜尋或活動分類", 0.1, 0.1),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.10, 0.05),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.12, 0.05),
-        // Step 5: click "立即報名按鈕" -> low_box_conf (2nd consecutive no-op)
+        // Step 5: click "立即報名按鈕" -> low_box_conf (2nd consecutive no-op; primary target: 4 box asks)
         make_choice_response_with_results_and_popup("click", "立即報名按鈕", 0.1, 0.1),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.09, 0.05),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.11, 0.05),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.13, 0.05),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.15, 0.05),
-        // Step 6: click "票種選項" -> low_box_conf (3rd consecutive no-op -> blocked!)
+        // Step 6: click "票種選項" -> low_box_conf (3rd consecutive no-op -> blocked!; primary target: 4 box asks)
         make_choice_response_with_results_and_popup("click", "票種選項", 0.1, 0.1),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.08, 0.05),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.10, 0.05),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.11, 0.05),
         make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.13, 0.05),
     ]);
 
@@ -2446,23 +2447,7 @@ fn acc2_fixes_low_conf_exclusion_noop_cap_scroll_target_and_popup_target_gate() 
         }
         _ => panic!("Expected target choice question"),
     }
-    // Step 1 choice request (reqs[3]): "活動卡片" excluded (1st of 2 steps), "關閉彈窗" still NOT offered (step 0 popup_present = 0.2)
-    match reqs[3].questions.get("target").unwrap() {
-        Question::Choice { criteria, .. } => {
-            assert!(!criteria.contains_key("活動卡片"));
-            assert!(!criteria.contains_key("關閉彈窗"));
-        }
-        _ => panic!("Expected target choice question"),
-    }
-    // Step 2 choice request (reqs[4]): "活動卡片" STILL excluded (2nd of 2 steps), "關閉彈窗" IS offered (step 1 popup_present = 0.85 >= 0.6)
-    match reqs[4].questions.get("target").unwrap() {
-        Question::Choice { criteria, .. } => {
-            assert!(!criteria.contains_key("活動卡片"));
-            assert!(criteria.contains_key("關閉彈窗"));
-        }
-        _ => panic!("Expected target choice question"),
-    }
-    // Step 3 choice request (reqs[5]): "活動卡片" remains excluded for the rest of the run, "關閉彈窗" NOT offered (step 2 popup_present = 0.1 < 0.6)
+    // Step 1 choice request (reqs[5]): "活動卡片" excluded (1st of 3 steps), "關閉彈窗" still NOT offered (step 0 popup_present = 0.2)
     match reqs[5].questions.get("target").unwrap() {
         Question::Choice { criteria, .. } => {
             assert!(!criteria.contains_key("活動卡片"));
@@ -2470,15 +2455,38 @@ fn acc2_fixes_low_conf_exclusion_noop_cap_scroll_target_and_popup_target_gate() 
         }
         _ => panic!("Expected target choice question"),
     }
-    // Step 5 choice request (reqs[9]): "搜尋或活動分類" excluded (from step 4 low_box_conf)
-    match reqs[9].questions.get("target").unwrap() {
+    // Step 2 choice request (reqs[6]): "活動卡片" STILL excluded (2nd of 3 steps), "關閉彈窗" IS offered (step 1 popup_present = 0.85 >= 0.6)
+    match reqs[6].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("活動卡片"));
+            assert!(criteria.contains_key("關閉彈窗"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+    // Step 3 choice request (reqs[7]): "活動卡片" STILL excluded (3rd of 3 steps), "關閉彈窗" NOT offered (step 2 popup_present = 0.1 < 0.6)
+    match reqs[7].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("活動卡片"));
+            assert!(!criteria.contains_key("關閉彈窗"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+    // Step 4 choice request (reqs[8]): "活動卡片" is BACK in target choices after 3 excluded steps!
+    match reqs[8].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(criteria.contains_key("活動卡片"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+    // Step 5 choice request (reqs[11]): "搜尋或活動分類" excluded (from step 4 low_box_conf)
+    match reqs[11].questions.get("target").unwrap() {
         Question::Choice { criteria, .. } => {
             assert!(!criteria.contains_key("搜尋或活動分類"));
         }
         _ => panic!("Expected target choice question"),
     }
-    // Step 6 choice request (reqs[12]): both "搜尋或活動分類" (2nd step) and "立即報名按鈕" (1st step) excluded
-    match reqs[12].questions.get("target").unwrap() {
+    // Step 6 choice request (reqs[16]): both "搜尋或活動分類" (2nd step) and "立即報名按鈕" (1st step) excluded
+    match reqs[16].questions.get("target").unwrap() {
         Question::Choice { criteria, .. } => {
             assert!(!criteria.contains_key("搜尋或活動分類"));
             assert!(!criteria.contains_key("立即報名按鈕"));
@@ -2631,7 +2639,11 @@ fn f5_noop_counting_and_stop_on_scroll_dismiss_alternation_and_rest_of_run_exclu
         make_choice_response_with_results_and_popup("scroll", "向下捲動", 0.1, 0.9),
         make_choice_response_with_results_and_popup("dismiss popup", "關閉彈窗", 0.1, 0.9),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.05, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.06, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.07, 0.9),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.08, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.09, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.10, 0.9),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.11, 0.9),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.12, 0.9),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.14, 0.9),
@@ -2671,7 +2683,7 @@ fn f5_noop_counting_and_stop_on_scroll_dismiss_alternation_and_rest_of_run_exclu
 #[test]
 fn f5_popup_escape_then_specific_reask_then_corner_crop_mapping_and_box_width_guard() {
     use decision_cu::decider::{
-        POPUP_REASK_AD_CLOSE_DESC, POPUP_REASK_COOKIE_DESC,
+        POPUP_REASK_AD_CLOSE_DESC, POPUP_REASK_COOKIE_DESC, POPUP_REASK_COOKIE_GOT_IT_DESC,
     };
 
     let base_img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
@@ -2734,6 +2746,10 @@ fn f5_popup_escape_then_specific_reask_then_corner_crop_mapping_and_box_width_gu
         make_choice_response_with_results_and_popup("scroll", "向下捲動", 0.1, 0.9),
         make_choice_response_with_results_and_popup("dismiss popup", "關閉彈窗", 0.2, 0.9),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.10, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.11, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.11, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.11, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.11, 0.9),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.12, 0.9),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.15, 0.9),
         make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.18, 0.9),
@@ -2763,19 +2779,19 @@ fn f5_popup_escape_then_specific_reask_then_corner_crop_mapping_and_box_width_gu
     assert!((cy - 560.0).abs() < 1e-6, "expected cy=560.0, got {}", cy);
 
     let reqs = agent_crop.decider().backend().requests.borrow();
-    match reqs[3].questions.get("target_box").unwrap() {
+    match reqs[7].questions.get("target_box").unwrap() {
         Question::Box { instructions } => assert_eq!(instructions, POPUP_REASK_COOKIE_DESC),
         _ => panic!("Expected box question"),
     }
-    match reqs[4].questions.get("target_box").unwrap() {
+    match reqs[8].questions.get("target_box").unwrap() {
         Question::Box { instructions } => assert_eq!(instructions, POPUP_REASK_AD_CLOSE_DESC),
         _ => panic!("Expected box question"),
     }
-    match reqs[5].questions.get("target_box").unwrap() {
-        Question::Box { instructions } => assert_eq!(instructions, POPUP_REASK_COOKIE_DESC),
+    match reqs[9].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => assert_eq!(instructions, POPUP_REASK_COOKIE_GOT_IT_DESC),
         _ => panic!("Expected box question"),
     }
-    match reqs[6].questions.get("target_box").unwrap() {
+    match reqs[10].questions.get("target_box").unwrap() {
         Question::Box { instructions } => assert_eq!(instructions, POPUP_REASK_AD_CLOSE_DESC),
         _ => panic!("Expected box question"),
     }
@@ -2787,6 +2803,255 @@ fn f5_popup_escape_then_specific_reask_then_corner_crop_mapping_and_box_width_gu
         .collect();
     assert!(audit_purposes.contains(&"step_1_popup_bottom_right_2x"));
     assert!(audit_purposes.contains(&"step_1_popup_bottom_left_2x"));
+}
+
+#[test]
+fn f6_card_boxing_reask_content_crop_2x_mapping_wide_card_ok_and_short_primary_exclusion() {
+    use decision_cu::decider::{
+        CARD_REASK_FIRST_CARD_IMAGE_DESC, CARD_REASK_TITLE_TEXT_DESC,
+        PRIMARY_LOW_BOX_CONF_EXCLUDE_STEPS,
+    };
+
+    let base_img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 100.0,
+        y: 50.0,
+        width: 800.0,
+        height: 600.0,
+    };
+
+    let screen = MockScreen {
+        img: base_img.clone(),
+        rect: Some(window),
+        scale: 2.0,
+    };
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results_and_popup("click", "活動卡片", 0.3, 0.1),
+        make_box_response(0.1, 0.2, 0.4, 0.5, 0.11),
+        make_box_response(0.1, 0.2, 0.4, 0.5, 0.14),
+        make_box_response(0.1, 0.2, 0.4, 0.5, 0.18),
+        make_box_response(0.25, 0.10, 0.75, 0.40, 0.85),
+        make_choice_response_with_results_and_popup("done", "nothing to click", 0.9, 0.1),
+    ]);
+    let decider = VisionDecider::new(backend, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage);
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_flights_preset(false)
+        .with_start_url(Some("https://www.google.com/travel/flights".to_string()));
+
+    let summary = agent.run("Click Accupass card via content crop").unwrap();
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.clicks, 1);
+    assert_eq!(agent.input().clicks.len(), 1);
+
+    let (cx, cy) = agent.input().clicks[0];
+    assert!((cx - 300.0).abs() < 1e-4, "expected cx=300.0, got {}", cx);
+    assert!((cy - 390.0).abs() < 1e-4, "expected cy=390.0, got {}", cy);
+
+    let reqs = agent.decider().backend().requests.borrow();
+    match reqs[1].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => assert_eq!(instructions, "活動卡片"),
+        _ => panic!("Expected box question"),
+    }
+    match reqs[2].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => {
+            assert_eq!(instructions, CARD_REASK_FIRST_CARD_IMAGE_DESC)
+        }
+        _ => panic!("Expected box question"),
+    }
+    match reqs[3].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => assert_eq!(instructions, CARD_REASK_TITLE_TEXT_DESC),
+        _ => panic!("Expected box question"),
+    }
+    match reqs[4].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => {
+            assert_eq!(instructions, CARD_REASK_FIRST_CARD_IMAGE_DESC)
+        }
+        _ => panic!("Expected box question"),
+    }
+    let audit_purposes: Vec<&str> = agent
+        .audit_log()
+        .records()
+        .iter()
+        .map(|r| r.purpose.as_str())
+        .collect();
+    assert!(audit_purposes.contains(&"step_0_content_2x"));
+
+    assert_eq!(PRIMARY_LOW_BOX_CONF_EXCLUDE_STEPS, 3);
+    let events_within_3 = vec![
+        Some("low_box_conf:活動卡片".to_string()),
+        None,
+        None,
+    ];
+    assert!(
+        decision_cu::decider::compute_excluded_targets(&events_within_3)
+            .contains(&"活動卡片".to_string())
+    );
+    let events_after_4 = vec![
+        Some("low_box_conf:活動卡片".to_string()),
+        Some("low_box_conf:搜尋或活動分類".to_string()),
+        None,
+        None,
+        None,
+        None,
+    ];
+    let excluded_after_4 = decision_cu::decider::compute_excluded_targets(&events_after_4);
+    assert!(
+        !excluded_after_4.contains(&"活動卡片".to_string()),
+        "Primary target 活動卡片 must re-enter available targets after 3 steps"
+    );
+    assert!(
+        excluded_after_4.contains(&"搜尋或活動分類".to_string()),
+        "Auxiliary target 搜尋或活動分類 may remain excluded for the rest of the run"
+    );
+}
+
+#[test]
+fn f6_cookie_banner_specific_descriptions_and_bottom_right_corner_crop() {
+    use decision_cu::decider::{
+        POPUP_REASK_ACCEPT_DESC, POPUP_REASK_AGREE_DESC, POPUP_REASK_COOKIE_CLOSE_X_DESC,
+        POPUP_REASK_COOKIE_DESC, POPUP_REASK_COOKIE_GOT_IT_DESC,
+    };
+
+    let base_img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 100.0,
+        y: 50.0,
+        width: 800.0,
+        height: 600.0,
+    };
+
+    let screen_desc = MockScreen {
+        img: base_img.clone(),
+        rect: Some(window),
+        scale: 2.0,
+    };
+    let backend_desc = MockBackend::new(vec![
+        make_choice_response_with_results_and_popup("scroll", "向下捲動", 0.1, 0.9),
+        make_choice_response_with_results_and_popup("dismiss popup", "關閉彈窗", 0.2, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.10, 0.9),
+        make_box_response_with_closeish(0.80, 0.80, 0.90, 0.90, 0.82, 0.95),
+        make_choice_response_with_results_and_popup("done", "nothing to click", 0.9, 0.1),
+    ]);
+    let decider_desc = VisionDecider::new(backend_desc, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage);
+    let mut agent_desc = Agent::new(
+        screen_desc,
+        decider_desc,
+        MockInput::default(),
+        SafetyPolicy::default(),
+    )
+    .with_flights_preset(false)
+    .with_start_url(Some("https://www.accupass.com".to_string()));
+
+    let summary_desc = agent_desc.run("Dismiss cookie banner via got-it description").unwrap();
+    assert_eq!(summary_desc.stop_reason, StopReason::Done);
+    assert_eq!(summary_desc.clicks, 1);
+
+    let screen_br = MockScreen {
+        img: base_img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+    let backend_br = MockBackend::new(vec![
+        make_choice_response_with_results_and_popup("scroll", "向下捲動", 0.1, 0.9),
+        make_choice_response_with_results_and_popup("dismiss popup", "關閉彈窗", 0.2, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.08, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.09, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.10, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.11, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.12, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.13, 0.9),
+        make_box_response_with_closeish(0.4, 0.4, 0.5, 0.5, 0.14, 0.9),
+        make_box_response_with_closeish(0.6, 0.5, 0.8, 0.7, 0.90, 0.95),
+        make_choice_response_with_results_and_popup("done", "nothing to click", 0.9, 0.1),
+    ]);
+    let decider_br = VisionDecider::new(backend_br, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage);
+    let mut agent_br = Agent::new(
+        screen_br,
+        decider_br,
+        MockInput::default(),
+        SafetyPolicy::default(),
+    )
+    .with_flights_preset(false)
+    .with_start_url(Some("https://www.accupass.com".to_string()));
+
+    let summary_br = agent_br.run("Dismiss cookie banner via bottom-right corner crop").unwrap();
+    assert_eq!(summary_br.stop_reason, StopReason::Done);
+    assert_eq!(summary_br.clicks, 1);
+    let (cx, cy) = agent_br.input().clicks[0];
+    assert!((cx - 740.0).abs() < 1e-4, "expected cx=740.0, got {}", cx);
+    assert!((cy - 560.0).abs() < 1e-4, "expected cy=560.0, got {}", cy);
+
+    let reqs = agent_br.decider().backend().requests.borrow();
+    let expected_descs = [
+        "關閉彈窗",
+        POPUP_REASK_COOKIE_GOT_IT_DESC,
+        POPUP_REASK_ACCEPT_DESC,
+        POPUP_REASK_AGREE_DESC,
+        POPUP_REASK_COOKIE_CLOSE_X_DESC,
+        POPUP_REASK_COOKIE_DESC,
+    ];
+    for (idx, expected) in expected_descs.iter().enumerate() {
+        match reqs[2 + idx].questions.get("target_box").unwrap() {
+            Question::Box { instructions } => assert_eq!(instructions, expected),
+            _ => panic!("Expected box question at index {}", 2 + idx),
+        }
+    }
+}
+
+#[test]
+fn f6_no_available_targets_wait_counts_as_noop_and_stops_blocked() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    let backend = MockBackend::new(vec![
+        make_choice_response("click", "活動卡片"),
+        make_box_response(0.2, 0.2, 0.4, 0.4, 0.05),
+        make_box_response(0.2, 0.2, 0.4, 0.4, 0.08),
+        make_box_response(0.2, 0.2, 0.4, 0.4, 0.10),
+        make_box_response(0.2, 0.2, 0.4, 0.4, 0.12),
+        make_choice_response("wait", "nothing to click"),
+    ]);
+    let decider = VisionDecider::new(
+        backend,
+        vec![decision_cu::decider::TargetSpec::new("活動卡片", None)],
+    )
+    .with_preset(Preset::EventsZh)
+    .with_done_condition(DoneCondition::CheckoutPage);
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_flights_preset(false)
+        .with_start_url(Some("https://www.google.com/travel/flights".to_string()));
+
+    let summary = agent.run("Stop when no available targets").unwrap();
+    assert_eq!(
+        summary.stop_reason,
+        StopReason::SafetyBlocked("no available targets".to_string())
+    );
+    assert_eq!(summary.steps_taken, 2);
+    assert_eq!(
+        agent.policy().consecutive_waits(),
+        0,
+        "Wait when no available targets must count as no-op, not wait"
+    );
+    let json = summary.to_summary_json();
+    assert_eq!(json.status, "blocked");
+    assert_eq!(json.reason, "no available targets");
 }
 
 
