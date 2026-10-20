@@ -88,6 +88,29 @@ Exit codes:
 
 See [`skills/decision-computer-use/SKILL.md`](skills/decision-computer-use/SKILL.md) for full agent skill instructions.
 
+### Measured result (single run)
+
+> **Note:** The following records **ONE single live run** (not a multi-run benchmark).
+
+- **Date & Environment**: `2026-10-20` (`Asia/Tokyo`), commit `5515ddf`, model `vllm-sr/d3-turbo`, macOS on Mac mini, Chrome window `1200x916` pt.
+- **Task**: Cheapest one-way flight from Osaka (`KIX`) to Taipei (`TPE`) on Nov 3, 2026 on Google Flights (read-only).
+- **Command used**:
+  ```bash
+  decision-cu run \
+    --task "Find the cheapest one-way flight from Osaka (KIX) to Taipei (TPE) on Nov 3, 2026 on Google Flights" \
+    --start-url "https://www.google.com/travel/flights?hl=en" \
+    --fill "origin field=Osaka" \
+    --fill "destination field=Taipei" \
+    --fill "departure date=Nov 3, 2026" \
+    --max-steps 25 \
+    --json
+  ```
+- **Outcome**:
+  - `status`: `done` — reached the Google Flights results page (`KIX` to `TPE`, one way, `Tue, Nov 3`) showing flight prices; cheapest shown at the time of the run was **¥20,470** (Jetstar, nonstop).
+  - **Steps & Actions**: `11` steps, `9` clicks — all on the intended targets (`trip type dropdown`, `one way option`, `origin field`, `KIX` suggestion, `destination field`, `TPE` suggestion, `departure date`, `Done`, `Search`) plus `1` Return key press.
+  - **API & Privacy**: `22` API requests / `22` images sent; every image was a Chrome-window-only capture (`all_images_cropped: true`); average `4.77 s` per step; `0` tabs opened or closed; no text typed outside Chrome.
+  - **Context on earlier attempts**: Earlier live attempts failed (due to other application windows covering Chrome and missing UI settle delays) and those issues were fixed prior to this run.
+
 ### Safety Rules
 
 Enforced by `SafetyPolicy` (`src/safety.rs`) and `Agent` (`src/agent.rs`):
@@ -190,6 +213,29 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 - `--dry-run`：乾跑模式，不執行實際滑鼠或鍵盤動作。
 - `--json`：於標準輸出印出單一 JSON 結果物件（`{status, steps, reason, ...}`）。
 - 結束狀態碼：`0` (`done`)、`1` (`error`)、`2` (`step_limit`)、`3` (`wait_limit`)、`4` (`blocked`)。完整說明請參考 [`skills/decision-computer-use/SKILL.md`](skills/decision-computer-use/SKILL.md)。
+
+### 實測結果（單次執行）
+
+> **說明：** 以下僅為**單次實際執行（ONE single run）**之紀錄，並非多次測試之效能基準（not a benchmark）。
+
+- **日期與環境**：`2026-10-20`（`Asia/Tokyo` 時區）、commit `5515ddf`、模型 `vllm-sr/d3-turbo`、macOS（Mac mini）、Chrome 視窗大小 `1200x916` pt。
+- **任務內容**：於 Google Flights 查詢 2026 年 11 月 3 日從大阪（`KIX`）飛往台北（`TPE`）的最便宜單程機票（唯讀操作）。
+- **執行指令**：
+  ```bash
+  decision-cu run \
+    --task "Find the cheapest one-way flight from Osaka (KIX) to Taipei (TPE) on Nov 3, 2026 on Google Flights" \
+    --start-url "https://www.google.com/travel/flights?hl=en" \
+    --fill "origin field=Osaka" \
+    --fill "destination field=Taipei" \
+    --fill "departure date=Nov 3, 2026" \
+    --max-steps 25 \
+    --json
+  ```
+- **執行結果**：
+  - **狀態（`status`）**：`done`，成功抵達顯示票價的 Google Flights 搜尋結果頁面（`KIX` 至 `TPE`、單程、`Tue, Nov 3`）；執行當下畫面顯示之最便宜票價為 **¥20,470**（Jetstar，直飛 nonstop）。
+  - **步數與動作**：共 `11` 步、`9` 次點擊，全部精準命中預期目標（行程類型下拉選單 `trip type`、單程 `One way`、出發地 `origin`、`KIX` 建議選項、目的地 `destination`、`TPE` 建議選項、出發日期 `departure date`、`Done` 按鈕、`Search` 搜尋按鈕）以及 `1` 次 Return 鍵。
+  - **API 請求與隱私安全**：共發送 `22` 次 API 請求 / `22` 張圖片，每張圖片皆為僅擷取 Chrome 視窗的畫面（Chrome-window-only capture）；平均每步耗時 `4.77 s`；未開啟或關閉任何分頁；未在 Chrome 視窗外輸入任何文字。
+  - **早期嘗試備註**：先前的實機嘗試曾因其他應用程式視窗遮擋 Chrome 以及缺少畫面穩定延遲（settle delays）而失敗，相關問題已於本次執行前修復完成。
 
 ### 安全規則 (Safety Rules)
 

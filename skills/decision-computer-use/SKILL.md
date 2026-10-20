@@ -92,6 +92,18 @@ When `--json` is passed, `decision-cu` prints exactly one JSON object to `stdout
 
 Detailed per-step logs are written to `./runs/<timestamp>/steps.jsonl` and the run summary is written to `./runs/<timestamp>/summary.json` with automatic secret redaction (`redact()`).
 
+## Measured result (single run)
+
+> **Note:** This is **ONE single live run**, not a benchmark.
+
+- **Environment**: `2026-10-20` (`Asia/Tokyo`), commit `5515ddf`, model `vllm-sr/d3-turbo`, macOS on Mac mini, Chrome window `1200x916` pt.
+- **Task**: Cheapest one-way Osaka (`KIX`) to Taipei (`TPE`) on Nov 3, 2026 on Google Flights (read-only).
+- **Command**:
+  ```bash
+  decision-cu run --task "Find the cheapest one-way flight from Osaka (KIX) to Taipei (TPE) on Nov 3, 2026 on Google Flights" --start-url "https://www.google.com/travel/flights?hl=en" --fill "origin field=Osaka" --fill "destination field=Taipei" --fill "departure date=Nov 3, 2026" --max-steps 25 --json
+  ```
+- **Result**: `status: "done"` — reached the Google Flights results page (`KIX` to `TPE`, one way, Tue Nov 3) showing prices; cheapest shown at the time of the run was **¥20,470** (Jetstar, nonstop). Completed in `11` steps with `9` clicks on the intended targets (trip type, One way, origin, KIX suggestion, destination, TPE suggestion, departure date, Done, Search) plus `1` Return key press; `22` API requests / `22` images (every image a Chrome-window-only capture); average `4.77 s` per step; no tab opened or closed; no text typed outside Chrome. Earlier live attempts failed (other app windows covering Chrome, missing settle delays) and were fixed prior to this run.
+
 ## Safety Limits
 
 - **Chrome-Window Crop Only**: If no `Google Chrome` window is found (`crop == None`) or the cropped area is `< 50x50` px, `decision-cu` stops immediately (`status: "blocked"`, exit code `4`) and sends **zero** bytes over the network.
