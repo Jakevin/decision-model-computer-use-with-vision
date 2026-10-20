@@ -1,5 +1,5 @@
 use decision_cu::browser::{activate_chrome, frontmost_app};
-use decision_cu::capture::{screen_changed, topmost_app_at, Screen};
+use decision_cu::capture::{changed_fraction, is_changed, topmost_app_at, Screen};
 use decision_cu::input::Input;
 use serde::Serialize;
 use std::env;
@@ -9,7 +9,8 @@ use std::time::Duration;
 
 #[derive(Serialize)]
 struct ProbeOutput {
-    changed: f64,
+    changed_fraction: f64,
+    is_changed: bool,
     frontmost: Option<String>,
     topmost: Option<String>,
 }
@@ -41,7 +42,8 @@ fn main() -> ExitCode {
     let topmost = topmost_app_at(x, y);
     if topmost.as_deref() != Some("Google Chrome") {
         let out = ProbeOutput {
-            changed: 0.0,
+            changed_fraction: 0.0,
+            is_changed: false,
             frontmost: frontmost_app(),
             topmost,
         };
@@ -93,9 +95,11 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
 
-        let changed = screen_changed(&before, &after);
+        let frac = changed_fraction(&before, &after);
+        let changed = is_changed(&before, &after);
         let out = ProbeOutput {
-            changed,
+            changed_fraction: frac,
+            is_changed: changed,
             frontmost: frontmost_app(),
             topmost: topmost_app_at(x, y),
         };
@@ -107,7 +111,14 @@ fn main() -> ExitCode {
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (out_path, screen_changed, Duration::from_millis(1500), thread::sleep, Input::click);
+        let _ = (
+            out_path,
+            changed_fraction,
+            is_changed,
+            Duration::from_millis(1500),
+            thread::sleep,
+            Input::click,
+        );
         ExitCode::from(1)
     }
 }

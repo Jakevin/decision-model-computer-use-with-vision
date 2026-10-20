@@ -1,6 +1,6 @@
 use crate::api::DecisionBackend;
 use crate::browser::{Browser, DefaultAllowedBrowser};
-use crate::capture::{screen_changed, CaptureError, Rect, Screen};
+use crate::capture::{changed_fraction, is_changed, CaptureError, Rect, Screen};
 use crate::decider::{
     compute_excluded_targets, ActionKind, DeciderError, Decision, VisionDecider,
 };
@@ -134,7 +134,7 @@ pub struct ReclickEventRecord {
     pub step: usize,
     pub target: String,
     pub point: (f64, f64),
-    pub changed: f64,
+    pub changed_fraction: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -579,8 +579,8 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                                     thread::sleep(self.timing.dropdown_reclick_wait);
                                 }
                                 let after = self.screen.capture()?;
-                                let diff = screen_changed(&full, &after);
-                                if diff < 1.0 {
+                                let frac = changed_fraction(&full, &after);
+                                if !is_changed(&full, &after) {
                                     if let Err(reason) = self.check_unoccluded_at(step, pt) {
                                         stop_reason = StopReason::SafetyBlocked(reason);
                                         break;
@@ -593,7 +593,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                                             step,
                                             target: tgt.to_string(),
                                             point: pt,
-                                            changed: diff,
+                                            changed_fraction: frac,
                                         };
                                         let _ = logger.log_entry(&evt);
                                     }

@@ -95,20 +95,26 @@ pub fn topmost_app_at(_x_pt: f64, _y_pt: f64) -> Option<String> {
     None
 }
 
-pub fn screen_changed(a: &RgbaImage, b: &RgbaImage) -> f64 {
+pub fn changed_fraction(a: &RgbaImage, b: &RgbaImage) -> f64 {
     use image::imageops::{grayscale, resize, FilterType};
 
     let gray_a = grayscale(a);
     let gray_b = grayscale(b);
-    let thumb_a = resize(&gray_a, 64, 36, FilterType::Triangle);
-    let thumb_b = resize(&gray_b, 64, 36, FilterType::Triangle);
+    let thumb_a = resize(&gray_a, 320, 180, FilterType::Triangle);
+    let thumb_b = resize(&gray_b, 320, 180, FilterType::Triangle);
 
-    let mut total_diff = 0.0f64;
-    let count = (64 * 36) as f64;
+    let mut diff_pixels = 0usize;
+    let total = (320 * 180) as f64;
     for (pa, pb) in thumb_a.pixels().zip(thumb_b.pixels()) {
-        total_diff += (pa[0] as f64 - pb[0] as f64).abs();
+        if (pa[0] as i32 - pb[0] as i32).abs() > 24 {
+            diff_pixels += 1;
+        }
     }
-    total_diff / count
+    (diff_pixels as f64) / total
+}
+
+pub fn is_changed(a: &RgbaImage, b: &RgbaImage) -> bool {
+    changed_fraction(a, b) > 0.002
 }
 
 #[derive(Debug, Error)]
@@ -280,13 +286,21 @@ mod tests {
     }
 
     #[test]
-    fn screen_changed_identical_and_different_images() {
-        let img1 = RgbaImage::from_pixel(200, 100, image::Rgba([50, 50, 50, 255]));
-        let img2 = RgbaImage::from_pixel(200, 100, image::Rgba([50, 50, 50, 255]));
-        let img3 = RgbaImage::from_pixel(200, 100, image::Rgba([200, 200, 200, 255]));
+    fn changed_fraction_and_is_changed_on_identical_and_bright_patch() {
+        let base = RgbaImage::from_pixel(1200, 900, image::Rgba([40, 40, 40, 255]));
+        let identical = base.clone();
+        assert_eq!(changed_fraction(&base, &identical), 0.0);
+        assert!(!is_changed(&base, &identical));
 
-        assert_eq!(screen_changed(&img1, &img2), 0.0);
-        let diff = screen_changed(&img1, &img3);
-        assert!(diff > 100.0, "expected large diff, got {}", diff);
+        // A 60x60 bright patch on 1200x900 (~0.33% area > 0.002 threshold)
+        let mut with_patch = base.clone();
+        for y in 100..160 {
+            for x in 200..260 {
+                with_patch.put_pixel(x, y, image::Rgba([240, 240, 240, 255]));
+            }
+        }
+        let frac = changed_fraction(&base, &with_patch);
+        assert!(frac > 0.002, "expected fraction > 0.002, got {}", frac);
+        assert!(is_changed(&base, &with_patch));
     }
 }
