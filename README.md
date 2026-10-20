@@ -10,6 +10,8 @@ A screenshot-only macOS computer-use agent written in Rust (`decision-cu`, editi
 
 `decision-cu` is a typesafe, privacy-conscious, read-only macOS computer-use agent in Rust. Instead of relying on DOM scraping, browser extensions, or accessibility trees, it operates strictly on cropped screenshots of the active Google Chrome window and uses structured visual decision queries (`choice` and `box` questions) via the vllm-sr Decision 3.0 API to navigate and inspect web interfaces (such as Google Flights).
 
+An agent skill definition is also included at [`skills/decision-computer-use/SKILL.md`](skills/decision-computer-use/SKILL.md) so AI coding and automation agents can invoke `decision-cu` with structured `--json` output and well-defined exit codes.
+
 ### How It Works
 
 1. **Screenshot-Only Capture (`src/capture.rs` & `src/privacy.rs`)**:
@@ -46,7 +48,7 @@ export VSR_API_KEY="sk-vsr-your-secret-key-here"
 
 - **Never commit your API key** to version control (`.env` is gitignored).
 - Internally, the key is wrapped in an `ApiKey` newtype whose `Debug` and `Display` implementations always output `ApiKey(***)`.
-- All transport errors, API errors, and JSONL run logs in `./runs/` pass through secret sanitization (`redact()`) so neither `VSR_API_KEY` nor any `sk-vsr-[0-9A-Za-z]{43}` token is ever printed or written to disk.
+- All transport errors, API errors, CLI outputs, and JSONL run logs in `./runs/` pass through secret sanitization (`redact()`) so neither `VSR_API_KEY` nor any `sk-vsr-[0-9A-Za-z]{43}` token is ever printed or written to disk.
 
 ### Running & Testing
 
@@ -60,12 +62,28 @@ cargo test
 Run the CLI agent (with Google Chrome open to Google Flights):
 
 ```bash
-# Dry-run mode (captures, crops, queries API, and checks safety without moving mouse/keyboard)
-cargo run -- run --goal "Find nonstop flights from SFO to JFK next Friday" --max-steps 15 --dry-run
+# Using --task (or --goal alias) in dry-run mode with structured JSON output
+cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max-steps 15 --dry-run --json
 
 # Live execution
-cargo run -- run --goal "Find nonstop flights from SFO to JFK next Friday" --max-steps 30
+cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max-steps 30 --json
 ```
+
+#### CLI Flags & Exit Codes (`decision-cu run`)
+
+- `--task <TASK>` (alias `--goal <TASK>`): Natural language task/goal to accomplish.
+- `--max-steps <MAX_STEPS>`: Maximum number of steps before stopping (default `30`).
+- `--dry-run`: Perform capture and decision making without executing mouse/keyboard actions.
+- `--json`: Print a single final JSON result object to stdout: `{"status":"done|step_limit|wait_limit|blocked|error","steps":N,"reason":"..."}`.
+
+Exit codes:
+- `0` (`done`): Task completed.
+- `1` (`error`): Missing `VSR_API_KEY`, transport/API failure, or platform error.
+- `2` (`step_limit`): Reached `--max-steps`.
+- `3` (`wait_limit`): Exceeded maximum consecutive waits (`> 2`).
+- `4` (`blocked`): Blocked by privacy (`NoCrop` / `CropTooSmall`) or safety policy (`ClickInTabStrip`, `ForbiddenTarget`, etc.).
+
+See [`skills/decision-computer-use/SKILL.md`](skills/decision-computer-use/SKILL.md) for full agent skill instructions.
 
 ### Safety Rules
 
@@ -99,6 +117,8 @@ Design inspired by `awlevin/typesafe-computer-use` (no code copied).
 ### 專案簡介 (What It Is)
 
 `decision-cu` 是一個以 Rust（2021 Edition）從零編寫、僅依賴螢幕截圖（screenshot-only）的 macOS 電腦操作代理程式（Computer-Use Agent），由 **vllm-sr Decision 3.0 API**（`https://decision.vllm-sr.ai/v1/systemone`，模型 `vllm-sr/d3-turbo`）驅動。本專案不依賴 DOM 解析、瀏覽器外掛或無障礙樹（Accessibility Tree），而是直接擷取並裁切 Google Chrome 視窗畫面，透過型別安全的結構化視覺問答（`choice` 選擇題與 `box` 邊界框定位題）完成網頁操作。
+
+本倉庫同時提供 [`skills/decision-computer-use/SKILL.md`](skills/decision-computer-use/SKILL.md) 技能定義檔，方便 AI 代理程式透過 `--task` 與 `--json` 旗標自動化呼叫並解析結果與狀態碼。
 
 ### 運作原理 (How It Works)
 
@@ -136,7 +156,7 @@ export VSR_API_KEY="sk-vsr-your-secret-key-here"
 
 - **切勿將金鑰提交至 Git**（`.env` 與 `runs/` 已列入 `.gitignore`）。
 - 金鑰封裝於 `ApiKey` 新型別中，其 `Debug` 與 `Display` 輸出永遠為 `ApiKey(***)`。
-- 所有錯誤訊息與 `./runs/` 下的 JSONL 執行紀錄皆經過 `redact()` 過濾，自動將目前金鑰與任何符合 `sk-vsr-[0-9A-Za-z]{43}` 格式的字串替換為 `"***"`。
+- 所有錯誤訊息、CLI 輸出與 `./runs/` 下的 JSONL 執行紀錄皆經過 `redact()` 過濾，自動將目前金鑰與任何符合 `sk-vsr-[0-9A-Za-z]{43}` 格式的字串替換為 `"***"`。
 
 ### 執行與測試
 
@@ -150,12 +170,20 @@ cargo test
 執行 CLI（請先開啟 Google Chrome 並停留在 Google Flights 頁面）：
 
 ```bash
-# 乾跑模式（僅截圖與詢問模型決策，不實際移動滑鼠或按鍵）
-cargo run -- run --goal "Find nonstop flights from SFO to JFK next Friday" --max-steps 15 --dry-run
+# 乾跑模式（僅截圖與詢問模型決策，不實際移動滑鼠或按鍵），並輸出單行 JSON 結果
+cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max-steps 15 --dry-run --json
 
-# 實際執行模式
-cargo run -- run --goal "Find nonstop flights from SFO to JFK next Friday" --max-steps 30
+# 實際執行模式（亦可使用 --goal 別名）
+cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max-steps 30 --json
 ```
+
+#### CLI 參數與結束狀態碼 (Exit Codes)
+
+- `--task <TASK>`（別名 `--goal <TASK>`）：指定自然語言任務目標。
+- `--max-steps <MAX_STEPS>`：最大步數上限（預設 `30`）。
+- `--dry-run`：乾跑模式，不執行實際滑鼠或鍵盤動作。
+- `--json`：於標準輸出印出單一 JSON 結果物件：`{"status":"done|step_limit|wait_limit|blocked|error","steps":N,"reason":"..."}`。
+- 結束狀態碼：`0` (`done`)、`1` (`error`)、`2` (`step_limit`)、`3` (`wait_limit`)、`4` (`blocked`)。完整說明請參考 [`skills/decision-computer-use/SKILL.md`](skills/decision-computer-use/SKILL.md)。
 
 ### 安全規則 (Safety Rules)
 
