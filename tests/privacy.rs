@@ -445,10 +445,18 @@ fn waits_limit() {
 fn box_centre_mapping() {
     let prepared = PreparedImage {
         data_url: "data:image/jpeg;base64,".to_string(),
-        crop_origin_px: (200, 100),
+        crop_origin_px: (0, 0),
         crop_size_px: (1600, 1200),
         sent_size_px: (800, 600),
         scale_factor: 2.0,
+        window_rect: Some(Rect {
+            x: 100.0,
+            y: 50.0,
+            width: 800.0,
+            height: 600.0,
+        }),
+        capture_size_px: (1600, 1200),
+        source_rgba: None,
     };
     let bbox = BoundingBox {
         top: 0.25,
@@ -457,8 +465,8 @@ fn box_centre_mapping() {
         right: 0.90,
     };
     // center_x_frac = 0.70, center_y_frac = 0.50
-    // crop_x_px = 200 + 0.70 * 1600 = 200 + 1120 = 1320 px -> / 2.0 scale = 660.0 pt
-    // crop_y_px = 100 + 0.50 * 1200 = 100 + 600 = 700 px -> / 2.0 scale = 350.0 pt
+    // x_pt = 100 + (0 + 0.70 * 1600) * 800 / 1600 = 100 + 560 = 660.0 pt
+    // y_pt = 50 + (0 + 0.50 * 1200) * 600 / 1200 = 50 + 300 = 350.0 pt
     let (pt_x, pt_y) = map_box_center_to_screen_pt(&bbox, &prepared);
     assert!((pt_x - 660.0).abs() < 1e-6);
     assert!((pt_y - 350.0).abs() < 1e-6);
@@ -472,6 +480,14 @@ fn reask_when_confidence_below_threshold() {
         crop_size_px: (1000, 800),
         sent_size_px: (1000, 800),
         scale_factor: 2.0,
+        window_rect: Some(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 500.0,
+            height: 400.0,
+        }),
+        capture_size_px: (1000, 800),
+        source_rgba: None,
     };
 
     let backend = MockBackend::new(vec![
@@ -816,7 +832,7 @@ fn summary_counters_and_step_log_fields() {
     assert!(step0["seconds"].is_number());
     assert_eq!(step0["results_noul"], 0.1);
     assert!(step0["sent_image_crop_rect"].is_object());
-    assert_eq!(step0["sent_size"], serde_json::json!([1400, 1000]));
+    assert_eq!(step0["sent_size"], serde_json::json!([1460, 1095]));
     assert_eq!(step0["full_screen_size"], serde_json::json!([1600, 1200]));
 
     let key = ApiKey::new("sk-vsr-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefG");
@@ -1189,6 +1205,14 @@ fn events_and_generic_preset_target_criteria_and_targets_file() {
         crop_size_px: (1000, 800),
         sent_size_px: (1000, 800),
         scale_factor: 2.0,
+        window_rect: Some(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 500.0,
+            height: 400.0,
+        }),
+        capture_size_px: (1000, 800),
+        source_rgba: None,
     };
 
     let events_targets = Preset::Events.default_targets();
@@ -3117,6 +3141,7 @@ fn f7_event_page_priority_and_footer_scroll_reversal_with_direction_logging() {
     let backend = MockBackend::new(vec![
         make_choice_response_with_results_popup_and_footer("scroll", "向下捲動", 0.2, 0.1, 0.1),
         make_box_response(0.3, 0.6, 0.4, 0.8, 0.85),
+        make_price_box_response(0.4, 0.2, 0.5, 0.4, 0.10),
         make_choice_response_with_results_popup_and_footer("scroll", "向下捲動", 0.2, 0.1, 0.72),
         make_box_response(0.3, 0.6, 0.4, 0.8, 0.05),
         make_box_response(0.5, 0.2, 0.6, 0.8, 0.08),
@@ -3335,3 +3360,401 @@ fn f7_reappearing_popup_closed_at_most_once_more_then_ignored() {
 
 
 
+fn make_price_box_response(
+    top: f64,
+    left: f64,
+    bottom: f64,
+    right: f64,
+    confidence: f64,
+) -> Response {
+    let mut answers = BTreeMap::new();
+    answers.insert(
+        "price_box".to_string(),
+        Answer::Box {
+            bbox: BoundingBox {
+                top,
+                left,
+                bottom,
+                right,
+            },
+            confidence,
+        },
+    );
+    Response {
+        answers,
+        model: DEFAULT_MODEL.to_string(),
+        usage: Usage {
+            input_tokens: 100,
+            output_tokens: 0,
+        },
+    }
+}
+
+#[test]
+fn f8_negative_origin_mapping_on_secondary_display_with_different_scale() {
+    use decision_cu::capture::{select_main_window_with_id, BoundWindowCapture, WinInfo};
+    use decision_cu::privacy::{prepare_content_zoom_2x, prepare_corner_zoom_2x, CornerRegion};
+
+    let wins = vec![
+        WinInfo {
+            window_id: 101,
+            app_name: "Google Chrome".to_string(),
+            title: "Main Tab".to_string(),
+            is_minimized: false,
+            x: -1440.0,
+            y: -300.0,
+            width: 576.0,
+            height: 360.0,
+        },
+        WinInfo {
+            window_id: 202,
+            app_name: "Google Chrome".to_string(),
+            title: "Small Popup".to_string(),
+            is_minimized: false,
+            x: 0.0,
+            y: 0.0,
+            width: 400.0,
+            height: 300.0,
+        },
+    ];
+    let (wid, rect) = select_main_window_with_id(&wins).unwrap();
+    assert_eq!(wid, 101);
+    assert_eq!(rect.x, -1440.0);
+    assert_eq!(rect.y, -300.0);
+
+    // Secondary display is 1.25x scale (720x450 px for 576x360 pt), while main display is 2.0x
+    let img = RgbaImage::from_pixel(720, 450, Rgba([220, 220, 220, 255]));
+    let prepared = prepare_image(&img, Some(rect), 2.0).unwrap();
+    assert_eq!(prepared.crop_origin_px, (0, 0));
+    assert_eq!(prepared.crop_size_px, (720, 450));
+    assert_eq!(prepared.capture_size_px, (720, 450));
+    assert_eq!(prepared.window_rect, Some(rect));
+
+    let bbox = BoundingBox {
+        top: 0.20,
+        left: 0.25,
+        bottom: 0.60,
+        right: 0.75,
+    };
+    // cx = 0.50 -> -1440 + 0.50 * 576 = -1152.0
+    // cy = 0.40 -> -300 + 0.40 * 360 = -156.0
+    let (x_pt, y_pt) = map_box_center_to_screen_pt(&bbox, &prepared);
+    assert!((x_pt - (-1152.0)).abs() < 1e-6);
+    assert!((y_pt - (-156.0)).abs() < 1e-6);
+
+    let zoom = prepare_content_zoom_2x(&prepared).unwrap();
+    let (zx, zy) = map_box_center_to_screen_pt(&bbox, &zoom);
+    let expected_zx =
+        rect.x + (zoom.crop_origin_px.0 as f64 + 0.50 * zoom.crop_size_px.0 as f64) * rect.width
+            / 720.0;
+    let expected_zy =
+        rect.y + (zoom.crop_origin_px.1 as f64 + 0.40 * zoom.crop_size_px.1 as f64) * rect.height
+            / 450.0;
+    assert!((zx - expected_zx).abs() < 1e-6);
+    assert!((zy - expected_zy).abs() < 1e-6);
+
+    let corner_zoom = prepare_corner_zoom_2x(&prepared, CornerRegion::BottomRight).unwrap();
+    let (cx_pt, cy_pt) = map_box_center_to_screen_pt(&bbox, &corner_zoom);
+    let expected_cx = rect.x
+        + (corner_zoom.crop_origin_px.0 as f64 + 0.50 * corner_zoom.crop_size_px.0 as f64)
+            * rect.width
+            / 720.0;
+    let expected_cy = rect.y
+        + (corner_zoom.crop_origin_px.1 as f64 + 0.40 * corner_zoom.crop_size_px.1 as f64)
+            * rect.height
+            / 450.0;
+    assert!((cx_pt - expected_cx).abs() < 1e-6);
+    assert!((cy_pt - expected_cy).abs() < 1e-6);
+
+    struct BoundSecondaryScreen {
+        img: RgbaImage,
+        rect: Rect,
+    }
+    impl Screen for BoundSecondaryScreen {
+        fn capture(&self) -> Result<RgbaImage, CaptureError> {
+            Ok(self.img.clone())
+        }
+        fn chrome_window_rect(&self) -> Option<Rect> {
+            Some(self.rect)
+        }
+        fn capture_window(&self) -> Result<BoundWindowCapture, CaptureError> {
+            Ok(BoundWindowCapture {
+                window_id: 101,
+                image: self.img.clone(),
+                rect: Some(self.rect),
+            })
+        }
+        fn scale_factor(&self) -> f64 {
+            2.0
+        }
+    }
+
+    let screen = BoundSecondaryScreen { img, rect };
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results("click", "search button", 0.1),
+        make_box_response(0.20, 0.25, 0.60, 0.75, 0.90),
+        make_choice_response_with_results("done", "nothing to click", 0.9),
+    ]);
+    let decider = VisionDecider::new(backend, vec![TargetSpec::new("search button", None)]);
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default());
+    let summary = agent.run("Click on secondary display").unwrap();
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(agent.input().clicks.len(), 1);
+    let (click_x, click_y) = agent.input().clicks[0];
+    assert!((click_x - (-1152.0)).abs() < 1e-6);
+    assert!((click_y - (-156.0)).abs() < 1e-6);
+}
+
+#[test]
+fn f8_crop_rounding_uses_actual_integer_sub_ratios() {
+    use decision_cu::decider::{map_content_box_to_window_box, map_corner_box_to_window_box};
+    use decision_cu::privacy::{content_crop_rect_px, corner_crop_rect_px, CornerRegion};
+
+    let full_w = 103u32;
+    let full_h = 667u32;
+    let img = RgbaImage::from_pixel(full_w, full_h, Rgba([200, 200, 200, 255]));
+    let rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 80.0,
+        height: 510.0,
+    };
+    let prepared = prepare_image(&img, Some(rect), 1.0).unwrap();
+
+    // scale_y = 667 / 510 = 1.307843..., toolbar_px = round(80 * 1.307843) = 105
+    // Notice 105 / 667 != 80.0 / 510.0 (integer rounding difference!)
+    let (sub_x, sub_y, sub_w, sub_h) = content_crop_rect_px(&prepared);
+    assert_eq!(sub_x, 0);
+    assert_eq!(sub_y, 105);
+    assert_eq!(sub_w, 103);
+    assert_eq!(sub_h, 562);
+    assert!(((sub_y as f64 / full_h as f64) - (80.0 / 510.0)).abs() > 1e-4);
+
+    let sub_box = BoundingBox {
+        top: 0.25,
+        left: 0.20,
+        bottom: 0.75,
+        right: 0.80,
+    };
+    let mapped_content = map_content_box_to_window_box(&sub_box, &prepared);
+    let expected_top = (sub_y as f64 / full_h as f64) + 0.25 * (sub_h as f64 / full_h as f64);
+    let expected_bottom = (sub_y as f64 / full_h as f64) + 0.75 * (sub_h as f64 / full_h as f64);
+    assert!((mapped_content.top - expected_top).abs() < 1e-12);
+    assert!((mapped_content.bottom - expected_bottom).abs() < 1e-12);
+
+    let (cx, cy, cw, ch) = corner_crop_rect_px(full_w, full_h, CornerRegion::BottomRight);
+    assert_eq!(cx, 52);
+    assert_eq!(cy, 334);
+    assert_eq!(cw, 51);
+    assert_eq!(ch, 333);
+
+    let mapped_corner =
+        map_corner_box_to_window_box(&sub_box, &prepared, CornerRegion::BottomRight);
+    let expected_c_left = (cx as f64 / full_w as f64) + 0.20 * (cw as f64 / full_w as f64);
+    let expected_c_right = (cx as f64 / full_w as f64) + 0.80 * (cw as f64 / full_w as f64);
+    let expected_c_top = (cy as f64 / full_h as f64) + 0.25 * (ch as f64 / full_h as f64);
+    let expected_c_bottom = (cy as f64 / full_h as f64) + 0.75 * (ch as f64 / full_h as f64);
+    assert!((mapped_corner.left - expected_c_left).abs() < 1e-12);
+    assert!((mapped_corner.right - expected_c_right).abs() < 1e-12);
+    assert!((mapped_corner.top - expected_c_top).abs() < 1e-12);
+    assert!((mapped_corner.bottom - expected_c_bottom).abs() < 1e-12);
+}
+
+#[test]
+fn f8_zoom_from_original_crops_without_jpeg_roundtrip() {
+    use decision_cu::privacy::{prepare_content_zoom_2x, prepare_corner_zoom_2x, CornerRegion};
+
+    let mut orig = RgbaImage::from_pixel(400, 300, Rgba([128, 128, 128, 255]));
+    for y in 160..280 {
+        for x in 210..380 {
+            orig.put_pixel(x, y, Rgba([0, 255, 0, 255]));
+        }
+    }
+    let rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 400.0,
+        height: 300.0,
+    };
+    let mut prepared = prepare_image(&orig, Some(rect), 1.0).unwrap();
+    assert!(prepared.source_rgba.is_some());
+    prepared.data_url = "data:image/jpeg;base64,NOT_VALID_JPEG".to_string();
+
+    let content_zoom = prepare_content_zoom_2x(&prepared).unwrap();
+    assert_eq!(content_zoom.capture_size_px, (400, 300));
+    assert_eq!(content_zoom.crop_origin_px, (0, 80));
+    assert_eq!(content_zoom.crop_size_px, (400, 220));
+    assert_eq!(content_zoom.sent_size_px, (800, 440));
+
+    let corner_zoom = prepare_corner_zoom_2x(&prepared, CornerRegion::BottomRight).unwrap();
+    assert_eq!(corner_zoom.capture_size_px, (400, 300));
+    assert_eq!(corner_zoom.crop_origin_px, (200, 150));
+    assert_eq!(corner_zoom.crop_size_px, (200, 150));
+    assert_eq!(corner_zoom.sent_size_px, (400, 300));
+}
+
+#[test]
+fn f8_login_stop_on_url_or_login_form_noul() {
+    use decision_cu::decider::LOGIN_FORM_QUESTION_INSTRUCTIONS;
+
+    let img = RgbaImage::from_pixel(800, 600, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+
+    let screen1 = MockScreen {
+        img: img.clone(),
+        rect: Some(window),
+        scale: 1.0,
+    };
+    let backend1 = MockBackend::new(vec![]);
+    let decider1 = VisionDecider::new(backend1, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh);
+    let browser1 = SequenceBrowser::new(vec![Some(
+        "https://www.accupass.com/login?redirect=/event/123".to_string(),
+    )]);
+    let mut agent1 = Agent::new(
+        screen1,
+        decider1,
+        MockInput::default(),
+        SafetyPolicy::default().with_allowed_prefixes(vec!["https://www.accupass.com".to_string()]),
+    )
+    .with_browser(browser1)
+    .with_flights_preset(false);
+
+    let summary1 = agent1.run("Register on event").unwrap();
+    assert_eq!(
+        summary1.stop_reason,
+        StopReason::SafetyBlocked("login required".to_string())
+    );
+    let json1 = summary1.to_summary_json();
+    assert_eq!(json1.status, "blocked");
+    assert_eq!(json1.reason, "login required");
+    assert_eq!(agent1.decider().requests_sent(), 0);
+
+    let screen2 = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 1.0,
+    };
+    let mut resp = make_choice_response_with_results("click", "立即報名按鈕", 0.1);
+    resp.answers
+        .insert("login_form".to_string(), Answer::Noul { noul: 0.65 });
+    let backend2 = MockBackend::new(vec![resp]);
+    let decider2 = VisionDecider::new(backend2, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh);
+    let browser2 = SequenceBrowser::new(vec![Some(
+        "https://www.accupass.com/event/123".to_string(),
+    )]);
+    let mut agent2 = Agent::new(
+        screen2,
+        decider2,
+        MockInput::default(),
+        SafetyPolicy::default().with_allowed_prefixes(vec!["https://www.accupass.com".to_string()]),
+    )
+    .with_browser(browser2)
+    .with_flights_preset(false);
+
+    let summary2 = agent2.run("Register on event").unwrap();
+    assert_eq!(
+        summary2.stop_reason,
+        StopReason::SafetyBlocked("login required".to_string())
+    );
+    let json2 = summary2.to_summary_json();
+    assert_eq!(json2.status, "blocked");
+    assert_eq!(json2.reason, "login required");
+    assert_eq!(agent2.input().clicks.len(), 0);
+    assert_eq!(agent2.decider().requests_sent(), 1);
+    let reqs2 = agent2.decider().backend().requests.borrow();
+    match reqs2[0].questions.get("login_form").unwrap() {
+        Question::Noul { instructions } => {
+            assert_eq!(instructions, LOGIN_FORM_QUESTION_INSTRUCTIONS);
+        }
+        _ => panic!("Expected login_form noul question"),
+    }
+}
+
+#[test]
+fn f8_price_seen_recorded_before_clicking_register_on_event_page() {
+    use decision_cu::decider::PRICE_TEXT_BOX_DESC;
+
+    let img = RgbaImage::from_pixel(1000, 800, Rgba([230, 240, 250, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 1000.0,
+        height: 800.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 1.0,
+    };
+
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results_popup_and_footer("click", "立即報名按鈕", 0.2, 0.1, 0.1),
+        make_box_response(0.60, 0.70, 0.70, 0.90, 0.92),
+        make_price_box_response(0.40, 0.20, 0.50, 0.45, 0.84),
+        make_choice_response_with_results_popup_and_footer("done", "nothing to click", 0.9, 0.1, 0.1),
+    ]);
+
+    let decider = VisionDecider::new(backend, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage);
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_f8_price_seen");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+    let summary_path = logger.summary_path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_flights_preset(false)
+        .with_start_url(Some("https://www.accupass.com/event/251021".to_string()))
+        .with_logger(logger);
+
+    let summary = agent.run("Find event price and register").unwrap();
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.clicks, 1);
+    assert_eq!(summary.price_crops.len(), 1);
+    let crop_path = std::path::Path::new(&summary.price_crops[0]);
+    assert!(crop_path.exists(), "Saved price crop jpg must exist in run dir");
+    assert!(crop_path.starts_with(&temp_dir));
+
+    let reqs = agent.decider().backend().requests.borrow();
+    match reqs[2].questions.get("price_box").unwrap() {
+        Question::Box { instructions } => {
+            assert_eq!(instructions, PRICE_TEXT_BOX_DESC);
+        }
+        _ => panic!("Expected price_box question"),
+    }
+
+    let steps_str = std::fs::read_to_string(&steps_path).unwrap();
+    let price_events: Vec<serde_json::Value> = steps_str
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("price_seen"))
+        .collect();
+    assert_eq!(price_events.len(), 1);
+    assert_eq!(price_events[0]["step"], 0);
+    assert!((price_events[0]["confidence"].as_f64().unwrap() - 0.84).abs() < 1e-6);
+    assert_eq!(
+        price_events[0]["crop_path"].as_str().unwrap(),
+        summary.price_crops[0]
+    );
+    assert_eq!(price_events[0]["box_crop_px"]["top"], 320);
+    assert_eq!(price_events[0]["box_crop_px"]["left"], 200);
+    assert_eq!(price_events[0]["box_crop_px"]["bottom"], 400);
+    assert_eq!(price_events[0]["box_crop_px"]["right"], 450);
+
+    let summary_str = std::fs::read_to_string(&summary_path).unwrap();
+    let summary_val: serde_json::Value = serde_json::from_str(&summary_str).unwrap();
+    let crops_arr = summary_val["price_crops"].as_array().unwrap();
+    assert_eq!(crops_arr.len(), 1);
+    assert_eq!(crops_arr[0].as_str().unwrap(), summary.price_crops[0]);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

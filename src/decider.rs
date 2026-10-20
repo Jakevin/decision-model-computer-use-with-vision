@@ -2,8 +2,8 @@ use crate::api::{
     Answer, ApiError, BoundingBox, DecisionBackend, Question, Request, Response, DEFAULT_MODEL,
 };
 use crate::privacy::{
-    content_region_offset_and_scale_frac, prepare_content_zoom_2x, prepare_corner_zoom_2x,
-    CornerRegion, PreparedImage,
+    content_region_offset_and_scale_frac, corner_offset_and_scale_frac, prepare_content_zoom_2x,
+    prepare_corner_zoom_2x, CornerRegion, PreparedImage,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -33,6 +33,9 @@ pub const EVENT_PAGE_REGISTER_DESC: &str = "立即報名 或 購票 或 報名 �
 pub const EVENT_PAGE_TICKET_DESC: &str = "票種列表中第一列或價格最低的票種選項";
 pub const FOOTER_QUESTION_INSTRUCTIONS: &str = "頁面底部的頁尾區塊（關於我們/客服中心）";
 pub const FOOTER_DETECTED_THRESHOLD: f64 = 0.5;
+pub const LOGIN_FORM_QUESTION_INSTRUCTIONS: &str = "登入表單（電子信箱與密碼欄位）";
+pub const LOGIN_FORM_DETECTED_THRESHOLD: f64 = 0.5;
+pub const PRICE_TEXT_BOX_DESC: &str = "頁面上的票價文字（NT$ 或 元）";
 pub const CARD_LINK_RETRY_TITLE_DESC: &str = "活動卡片的標題文字連結";
 pub const CARD_LINK_RETRY_IMAGE_DESC: &str = "活動卡片的圖片";
 pub const CARD_LINK_RETRY_DESCRIPTIONS: &[&str] = &[
@@ -74,6 +77,14 @@ pub struct ClosedPopupMemory {
 
 pub fn is_event_page_url(url: Option<&str>) -> bool {
     url.map(|u| u.contains("/event/")).unwrap_or(false)
+}
+
+pub fn is_login_url(url: Option<&str>) -> bool {
+    url.map(|u| {
+        let lower = u.to_lowercase();
+        lower.contains("/login") || lower.contains("/signin")
+    })
+    .unwrap_or(false)
 }
 pub const RESULTS_QUESTION_INSTRUCTIONS: &str =
     "Does the image show a Google Flights results list with flight prices?";
@@ -467,6 +478,8 @@ pub struct Decision {
     pub popup_present_noul: Option<f64>,
     #[serde(default)]
     pub footer_noul: Option<f64>,
+    #[serde(default)]
+    pub login_form_noul: Option<f64>,
 }
 
 #[derive(Debug, Error)]
@@ -483,22 +496,43 @@ pub enum DeciderError {
 
 pub fn map_box_center_to_screen_pt(bbox: &BoundingBox, img: &PreparedImage) -> (f64, f64) {
     let (cx_frac, cy_frac) = bbox.center();
-    let scale = if img.scale_factor <= 0.0 {
-        1.0
+    let roi_x = img.crop_origin_px.0 as f64;
+    let roi_y = img.crop_origin_px.1 as f64;
+    let roi_w = img.crop_size_px.0 as f64;
+    let roi_h = img.crop_size_px.1 as f64;
+
+    if let Some(win) = img.window_rect {
+        let cap_w = (if img.capture_size_px.0 > 0 {
+            img.capture_size_px.0
+        } else {
+            img.crop_size_px.0
+        }
+        .max(1)) as f64;
+        let cap_h = (if img.capture_size_px.1 > 0 {
+            img.capture_size_px.1
+        } else {
+            img.crop_size_px.1
+        }
+        .max(1)) as f64;
+        let x_pt = win.x + (roi_x + cx_frac * roi_w) * win.width / cap_w;
+        let y_pt = win.y + (roi_y + cy_frac * roi_h) * win.height / cap_h;
+        (x_pt, y_pt)
     } else {
-        img.scale_factor
-    };
-    let (origin_x_px, origin_y_px) = img.crop_origin_px;
-    let (crop_w_px, crop_h_px) = img.crop_size_px;
-
-    let screen_x_px = (origin_x_px as f64) + cx_frac * (crop_w_px as f64);
-    let screen_y_px = (origin_y_px as f64) + cy_frac * (crop_h_px as f64);
-
-    (screen_x_px / scale, screen_y_px / scale)
+        let scale = if img.scale_factor <= 0.0 {
+            1.0
+        } else {
+            img.scale_factor
+        };
+        ((roi_x + cx_frac * roi_w) / scale, (roi_y + cy_frac * roi_h) / scale)
+    }
 }
 
-pub fn map_corner_box_to_window_box(bbox: &BoundingBox, corner: CornerRegion) -> BoundingBox {
-    let (left_off, top_off, w_scale, h_scale) = corner.offset_and_scale_frac();
+pub fn map_corner_box_to_window_box(
+    bbox: &BoundingBox,
+    window_img: &PreparedImage,
+    corner: CornerRegion,
+) -> BoundingBox {
+    let (left_off, top_off, w_scale, h_scale) = corner_offset_and_scale_frac(window_img, corner);
     BoundingBox {
         top: top_off + bbox.top * h_scale,
         left: left_off + bbox.left * w_scale,
@@ -1148,6 +1182,12 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 },
             );
         }
+        questions.insert(
+            "login_form".to_string(),
+            Question::Noul {
+                instructions: LOGIN_FORM_QUESTION_INSTRUCTIONS.to_string(),
+            },
+        );
 
         let req1 = Request {
             model: self.model.clone(),
@@ -1194,8 +1234,34 @@ impl<B: DecisionBackend> VisionDecider<B> {
             self.set_scroll_direction(ScrollDirection::Up);
         }
 
+        let login_form_noul = match resp1.answers.get("login_form") {
+            Some(Answer::Noul { noul }) => Some(*noul),
+            Some(_) => return Err(DeciderError::UnexpectedAnswerType("login_form".to_string())),
+            None => None,
+        };
+
         let action_kind = ActionKind::from_choice(&kind_choice)
             .ok_or_else(|| DeciderError::UnknownActionKind(kind_choice.clone()))?;
+
+        if login_form_noul.unwrap_or(0.0) >= LOGIN_FORM_DETECTED_THRESHOLD {
+            return Ok(Decision {
+                kind: ActionKind::Wait,
+                kind_confidence: kind_conf,
+                target: target_choice,
+                click_point_screen_pt: None,
+                bbox: None,
+                box_confidence: None,
+                confidence: kind_conf,
+                reasked: false,
+                text_to_type: None,
+                results_noul,
+                sensitive_noul: None,
+                closeish_noul: None,
+                popup_present_noul,
+                footer_noul,
+                login_form_noul,
+            });
+        }
 
         if action_kind == ActionKind::DismissPopup {
             return Ok(Decision {
@@ -1213,6 +1279,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 closeish_noul: None,
                 popup_present_noul,
                 footer_noul,
+                login_form_noul,
             });
         }
 
@@ -1236,6 +1303,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                     closeish_noul: None,
                     popup_present_noul,
                     footer_noul,
+                    login_form_noul,
                 });
             }
 
@@ -1267,6 +1335,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 closeish_noul: None,
                 popup_present_noul,
                 footer_noul,
+                login_form_noul,
             });
         }
 
@@ -1297,6 +1366,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                             closeish_noul: None,
                             popup_present_noul,
                             footer_noul,
+                            login_form_noul,
                         });
                     }
                 }
@@ -1336,6 +1406,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
             closeish_noul: None,
             popup_present_noul,
             footer_noul,
+            login_form_noul,
         })
     }
 
@@ -1394,7 +1465,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                         log.record(&corner_img, format!("step_{}_popup_{}", step, suffix));
                     }
                     let (cb, cc, cl) = self.ask_dismiss_popup_box(state, &corner_img, desc)?;
-                    let mapped_box = map_corner_box_to_window_box(&cb, corner);
+                    let mapped_box = map_corner_box_to_window_box(&cb, img, corner);
                     bbox = mapped_box;
                     box_conf = cc;
                     closeish_noul = cl.or(closeish_noul);
@@ -1533,6 +1604,32 @@ impl<B: DecisionBackend> VisionDecider<B> {
             Some(Answer::Box { bbox, confidence }) => Ok((*bbox, *confidence, closeish_noul)),
             Some(_) => Err(DeciderError::UnexpectedAnswerType("target_box".to_string())),
             None => Err(DeciderError::MissingAnswer("target_box".to_string())),
+        }
+    }
+
+    pub fn ask_price_box(
+        &self,
+        state: &str,
+        img: &PreparedImage,
+    ) -> Result<(BoundingBox, f64), DeciderError> {
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "price_box".to_string(),
+            Question::Box {
+                instructions: PRICE_TEXT_BOX_DESC.to_string(),
+            },
+        );
+        let req = Request {
+            model: self.model.clone(),
+            state: state.to_string(),
+            images: vec![img.data_url.clone()],
+            questions,
+        };
+        let resp = self.ask_backend(&req)?;
+        match resp.answers.get("price_box") {
+            Some(Answer::Box { bbox, confidence }) => Ok((*bbox, *confidence)),
+            Some(_) => Err(DeciderError::UnexpectedAnswerType("price_box".to_string())),
+            None => Err(DeciderError::MissingAnswer("price_box".to_string())),
         }
     }
 }

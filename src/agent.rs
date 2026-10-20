@@ -1,20 +1,23 @@
-use crate::api::DecisionBackend;
+use crate::api::{BoundingBox, DecisionBackend};
 use crate::browser::{Browser, DefaultAllowedBrowser};
 use crate::capture::{changed_fraction, is_changed, CaptureError, Rect, Screen};
 use crate::decider::{
-    compute_excluded_targets, format_state, low_box_conf_exclude_steps,
+    compute_excluded_targets, format_state, is_login_url, low_box_conf_exclude_steps,
     map_box_center_to_screen_pt, ActionKind, DeciderError, Decision, DoneCondition,
-    ScrollDirection, VisionDecider, FOOTER_DETECTED_THRESHOLD, LOW_CONFIDENCE_THRESHOLD,
-    POPUP_PRESENT_THRESHOLD,
+    ScrollDirection, VisionDecider, FOOTER_DETECTED_THRESHOLD, LOGIN_FORM_DETECTED_THRESHOLD,
+    LOW_CONFIDENCE_THRESHOLD, POPUP_PRESENT_THRESHOLD,
 };
 use crate::input::{
     Input, InputError, KeyCode, DEFAULT_SCROLL_DELTA_PX, DEFAULT_SCROLL_UP_DELTA_PX,
 };
 use crate::logging::RunLogger;
-use crate::privacy::{prepare_image, AuditLog, PreparedImage, PrivacyError};
+use crate::privacy::{
+    encode_jpeg, prepare_image, AuditLog, PreparedImage, PrivacyError, JPEG_QUALITY,
+};
 use crate::safety::{
     is_sensitive_fill_label, resolve_allowed_url_prefixes, SafetyError, SafetyPolicy,
 };
+use image::GenericImageView;
 use serde::{Deserialize, Serialize};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -217,6 +220,16 @@ pub struct PopupEscapeEventRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PriceSeenEventRecord {
+    pub event: String,
+    pub step: usize,
+    pub bbox: BoundingBox,
+    pub box_crop_px: CropBoxPx,
+    pub confidence: f64,
+    pub crop_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSummaryJson {
     pub status: String,
     pub reason: String,
@@ -228,6 +241,8 @@ pub struct RunSummaryJson {
     pub avg_seconds_per_step: f64,
     pub all_images_cropped: bool,
     pub tab_events: usize,
+    #[serde(default)]
+    pub price_crops: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +257,7 @@ pub struct AgentRunSummary {
     pub avg_seconds_per_step: f64,
     pub all_images_cropped: bool,
     pub tab_events: usize,
+    pub price_crops: Vec<String>,
 }
 
 impl AgentRunSummary {
@@ -285,6 +301,7 @@ impl AgentRunSummary {
             avg_seconds_per_step: self.avg_seconds_per_step,
             all_images_cropped: self.all_images_cropped,
             tab_events: self.tab_events,
+            price_crops: self.price_crops.clone(),
         }
     }
 }
@@ -417,6 +434,8 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         let mut sensitive_excluded: Vec<(String, usize)> = Vec::new();
         let mut consecutive_noop_steps = 0usize;
         let mut checkout_clicked = false;
+        let mut price_crops: Vec<String> = Vec::new();
+        let mut price_box_asked = false;
 
         if self.policy.allowed_hosts.is_empty() {
             let preset_prefixes = if self.flights_preset {
@@ -556,15 +575,21 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                 continue;
             }
 
-            let full = match self.screen.capture() {
-                Ok(f) => f,
+            if is_login_url(current_url.as_deref()) {
+                stop_reason = StopReason::SafetyBlocked("login required".to_string());
+                break;
+            }
+
+            let bound = match self.screen.capture_window() {
+                Ok(b) => b,
                 Err(e) => {
                     run_err = Some(AgentError::Capture(e));
                     break;
                 }
             };
+            let full = bound.image;
             let full_screen_size = (full.width(), full.height());
-            let win_rect = self.screen.chrome_window_rect();
+            let win_rect = bound.rect;
             let scale = self.screen.scale_factor();
 
             let prepared = match prepare_image(&full, win_rect, scale) {
@@ -615,6 +640,24 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     break;
                 }
             };
+
+            if decision.login_form_noul.unwrap_or(0.0) >= LOGIN_FORM_DETECTED_THRESHOLD {
+                let elapsed = step_start.elapsed().as_secs_f64();
+                total_step_secs += elapsed;
+                steps_completed += 1;
+                self.log_step(
+                    step,
+                    current_url,
+                    &decision,
+                    false,
+                    elapsed,
+                    win_rect,
+                    &prepared,
+                    full_screen_size,
+                );
+                stop_reason = StopReason::SafetyBlocked("login required".to_string());
+                break;
+            }
 
             if let Some(ref target_label) = decision.target {
                 if let Err(e) = self.policy.check_target(target_label) {
@@ -1158,6 +1201,87 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             }
                         }
 
+                        if tgt == "立即報名按鈕"
+                            && self.decider.is_on_event_page()
+                            && !price_box_asked
+                        {
+                            price_box_asked = true;
+                            let state = format_state(goal, &history);
+                            match self.decider.ask_price_box(&state, &prepared) {
+                                Ok((price_bbox, price_conf)) => {
+                                    if price_conf >= LOW_CONFIDENCE_THRESHOLD {
+                                        let (cw, ch) = prepared.crop_size_px;
+                                        let (ox, oy) = prepared.crop_origin_px;
+                                        let top_px = (price_bbox.top * (ch as f64))
+                                            .round()
+                                            .clamp(0.0, ch as f64)
+                                            as u32;
+                                        let left_px = (price_bbox.left * (cw as f64))
+                                            .round()
+                                            .clamp(0.0, cw as f64)
+                                            as u32;
+                                        let bottom_px = (price_bbox.bottom * (ch as f64))
+                                            .round()
+                                            .clamp(0.0, ch as f64)
+                                            as u32;
+                                        let right_px = (price_bbox.right * (cw as f64))
+                                            .round()
+                                            .clamp(0.0, cw as f64)
+                                            as u32;
+                                        let crop_x =
+                                            (ox + left_px).min(full.width().saturating_sub(1));
+                                        let crop_y =
+                                            (oy + top_px).min(full.height().saturating_sub(1));
+                                        let crop_w = right_px
+                                            .saturating_sub(left_px)
+                                            .max(1)
+                                            .min(full.width().saturating_sub(crop_x))
+                                            .max(1);
+                                        let crop_h = bottom_px
+                                            .saturating_sub(top_px)
+                                            .max(1)
+                                            .min(full.height().saturating_sub(crop_y))
+                                            .max(1);
+                                        let price_sub =
+                                            full.view(crop_x, crop_y, crop_w, crop_h).to_image();
+                                        let crop_filename = format!("price_step_{}.jpg", step);
+                                        let crop_path = if let Some(ref logger) = self.logger {
+                                            let p = logger.run_dir().join(&crop_filename);
+                                            if let Ok(jpeg_bytes) =
+                                                encode_jpeg(&price_sub, JPEG_QUALITY)
+                                            {
+                                                let _ = std::fs::write(&p, jpeg_bytes);
+                                            }
+                                            p.to_string_lossy().to_string()
+                                        } else {
+                                            crop_filename
+                                        };
+                                        price_crops.push(crop_path.clone());
+                                        if let Some(ref mut logger) = self.logger {
+                                            let evt = PriceSeenEventRecord {
+                                                event: "price_seen".to_string(),
+                                                step,
+                                                bbox: price_bbox,
+                                                box_crop_px: CropBoxPx {
+                                                    top: top_px,
+                                                    left: left_px,
+                                                    bottom: bottom_px,
+                                                    right: right_px,
+                                                },
+                                                confidence: price_conf,
+                                                crop_path,
+                                            };
+                                            let _ = logger.log_entry(&evt);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    run_err = Some(AgentError::Decider(e));
+                                    break;
+                                }
+                            }
+                        }
+
                         if !self.dry_run {
                             self.input.click(pt.0, pt.1)?;
                             executed = true;
@@ -1620,6 +1744,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     avg_seconds_per_step,
                     all_images_cropped,
                     tab_events,
+                    price_crops: price_crops.clone(),
                 };
                 let _ = logger.write_summary(&summary_json);
             }
@@ -1637,6 +1762,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             avg_seconds_per_step,
             all_images_cropped,
             tab_events,
+            price_crops,
         };
 
         if let Some(ref logger) = self.logger {

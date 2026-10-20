@@ -90,6 +90,8 @@ pub struct CliResultOutput {
     pub avg_seconds_per_step: f64,
     pub all_images_cropped: bool,
     pub tab_events: usize,
+    #[serde(default)]
+    pub price_crops: Vec<String>,
 }
 
 impl CliResultOutput {
@@ -105,6 +107,7 @@ impl CliResultOutput {
             avg_seconds_per_step: 0.0,
             all_images_cropped: true,
             tab_events: 0,
+            price_crops: Vec::new(),
         }
     }
 
@@ -328,6 +331,7 @@ fn execute_run(
                         avg_seconds_per_step: s.avg_seconds_per_step,
                         all_images_cropped: s.all_images_cropped,
                         tab_events: s.tab_events,
+                        price_crops: s.price_crops,
                     },
                     Some(api_key),
                 )

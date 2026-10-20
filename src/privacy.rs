@@ -29,6 +29,12 @@ pub struct PreparedImage {
     pub crop_size_px: (u32, u32),
     pub sent_size_px: (u32, u32),
     pub scale_factor: f64,
+    #[serde(default)]
+    pub window_rect: Option<Rect>,
+    #[serde(default)]
+    pub capture_size_px: (u32, u32),
+    #[serde(skip)]
+    pub source_rgba: Option<std::sync::Arc<RgbaImage>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,47 +77,32 @@ pub fn prepare_image(
     scale: f64,
 ) -> Result<PreparedImage, PrivacyError> {
     let rect = crop.ok_or(PrivacyError::NoCrop)?;
-    let scale = if scale <= 0.0 { 1.0 } else { scale };
 
     let full_w = full.width();
     let full_h = full.height();
+    let win_w_u32 = rect.width.round().max(0.0) as u32;
+    let win_h_u32 = rect.height.round().max(0.0) as u32;
 
-    let raw_x0 = (rect.x * scale).round().max(0.0) as u32;
-    let raw_y0 = (rect.y * scale).round().max(0.0) as u32;
-    let raw_x1 = ((rect.x + rect.width).max(0.0) * scale).round() as u32;
-    let raw_y1 = ((rect.y + rect.height).max(0.0) * scale).round() as u32;
+    if full_w < MIN_CROP_PX
+        || full_h < MIN_CROP_PX
+        || win_w_u32 < MIN_CROP_PX
+        || win_h_u32 < MIN_CROP_PX
+    {
+        return Err(PrivacyError::CropTooSmall {
+            width: full_w.min(win_w_u32),
+            height: full_h.min(win_h_u32),
+        });
+    }
 
-    let expected_w = raw_x1.saturating_sub(raw_x0);
-    let expected_h = raw_y1.saturating_sub(raw_y0);
-
-    let is_window_only_capture = (full.width() == expected_w && full.height() == expected_h)
-        || ((raw_x0 > 0 || raw_y0 > 0) && (raw_x1 > full.width() || raw_y1 > full.height()));
-
-    let (cropped, crop_origin_px, crop_w, crop_h) = if is_window_only_capture {
-        if full.width() < MIN_CROP_PX || full.height() < MIN_CROP_PX || expected_w < MIN_CROP_PX || expected_h < MIN_CROP_PX {
-            return Err(PrivacyError::CropTooSmall {
-                width: full.width().min(expected_w),
-                height: full.height().min(expected_h),
-            });
-        }
-        (full.clone(), (raw_x0, raw_y0), expected_w, expected_h)
+    let crop_origin_px = (0, 0);
+    let crop_w = full_w;
+    let crop_h = full_h;
+    let eff_scale = if rect.width > 0.0 {
+        (full_w as f64) / rect.width
+    } else if scale > 0.0 {
+        scale
     } else {
-        let x0 = raw_x0.min(full_w);
-        let y0 = raw_y0.min(full_h);
-        let x1 = raw_x1.min(full_w).max(x0);
-        let y1 = raw_y1.min(full_h).max(y0);
-
-        let w = x1 - x0;
-        let h = y1 - y0;
-
-        if w < MIN_CROP_PX || h < MIN_CROP_PX {
-            return Err(PrivacyError::CropTooSmall {
-                width: w,
-                height: h,
-            });
-        }
-
-        (crop_imm(full, x0, y0, w, h).to_image(), (x0, y0), w, h)
+        1.0
     };
 
     let total_px = (crop_w as u64) * (crop_h as u64);
@@ -119,10 +110,10 @@ pub fn prepare_image(
         let ratio = (MAX_PIXELS as f64 / total_px as f64).sqrt();
         let new_w = ((crop_w as f64 * ratio).floor() as u32).max(1);
         let new_h = ((crop_h as f64 * ratio).floor() as u32).max(1);
-        let resized = resize(&cropped, new_w, new_h, FilterType::Lanczos3);
+        let resized = resize(full, new_w, new_h, FilterType::Lanczos3);
         (resized, new_w, new_h)
     } else {
-        (cropped, crop_w, crop_h)
+        (full.clone(), crop_w, crop_h)
     };
 
     let rgb = DynamicImage::ImageRgba8(sent_rgba).into_rgb8();
@@ -140,7 +131,10 @@ pub fn prepare_image(
         crop_origin_px,
         crop_size_px: (crop_w, crop_h),
         sent_size_px: (sent_w, sent_h),
-        scale_factor: scale,
+        scale_factor: eff_scale,
+        window_rect: Some(rect),
+        capture_size_px: (full_w, full_h),
+        source_rgba: Some(std::sync::Arc::new(full.clone())),
     })
 }
 
@@ -159,29 +153,9 @@ impl CornerRegion {
     }
 }
 
-pub fn prepare_corner_zoom_2x(
-    window_img: &PreparedImage,
-    corner: CornerRegion,
-) -> Result<PreparedImage, PrivacyError> {
-    let b64_str = window_img
-        .data_url
-        .strip_prefix("data:image/jpeg;base64,")
-        .or_else(|| window_img.data_url.split_once(',').map(|(_, b)| b))
-        .unwrap_or(&window_img.data_url);
-    let decoded_bytes = BASE64_STANDARD
-        .decode(b64_str.trim())
-        .map_err(|e| PrivacyError::EncodeError(format!("base64 decode error: {}", e)))?;
-
-    let rgba = if let Ok(dyn_img) = image::load_from_memory(&decoded_bytes) {
-        dyn_img.to_rgba8()
-    } else {
-        let w = window_img.sent_size_px.0.max(100);
-        let h = window_img.sent_size_px.1.max(100);
-        RgbaImage::from_pixel(w, h, image::Rgba([240, 240, 240, 255]))
-    };
-
-    let full_w = rgba.width().max(2);
-    let full_h = rgba.height().max(2);
+pub fn corner_crop_rect_px(full_w: u32, full_h: u32, corner: CornerRegion) -> (u32, u32, u32, u32) {
+    let full_w = full_w.max(2);
+    let full_h = full_h.max(2);
     let sub_w = (full_w / 2).max(1);
     let sub_h = (full_h / 2).max(1);
     let sub_x = match corner {
@@ -189,83 +163,104 @@ pub fn prepare_corner_zoom_2x(
         CornerRegion::BottomLeft => 0,
     };
     let sub_y = full_h - sub_h;
+    (sub_x, sub_y, sub_w, sub_h)
+}
 
-    let sub_crop = crop_imm(&rgba, sub_x, sub_y, sub_w, sub_h).to_image();
-    let zoom_w = (sub_w * 2).max(1);
-    let zoom_h = (sub_h * 2).max(1);
-    let zoomed = resize(&sub_crop, zoom_w, zoom_h, FilterType::Triangle);
+pub fn corner_offset_and_scale_frac(
+    window_img: &PreparedImage,
+    corner: CornerRegion,
+) -> (f64, f64, f64, f64) {
+    let full_w = window_img.crop_size_px.0.max(2);
+    let full_h = window_img.crop_size_px.1.max(2);
+    let (sub_x, sub_y, sub_w, sub_h) = corner_crop_rect_px(full_w, full_h, corner);
+    (
+        (sub_x as f64) / (full_w as f64),
+        (sub_y as f64) / (full_h as f64),
+        (sub_w as f64) / (full_w as f64),
+        (sub_h as f64) / (full_h as f64),
+    )
+}
 
-    let rgb = DynamicImage::ImageRgba8(zoomed).into_rgb8();
-    let mut jpeg_bytes = Vec::new();
-    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, JPEG_QUALITY);
-    encoder
-        .encode_image(&rgb)
-        .map_err(|e| PrivacyError::EncodeError(e.to_string()))?;
-
-    let b64 = BASE64_STANDARD.encode(&jpeg_bytes);
-    let data_url = format!("data:image/jpeg;base64,{}", b64);
-
-    let (left_frac, top_frac, w_frac, h_frac) = corner.offset_and_scale_frac();
-    let origin_x_px =
-        window_img.crop_origin_px.0 + ((window_img.crop_size_px.0 as f64) * left_frac).round() as u32;
-    let origin_y_px =
-        window_img.crop_origin_px.1 + ((window_img.crop_size_px.1 as f64) * top_frac).round() as u32;
-    let crop_w_px = ((window_img.crop_size_px.0 as f64) * w_frac).round().max(1.0) as u32;
-    let crop_h_px = ((window_img.crop_size_px.1 as f64) * h_frac).round().max(1.0) as u32;
-
-    Ok(PreparedImage {
-        data_url,
-        crop_origin_px: (origin_x_px, origin_y_px),
-        crop_size_px: (crop_w_px, crop_h_px),
-        sent_size_px: (zoom_w, zoom_h),
-        scale_factor: window_img.scale_factor,
-    })
+pub fn content_crop_rect_px(window_img: &PreparedImage) -> (u32, u32, u32, u32) {
+    let full_w = window_img.crop_size_px.0.max(2);
+    let full_h = window_img.crop_size_px.1.max(2);
+    let scale_y = if let Some(win) = window_img.window_rect {
+        if win.height > 0.0 {
+            (full_h as f64) / win.height
+        } else if window_img.scale_factor > 0.0 {
+            window_img.scale_factor
+        } else {
+            1.0
+        }
+    } else if window_img.scale_factor > 0.0 {
+        window_img.scale_factor
+    } else {
+        1.0
+    };
+    let toolbar_px = (DEFAULT_TOOLBAR_PT * scale_y).round().max(0.0) as u32;
+    let sub_x = 0u32;
+    let sub_y = toolbar_px.min(full_h / 2).min(full_h - 1);
+    let sub_w = full_w;
+    let sub_h = (full_h - sub_y).max(1);
+    (sub_x, sub_y, sub_w, sub_h)
 }
 
 pub fn content_region_offset_and_scale_frac(window_img: &PreparedImage) -> (f64, f64, f64, f64) {
-    let scale = if window_img.scale_factor <= 0.0 {
-        1.0
-    } else {
-        window_img.scale_factor
-    };
-    let toolbar_px = (DEFAULT_TOOLBAR_PT * scale).round();
-    let total_h = (window_img.crop_size_px.1.max(1)) as f64;
-    let top_frac = (toolbar_px / total_h).clamp(0.0, 0.5);
-    (0.0, top_frac, 1.0, 1.0 - top_frac)
+    let full_w = window_img.crop_size_px.0.max(2);
+    let full_h = window_img.crop_size_px.1.max(2);
+    let (sub_x, sub_y, sub_w, sub_h) = content_crop_rect_px(window_img);
+    (
+        (sub_x as f64) / (full_w as f64),
+        (sub_y as f64) / (full_h as f64),
+        (sub_w as f64) / (full_w as f64),
+        (sub_h as f64) / (full_h as f64),
+    )
 }
 
-pub fn prepare_content_zoom_2x(window_img: &PreparedImage) -> Result<PreparedImage, PrivacyError> {
-    let b64_str = window_img
-        .data_url
-        .strip_prefix("data:image/jpeg;base64,")
-        .or_else(|| window_img.data_url.split_once(',').map(|(_, b)| b))
-        .unwrap_or(&window_img.data_url);
-    let decoded_bytes = BASE64_STANDARD
-        .decode(b64_str.trim())
-        .map_err(|e| PrivacyError::EncodeError(format!("base64 decode error: {}", e)))?;
-
-    let rgba = if let Ok(dyn_img) = image::load_from_memory(&decoded_bytes) {
-        dyn_img.to_rgba8()
+fn crop_and_zoom_from_original(
+    window_img: &PreparedImage,
+    sub_x: u32,
+    sub_y: u32,
+    sub_w: u32,
+    sub_h: u32,
+) -> Result<PreparedImage, PrivacyError> {
+    let fallback_rgba;
+    let src_rgba: &RgbaImage = if let Some(ref orig) = window_img.source_rgba {
+        orig.as_ref()
     } else {
-        let w = window_img.sent_size_px.0.max(100);
-        let h = window_img.sent_size_px.1.max(100);
-        RgbaImage::from_pixel(w, h, image::Rgba([240, 240, 240, 255]))
+        let w = window_img.crop_size_px.0.max(2);
+        let h = window_img.crop_size_px.1.max(2);
+        fallback_rgba = RgbaImage::from_pixel(w, h, image::Rgba([240, 240, 240, 255]));
+        &fallback_rgba
     };
 
-    let full_w = rgba.width().max(2);
-    let full_h = rgba.height().max(2);
-    let (left_frac, top_frac, w_frac, h_frac) = content_region_offset_and_scale_frac(window_img);
-    let sub_x = ((full_w as f64) * left_frac).round() as u32;
-    let sub_y = (((full_h as f64) * top_frac).round() as u32).min(full_h - 1);
-    let sub_w = (((full_w as f64) * w_frac).round() as u32)
-        .min(full_w.saturating_sub(sub_x))
-        .max(1);
-    let sub_h = (full_h - sub_y).max(1);
+    let img_w = src_rgba.width().max(2);
+    let img_h = src_rgba.height().max(2);
+    let cx = sub_x.min(img_w - 1);
+    let cy = sub_y.min(img_h - 1);
+    let cw = sub_w.min(img_w - cx).max(1);
+    let ch = sub_h.min(img_h - cy).max(1);
 
-    let sub_crop = crop_imm(&rgba, sub_x, sub_y, sub_w, sub_h).to_image();
-    let zoom_w = (sub_w * 2).max(1);
-    let zoom_h = (sub_h * 2).max(1);
-    let zoomed = resize(&sub_crop, zoom_w, zoom_h, FilterType::Triangle);
+    let sub_crop = crop_imm(src_rgba, cx, cy, cw, ch).to_image();
+
+    let target_w = (cw * 2).max(1);
+    let target_h = (ch * 2).max(1);
+    let target_px = (target_w as u64) * (target_h as u64);
+    let (sent_w, sent_h) = if target_px > MAX_PIXELS {
+        let ratio = (MAX_PIXELS as f64 / target_px as f64).sqrt();
+        (
+            ((target_w as f64 * ratio).floor() as u32).max(1),
+            ((target_h as f64 * ratio).floor() as u32).max(1),
+        )
+    } else {
+        (target_w, target_h)
+    };
+
+    let zoomed = if sent_w == cw && sent_h == ch {
+        sub_crop
+    } else {
+        resize(&sub_crop, sent_w, sent_h, FilterType::Lanczos3)
+    };
 
     let rgb = DynamicImage::ImageRgba8(zoomed).into_rgb8();
     let mut jpeg_bytes = Vec::new();
@@ -277,22 +272,47 @@ pub fn prepare_content_zoom_2x(window_img: &PreparedImage) -> Result<PreparedIma
     let b64 = BASE64_STANDARD.encode(&jpeg_bytes);
     let data_url = format!("data:image/jpeg;base64,{}", b64);
 
-    let origin_x_px = window_img.crop_origin_px.0
-        + ((window_img.crop_size_px.0 as f64) * left_frac).round() as u32;
-    let origin_y_px = window_img.crop_origin_px.1
-        + ((window_img.crop_size_px.1 as f64) * top_frac).round() as u32;
-    let crop_w_px = ((window_img.crop_size_px.0 as f64) * w_frac)
-        .round()
-        .max(1.0) as u32;
-    let crop_h_px = ((window_img.crop_size_px.1 as f64) * h_frac)
-        .round()
-        .max(1.0) as u32;
+    let origin_x_px = window_img.crop_origin_px.0 + cx;
+    let origin_y_px = window_img.crop_origin_px.1 + cy;
+    let capture_size_px = if window_img.capture_size_px.0 > 0 && window_img.capture_size_px.1 > 0 {
+        window_img.capture_size_px
+    } else {
+        window_img.crop_size_px
+    };
 
     Ok(PreparedImage {
         data_url,
         crop_origin_px: (origin_x_px, origin_y_px),
-        crop_size_px: (crop_w_px, crop_h_px),
-        sent_size_px: (zoom_w, zoom_h),
+        crop_size_px: (cw, ch),
+        sent_size_px: (sent_w, sent_h),
         scale_factor: window_img.scale_factor,
+        window_rect: window_img.window_rect,
+        capture_size_px,
+        source_rgba: window_img.source_rgba.clone(),
     })
+}
+
+pub fn prepare_corner_zoom_2x(
+    window_img: &PreparedImage,
+    corner: CornerRegion,
+) -> Result<PreparedImage, PrivacyError> {
+    let full_w = window_img.crop_size_px.0.max(2);
+    let full_h = window_img.crop_size_px.1.max(2);
+    let (sub_x, sub_y, sub_w, sub_h) = corner_crop_rect_px(full_w, full_h, corner);
+    crop_and_zoom_from_original(window_img, sub_x, sub_y, sub_w, sub_h)
+}
+
+pub fn prepare_content_zoom_2x(window_img: &PreparedImage) -> Result<PreparedImage, PrivacyError> {
+    let (sub_x, sub_y, sub_w, sub_h) = content_crop_rect_px(window_img);
+    crop_and_zoom_from_original(window_img, sub_x, sub_y, sub_w, sub_h)
+}
+
+pub fn encode_jpeg(img: &RgbaImage, quality: u8) -> Result<Vec<u8>, PrivacyError> {
+    let rgb = DynamicImage::ImageRgba8(img.clone()).into_rgb8();
+    let mut jpeg_bytes = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, quality);
+    encoder
+        .encode_image(&rgb)
+        .map_err(|e| PrivacyError::EncodeError(e.to_string()))?;
+    Ok(jpeg_bytes)
 }

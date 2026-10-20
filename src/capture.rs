@@ -15,6 +15,8 @@ pub struct Rect {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WinInfo {
+    #[serde(default)]
+    pub window_id: u32,
     pub app_name: String,
     pub title: String,
     pub is_minimized: bool,
@@ -22,6 +24,13 @@ pub struct WinInfo {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundWindowCapture {
+    pub window_id: u32,
+    pub image: RgbaImage,
+    pub rect: Option<Rect>,
 }
 
 pub fn select_main_window_index(windows: &[WinInfo]) -> Option<usize> {
@@ -45,15 +54,22 @@ pub fn select_main_window_index(windows: &[WinInfo]) -> Option<usize> {
         .map(|(idx, _)| idx)
 }
 
-pub fn select_main_window(windows: &[WinInfo]) -> Option<Rect> {
+pub fn select_main_window_with_id(windows: &[WinInfo]) -> Option<(u32, Rect)> {
     let idx = select_main_window_index(windows)?;
     let w = &windows[idx];
-    Some(Rect {
-        x: w.x,
-        y: w.y,
-        width: w.width,
-        height: w.height,
-    })
+    Some((
+        w.window_id,
+        Rect {
+            x: w.x,
+            y: w.y,
+            width: w.width,
+            height: w.height,
+        },
+    ))
+}
+
+pub fn select_main_window(windows: &[WinInfo]) -> Option<Rect> {
+    select_main_window_with_id(windows).map(|(_, rect)| rect)
 }
 
 pub fn select_topmost_app_at(windows: &[WinInfo], x_pt: f64, y_pt: f64) -> Option<String> {
@@ -78,6 +94,7 @@ pub fn topmost_app_at(x_pt: f64, y_pt: f64) -> Option<String> {
     let infos: Vec<WinInfo> = windows
         .into_iter()
         .map(|win| WinInfo {
+            window_id: win.id().unwrap_or(0),
             app_name: win.app_name().unwrap_or_default(),
             title: win.title().unwrap_or_default(),
             is_minimized: win.is_minimized().unwrap_or(false),
@@ -128,6 +145,13 @@ pub enum CaptureError {
 pub trait Screen {
     fn capture(&self) -> Result<RgbaImage, CaptureError>;
     fn chrome_window_rect(&self) -> Option<Rect>;
+    fn capture_window(&self) -> Result<BoundWindowCapture, CaptureError> {
+        Ok(BoundWindowCapture {
+            window_id: 0,
+            image: self.capture()?,
+            rect: self.chrome_window_rect(),
+        })
+    }
     fn scale_factor(&self) -> f64 {
         2.0
     }
@@ -137,12 +161,16 @@ pub trait Screen {
 }
 
 #[cfg(target_os = "macos")]
-pub struct MacScreen;
+pub struct MacScreen {
+    last_window: std::sync::Mutex<Option<(u32, Rect)>>,
+}
 
 #[cfg(target_os = "macos")]
 impl MacScreen {
     pub fn new() -> Self {
-        Self
+        Self {
+            last_window: std::sync::Mutex::new(None),
+        }
     }
 }
 
@@ -155,11 +183,12 @@ impl Default for MacScreen {
 
 #[cfg(target_os = "macos")]
 impl Screen for MacScreen {
-    fn capture(&self) -> Result<RgbaImage, CaptureError> {
+    fn capture_window(&self) -> Result<BoundWindowCapture, CaptureError> {
         let windows = xcap::Window::all().map_err(|e| CaptureError::Platform(e.to_string()))?;
         let infos: Vec<WinInfo> = windows
             .iter()
             .map(|win| WinInfo {
+                window_id: win.id().unwrap_or(0),
                 app_name: win.app_name().unwrap_or_default(),
                 title: win.title().unwrap_or_default(),
                 is_minimized: win.is_minimized().unwrap_or(false),
@@ -170,19 +199,43 @@ impl Screen for MacScreen {
             })
             .collect();
         if let Some(idx) = select_main_window_index(&infos) {
-            windows[idx]
+            let info = &infos[idx];
+            let rect = Rect {
+                x: info.x,
+                y: info.y,
+                width: info.width,
+                height: info.height,
+            };
+            let image = windows[idx]
                 .capture_image()
-                .map_err(|e| CaptureError::Platform(e.to_string()))
+                .map_err(|e| CaptureError::Platform(e.to_string()))?;
+            *self.last_window.lock().unwrap() = Some((info.window_id, rect));
+            Ok(BoundWindowCapture {
+                window_id: info.window_id,
+                image,
+                rect: Some(rect),
+            })
         } else {
-            Ok(RgbaImage::new(1, 1))
+            *self.last_window.lock().unwrap() = None;
+            Ok(BoundWindowCapture {
+                window_id: 0,
+                image: RgbaImage::new(1, 1),
+                rect: None,
+            })
         }
     }
 
+    fn capture(&self) -> Result<RgbaImage, CaptureError> {
+        self.capture_window().map(|c| c.image)
+    }
+
     fn chrome_window_rect(&self) -> Option<Rect> {
+        let cached = *self.last_window.lock().unwrap();
         let windows = xcap::Window::all().ok()?;
         let infos: Vec<WinInfo> = windows
             .into_iter()
             .map(|win| WinInfo {
+                window_id: win.id().unwrap_or(0),
                 app_name: win.app_name().unwrap_or_default(),
                 title: win.title().unwrap_or_default(),
                 is_minimized: win.is_minimized().unwrap_or(false),
@@ -192,20 +245,23 @@ impl Screen for MacScreen {
                 height: win.height().unwrap_or(0) as f64,
             })
             .collect();
+        if let Some((bound_id, bound_rect)) = cached {
+            if bound_id != 0 {
+                if let Some(w) = infos.iter().find(|w| w.window_id == bound_id) {
+                    return Some(Rect {
+                        x: w.x,
+                        y: w.y,
+                        width: w.width,
+                        height: w.height,
+                    });
+                }
+                return Some(bound_rect);
+            }
+        }
         select_main_window(&infos)
     }
 
     fn scale_factor(&self) -> f64 {
-        if let Ok(monitors) = xcap::Monitor::all() {
-            if let Some(m) = monitors
-                .into_iter()
-                .find(|m| m.is_primary().unwrap_or(false))
-            {
-                if let Ok(sf) = m.scale_factor() {
-                    return sf as f64;
-                }
-            }
-        }
         2.0
     }
 
@@ -223,6 +279,7 @@ mod tests {
         let windows = vec![
             // Tiny popup bubble came first
             WinInfo {
+                window_id: 101,
                 app_name: "Google Chrome".to_string(),
                 title: "Translate bubble".to_string(),
                 is_minimized: false,
@@ -233,6 +290,7 @@ mod tests {
             },
             // Large untitled overlay / helper window
             WinInfo {
+                window_id: 102,
                 app_name: "Google Chrome".to_string(),
                 title: "   ".to_string(),
                 is_minimized: false,
@@ -243,6 +301,7 @@ mod tests {
             },
             // Smaller Chrome window
             WinInfo {
+                window_id: 103,
                 app_name: "Google Chrome".to_string(),
                 title: "Secondary".to_string(),
                 is_minimized: false,
@@ -253,6 +312,7 @@ mod tests {
             },
             // Main browser window (largest valid)
             WinInfo {
+                window_id: 104,
                 app_name: "Google Chrome".to_string(),
                 title: "Google Flights - Google Chrome".to_string(),
                 is_minimized: false,
@@ -263,6 +323,7 @@ mod tests {
             },
             // Minimized even larger window
             WinInfo {
+                window_id: 105,
                 app_name: "Google Chrome".to_string(),
                 title: "Minimized Flights".to_string(),
                 is_minimized: true,
@@ -273,7 +334,8 @@ mod tests {
             },
         ];
 
-        let rect = select_main_window(&windows).unwrap();
+        let (win_id, rect) = select_main_window_with_id(&windows).unwrap();
+        assert_eq!(win_id, 104);
         assert_eq!(
             rect,
             Rect {
