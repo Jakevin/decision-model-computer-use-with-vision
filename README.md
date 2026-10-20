@@ -6,6 +6,12 @@ A screenshot-only macOS computer-use agent written in Rust (`decision-cu`, editi
 
 ## English
 
+### Install with an AI agent
+
+Paste this one line into your coding agent:
+
+> Install decision-cu from https://github.com/Jakevin/decision-model-computer-use-with-vision on this Mac: install Rust via rustup if `cargo` is missing, clone the repo, run `cargo install --path .`, check `decision-cu run --help`, copy `skills/decision-computer-use/SKILL.md` into your skills directory, and tell me to grant Screen Recording and Accessibility to my terminal and to set `VSR_API_KEY` myself (never ask me to paste the key into chat).
+
 ### What It Is
 
 `decision-cu` is a typesafe, privacy-conscious, read-only macOS computer-use agent in Rust. Instead of relying on DOM scraping, browser extensions, or accessibility trees, it operates strictly on cropped screenshots of the active Google Chrome window and uses structured visual decision queries (`choice` and `box` questions) via the vllm-sr Decision 3.0 API to navigate and inspect web interfaces (such as Google Flights).
@@ -139,6 +145,14 @@ Design inspired by `awlevin/typesafe-computer-use` (no code copied).
 ---
 
 ## 繁體中文 (Traditional Chinese)
+
+### 用 AI 代理安裝
+
+把下面這一句貼給你的 AI 代理：
+
+> Install decision-cu from https://github.com/Jakevin/decision-model-computer-use-with-vision on this Mac: install Rust via rustup if `cargo` is missing, clone the repo, run `cargo install --path .`, check `decision-cu run --help`, copy `skills/decision-computer-use/SKILL.md` into your skills directory, and tell me to grant Screen Recording and Accessibility to my terminal and to set `VSR_API_KEY` myself (never ask me to paste the key into chat).
+
+（金鑰請自行設定在環境變數 `VSR_API_KEY`，不要貼到對話裡。）
 
 ### 專案簡介 (What It Is)
 
