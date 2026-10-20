@@ -80,22 +80,38 @@ pub fn prepare_image(
     let raw_x1 = ((rect.x + rect.width).max(0.0) * scale).round() as u32;
     let raw_y1 = ((rect.y + rect.height).max(0.0) * scale).round() as u32;
 
-    let x0 = raw_x0.min(full_w);
-    let y0 = raw_y0.min(full_h);
-    let x1 = raw_x1.min(full_w).max(x0);
-    let y1 = raw_y1.min(full_h).max(y0);
+    let expected_w = raw_x1.saturating_sub(raw_x0);
+    let expected_h = raw_y1.saturating_sub(raw_y0);
 
-    let crop_w = x1 - x0;
-    let crop_h = y1 - y0;
+    let is_window_only_capture = (full.width() == expected_w && full.height() == expected_h)
+        || ((raw_x0 > 0 || raw_y0 > 0) && (raw_x1 > full.width() || raw_y1 > full.height()));
 
-    if crop_w < MIN_CROP_PX || crop_h < MIN_CROP_PX {
-        return Err(PrivacyError::CropTooSmall {
-            width: crop_w,
-            height: crop_h,
-        });
-    }
+    let (cropped, crop_origin_px, crop_w, crop_h) = if is_window_only_capture {
+        if full.width() < MIN_CROP_PX || full.height() < MIN_CROP_PX || expected_w < MIN_CROP_PX || expected_h < MIN_CROP_PX {
+            return Err(PrivacyError::CropTooSmall {
+                width: full.width().min(expected_w),
+                height: full.height().min(expected_h),
+            });
+        }
+        (full.clone(), (raw_x0, raw_y0), expected_w, expected_h)
+    } else {
+        let x0 = raw_x0.min(full_w);
+        let y0 = raw_y0.min(full_h);
+        let x1 = raw_x1.min(full_w).max(x0);
+        let y1 = raw_y1.min(full_h).max(y0);
 
-    let cropped = crop_imm(full, x0, y0, crop_w, crop_h).to_image();
+        let w = x1 - x0;
+        let h = y1 - y0;
+
+        if w < MIN_CROP_PX || h < MIN_CROP_PX {
+            return Err(PrivacyError::CropTooSmall {
+                width: w,
+                height: h,
+            });
+        }
+
+        (crop_imm(full, x0, y0, w, h).to_image(), (x0, y0), w, h)
+    };
 
     let total_px = (crop_w as u64) * (crop_h as u64);
     let (sent_rgba, sent_w, sent_h) = if total_px > MAX_PIXELS {
@@ -120,7 +136,7 @@ pub fn prepare_image(
 
     Ok(PreparedImage {
         data_url,
-        crop_origin_px: (x0, y0),
+        crop_origin_px,
         crop_size_px: (crop_w, crop_h),
         sent_size_px: (sent_w, sent_h),
         scale_factor: scale,

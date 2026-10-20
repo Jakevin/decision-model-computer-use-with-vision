@@ -24,29 +24,36 @@ pub struct WinInfo {
     pub height: f64,
 }
 
-pub fn select_main_window(windows: &[WinInfo]) -> Option<Rect> {
+pub fn select_main_window_index(windows: &[WinInfo]) -> Option<usize> {
     windows
         .iter()
-        .filter(|w| {
+        .enumerate()
+        .filter(|(_, w)| {
             !w.is_minimized
                 && w.app_name.contains("Google Chrome")
                 && !w.title.trim().is_empty()
                 && w.width >= MIN_CHROME_WINDOW_WIDTH_PT
                 && w.height >= MIN_CHROME_WINDOW_HEIGHT_PT
         })
-        .max_by(|a, b| {
+        .max_by(|(_, a), (_, b)| {
             let area_a = a.width * a.height;
             let area_b = b.width * b.height;
             area_a
                 .partial_cmp(&area_b)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-        .map(|w| Rect {
-            x: w.x,
-            y: w.y,
-            width: w.width,
-            height: w.height,
-        })
+        .map(|(idx, _)| idx)
+}
+
+pub fn select_main_window(windows: &[WinInfo]) -> Option<Rect> {
+    let idx = select_main_window_index(windows)?;
+    let w = &windows[idx];
+    Some(Rect {
+        x: w.x,
+        y: w.y,
+        width: w.width,
+        height: w.height,
+    })
 }
 
 #[derive(Debug, Error)]
@@ -85,15 +92,26 @@ impl Default for MacScreen {
 #[cfg(target_os = "macos")]
 impl Screen for MacScreen {
     fn capture(&self) -> Result<RgbaImage, CaptureError> {
-        let monitors = xcap::Monitor::all().map_err(|e| CaptureError::Platform(e.to_string()))?;
-        let monitor = monitors
-            .into_iter()
-            .find(|m| m.is_primary().unwrap_or(false))
-            .or_else(|| xcap::Monitor::all().ok()?.into_iter().next())
-            .ok_or(CaptureError::NoMonitor)?;
-        monitor
-            .capture_image()
-            .map_err(|e| CaptureError::Platform(e.to_string()))
+        let windows = xcap::Window::all().map_err(|e| CaptureError::Platform(e.to_string()))?;
+        let infos: Vec<WinInfo> = windows
+            .iter()
+            .map(|win| WinInfo {
+                app_name: win.app_name().unwrap_or_default(),
+                title: win.title().unwrap_or_default(),
+                is_minimized: win.is_minimized().unwrap_or(false),
+                x: win.x().unwrap_or(0) as f64,
+                y: win.y().unwrap_or(0) as f64,
+                width: win.width().unwrap_or(0) as f64,
+                height: win.height().unwrap_or(0) as f64,
+            })
+            .collect();
+        if let Some(idx) = select_main_window_index(&infos) {
+            windows[idx]
+                .capture_image()
+                .map_err(|e| CaptureError::Platform(e.to_string()))
+        } else {
+            Ok(RgbaImage::new(1, 1))
+        }
     }
 
     fn chrome_window_rect(&self) -> Option<Rect> {

@@ -13,6 +13,15 @@ pub trait Browser {
     fn activate_chrome(&mut self) -> Result<(), BrowserError> {
         Ok(())
     }
+    fn frontmost_app(&self) -> Option<String> {
+        Some("Google Chrome".to_string())
+    }
+    fn is_chrome_frontmost(&self) -> bool {
+        self.frontmost_app()
+            .as_deref()
+            .map(|n| n.trim() == "Google Chrome")
+            .unwrap_or(false)
+    }
 }
 
 impl<T: Browser + ?Sized> Browser for Box<T> {
@@ -27,6 +36,14 @@ impl<T: Browser + ?Sized> Browser for Box<T> {
     fn activate_chrome(&mut self) -> Result<(), BrowserError> {
         (**self).activate_chrome()
     }
+
+    fn frontmost_app(&self) -> Option<String> {
+        (**self).frontmost_app()
+    }
+
+    fn is_chrome_frontmost(&self) -> bool {
+        (**self).is_chrome_frontmost()
+    }
 }
 
 impl<T: Browser + ?Sized> Browser for &mut T {
@@ -40,6 +57,14 @@ impl<T: Browser + ?Sized> Browser for &mut T {
 
     fn activate_chrome(&mut self) -> Result<(), BrowserError> {
         (**self).activate_chrome()
+    }
+
+    fn frontmost_app(&self) -> Option<String> {
+        (**self).frontmost_app()
+    }
+
+    fn is_chrome_frontmost(&self) -> bool {
+        (**self).is_chrome_frontmost()
     }
 }
 
@@ -95,6 +120,30 @@ pub fn activate_chrome() -> Result<(), BrowserError> {
     }
 }
 
+pub fn frontmost_app() -> Option<String> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to get name of first process whose frontmost is true")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+pub fn is_chrome_frontmost() -> bool {
+    frontmost_app()
+        .as_deref()
+        .map(|n| n == "Google Chrome")
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MacBrowser;
 
@@ -115,6 +164,10 @@ impl Browser for MacBrowser {
 
     fn activate_chrome(&mut self) -> Result<(), BrowserError> {
         activate_chrome()
+    }
+
+    fn frontmost_app(&self) -> Option<String> {
+        frontmost_app()
     }
 }
 

@@ -589,7 +589,7 @@ fn url_off_prefix_nothing_sent_and_tab_event() {
     assert_eq!(agent.decider().backend().request_count(), 0);
     assert_eq!(agent.audit_log().records().len(), 0);
     assert_eq!(agent.browser().set_urls.len(), 4);
-    assert_eq!(agent.browser().activated, 1);
+    assert!(agent.browser().activated >= 1);
 
     let steps_content = std::fs::read_to_string(&steps_path).unwrap();
     assert!(steps_content.contains("\"tab_event\""));
@@ -785,4 +785,106 @@ fn summary_counters_and_step_log_fields() {
     assert_eq!(client.requests_sent(), 1);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+struct FrontmostSequenceBrowser {
+    frontmost_seq: RefCell<VecDeque<String>>,
+    activated: usize,
+}
+
+impl FrontmostSequenceBrowser {
+    fn new(seq: Vec<&str>) -> Self {
+        Self {
+            frontmost_seq: RefCell::new(seq.into_iter().map(|s| s.to_string()).collect()),
+            activated: 0,
+        }
+    }
+}
+
+impl decision_cu::browser::Browser for FrontmostSequenceBrowser {
+    fn active_tab_url(&self) -> Option<String> {
+        Some("https://www.google.com/travel/flights".to_string())
+    }
+
+    fn set_active_tab_url(&mut self, _url: &str) -> Result<(), decision_cu::browser::BrowserError> {
+        Ok(())
+    }
+
+    fn activate_chrome(&mut self) -> Result<(), decision_cu::browser::BrowserError> {
+        self.activated += 1;
+        Ok(())
+    }
+
+    fn frontmost_app(&self) -> Option<String> {
+        self.frontmost_seq.borrow_mut().pop_front()
+    }
+}
+
+#[test]
+fn not_frontmost_sends_nothing_and_stops_blocked() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+    let backend = MockBackend::new(vec![]);
+    let decider = VisionDecider::new(
+        backend,
+        vec![TargetSpec::new("search button", None)],
+    );
+    let browser = FrontmostSequenceBrowser::new(vec!["Terminal", "Finder"]);
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_browser(browser);
+    let summary = agent.run("Find flights").unwrap();
+
+    assert!(matches!(summary.stop_reason, StopReason::SafetyBlocked(_)));
+    assert_eq!(summary.steps_taken, 0);
+    assert_eq!(summary.requests_sent, 0);
+    assert_eq!(summary.images_sent, 0);
+    assert_eq!(agent.decider().backend().request_count(), 0);
+    assert_eq!(agent.audit_log().records().len(), 0);
+    assert_eq!(agent.browser().activated, 2);
+}
+
+#[test]
+fn click_blocked_when_chrome_loses_frontmost() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results("click", "search button", 0.1),
+        make_box_response(0.4, 0.4, 0.6, 0.6, 0.95),
+    ]);
+    let decider = VisionDecider::new(
+        backend,
+        vec![TargetSpec::new("search button", None)],
+    );
+    // Frontmost at start of step ("Google Chrome"), but loses frontmost right before click ("Slack")
+    let browser = FrontmostSequenceBrowser::new(vec!["Google Chrome", "Slack"]);
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_browser(browser);
+    let err = agent.run("Click search").unwrap_err();
+    assert!(matches!(
+        err,
+        AgentError::Safety(SafetyError::NotFrontmost)
+    ));
+    assert!(agent.input().clicks.is_empty());
 }

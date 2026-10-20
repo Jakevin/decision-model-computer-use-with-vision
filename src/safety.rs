@@ -16,6 +16,8 @@ pub enum SafetyError {
     ForbiddenTarget { label: String, word: String },
     #[error("Refusing to type sensitive or password-like content")]
     SensitiveTextBlocked,
+    #[error("Google Chrome is not the frontmost application")]
+    NotFrontmost,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

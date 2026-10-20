@@ -15,6 +15,8 @@ pub const RESULTS_DONE_CONSECUTIVE_THRESHOLD: f64 = 0.8;
 pub const RESULTS_DONE_CONSECUTIVE_COUNT: usize = 2;
 pub const RESULTS_MODEL_DONE_THRESHOLD: f64 = 0.5;
 pub const MAX_TAB_EVENTS: usize = 2;
+pub const MAX_FRONTMOST_FAILURES: usize = 2;
+pub const ACTIVATE_CHROME_SLEEP_MS: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopReason {
@@ -235,6 +237,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
 
         let mut clicks = 0usize;
         let mut tab_events = 0usize;
+        let mut frontmost_failures = 0usize;
         let mut total_step_secs = 0.0f64;
         let mut steps_completed = 0usize;
         let mut all_images_cropped = true;
@@ -252,6 +255,21 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
 
         for step in 0..max_steps {
             let step_start = Instant::now();
+
+            // Activate Chrome, sleep 300ms, and check frontmost app is Google Chrome
+            let _ = self.browser.activate_chrome();
+            thread::sleep(Duration::from_millis(ACTIVATE_CHROME_SLEEP_MS));
+            if !self.browser.is_chrome_frontmost() {
+                frontmost_failures += 1;
+                if frontmost_failures >= MAX_FRONTMOST_FAILURES {
+                    stop_reason = StopReason::SafetyBlocked(
+                        "Google Chrome is not the frontmost application".to_string(),
+                    );
+                    break;
+                }
+                continue;
+            }
+            frontmost_failures = 0;
 
             // Read active tab URL before capture
             let current_url = self.browser.active_tab_url();
@@ -406,6 +424,9 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     self.policy.reset_wait();
                     if let Some(pt) = decision.click_point_screen_pt {
                         self.policy.check_click(pt, win_rect)?;
+                        if !self.browser.is_chrome_frontmost() {
+                            return Err(AgentError::Safety(SafetyError::NotFrontmost));
+                        }
                         let tgt = decision.target.as_deref().unwrap_or("unknown");
                         let fill_val = self.decider.fill_for(tgt).map(|s| s.to_string());
 
