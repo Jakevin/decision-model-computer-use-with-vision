@@ -7,7 +7,7 @@ use decision_cu::capture::{CaptureError, Rect, Screen};
 use decision_cu::decider::{
     events_preset_targets, flights_preset_targets, generic_preset_targets, load_targets_file,
     map_box_center_to_screen_pt, ActionKind, DoneCondition, Preset, TargetSpec, VisionDecider,
-    CHECKOUT_QUESTION_INSTRUCTIONS,
+    CHECKOUT_QUESTION_INSTRUCTIONS, SENSITIVE_QUESTION_INSTRUCTIONS,
 };
 use decision_cu::input::{Input, InputError, KeyCode};
 use decision_cu::logging::{redact, RunLogger};
@@ -1333,5 +1333,156 @@ fn checkout_page_done_after_two_consecutive_and_logs_noul_and_done_condition() {
     let summary_val: serde_json::Value = serde_json::from_str(&summary_str).unwrap();
     assert_eq!(summary_val["status"], "done");
     assert_eq!(summary_val["done_condition"], "checkout-page");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+fn make_box_response_with_sensitive(
+    top: f64,
+    left: f64,
+    bottom: f64,
+    right: f64,
+    confidence: f64,
+    sensitive_noul: f64,
+) -> Response {
+    let mut resp = make_box_response(top, left, bottom, right, confidence);
+    resp.answers.insert(
+        "sensitive".to_string(),
+        Answer::Noul {
+            noul: sensitive_noul,
+        },
+    );
+    resp
+}
+
+#[test]
+fn sensitive_target_blocked_logged_and_excluded_for_next_three_steps() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    // Step 0: chooses click "primary call-to-action button toward the goal", box returns sensitive_noul = 0.72 (>= 0.5)
+    //         -> do not click, log 'blocked_sensitive', exclude target for next 3 steps (steps 1, 2, 3).
+    // Step 1: chooses click "navigation link toward the goal", box returns sensitive_noul = 0.05 (< 0.5) -> clicks
+    // Step 2: chooses scroll
+    // Step 3: chooses wait
+    // Step 4: after 3 steps, "primary call-to-action button toward the goal" is included again -> done
+    let backend = MockBackend::new(vec![
+        make_choice_response("click", "primary call-to-action button toward the goal"),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.72),
+        make_choice_response("click", "navigation link toward the goal"),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.05),
+        make_choice_response("scroll", "nothing to click"),
+        make_choice_response("wait", "nothing to click"),
+        make_choice_response("done", "nothing to click"),
+    ]);
+
+    let decider = VisionDecider::new(backend, Preset::Generic.default_targets())
+        .with_done_condition(DoneCondition::Model);
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_blocked_sensitive");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_logger(logger);
+    let summary = agent.run("Navigate to event page").unwrap();
+
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.steps_taken, 5);
+    assert_eq!(summary.clicks, 1);
+    assert_eq!(agent.input().clicks.len(), 1);
+
+    let log_str = std::fs::read_to_string(&steps_path).unwrap();
+    assert!(log_str.contains("\"blocked_sensitive\""));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    let reqs = agent.decider().backend().requests.borrow();
+    // reqs[1] is the box request for step 0: verify "sensitive" noul question in SAME request
+    match reqs[1].questions.get("sensitive").unwrap() {
+        Question::Noul { instructions } => {
+            assert_eq!(instructions, SENSITIVE_QUESTION_INSTRUCTIONS);
+        }
+        _ => panic!("Expected sensitive noul question in box request"),
+    }
+    assert!(reqs[1].questions.contains_key("target_box"));
+
+    // reqs[2] (step 1), reqs[4] (step 2), reqs[5] (step 3): target must be excluded!
+    for &req_idx in &[2usize, 4, 5] {
+        match reqs[req_idx].questions.get("target").unwrap() {
+            Question::Choice { criteria, .. } => {
+                assert!(
+                    !criteria.contains_key("primary call-to-action button toward the goal"),
+                    "Target should be excluded at request index {}",
+                    req_idx
+                );
+            }
+            _ => panic!("Expected target choice question"),
+        }
+    }
+
+    // reqs[6] (step 4): after 3 steps, target is no longer excluded
+    match reqs[6].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(criteria.contains_key("primary call-to-action button toward the goal"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+}
+
+#[test]
+fn checkout_button_allowed_at_most_once_per_run() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    // Step 0: click "checkout button" (1st time -> allowed and clicked)
+    // Step 1: click "checkout button" (2nd time -> blocked, not clicked, logs 'checkout_once')
+    // Step 2: done
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results("click", "checkout button", 0.2),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.1),
+        make_choice_response_with_results("click", "checkout button", 0.3),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.1),
+        make_choice_response_with_results("done", "nothing to click", 0.7),
+    ]);
+
+    let decider = VisionDecider::new(backend, Preset::Events.default_targets())
+        .with_done_condition(DoneCondition::CheckoutPage);
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_checkout_once");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_logger(logger);
+    let summary = agent.run("Proceed to checkout").unwrap();
+
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.steps_taken, 3);
+    assert_eq!(summary.clicks, 1);
+    assert_eq!(agent.input().clicks.len(), 1);
+
+    let log_str = std::fs::read_to_string(&steps_path).unwrap();
+    assert!(log_str.contains("\"checkout_once\""));
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

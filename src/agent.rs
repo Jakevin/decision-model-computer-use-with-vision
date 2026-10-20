@@ -17,6 +17,8 @@ pub const FLIGHTS_DEFAULT_URL_PREFIX: &str = "https://www.google.com/travel/flig
 pub const RESULTS_DONE_CONSECUTIVE_THRESHOLD: f64 = 0.8;
 pub const RESULTS_DONE_CONSECUTIVE_COUNT: usize = 2;
 pub const RESULTS_MODEL_DONE_THRESHOLD: f64 = 0.5;
+pub const SENSITIVE_BLOCK_THRESHOLD: f64 = 0.5;
+pub const SENSITIVE_EXCLUDE_STEPS: usize = 3;
 pub const MAX_TAB_EVENTS: usize = 2;
 pub const MAX_FRONTMOST_FAILURES: usize = 2;
 pub const ACTIVATE_CHROME_SLEEP_MS: u64 = 300;
@@ -138,6 +140,23 @@ pub struct ReclickEventRecord {
     pub target: String,
     pub point: (f64, f64),
     pub changed_fraction: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlockedSensitiveEventRecord {
+    pub event: String,
+    pub step: usize,
+    pub target: String,
+    pub point: (f64, f64),
+    pub sensitive_noul: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckoutOnceEventRecord {
+    pub event: String,
+    pub step: usize,
+    pub target: String,
+    pub point: (f64, f64),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -338,6 +357,8 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         let mut consecutive_results_high = 0usize;
         let mut step_clicks: Vec<Option<String>> = Vec::new();
         let mut last_click_point: Option<(f64, f64)> = None;
+        let mut sensitive_excluded: Vec<(String, usize)> = Vec::new();
+        let mut checkout_clicked = false;
 
         if self.policy.allowed_hosts.is_empty() {
             let preset_prefixes = if self.flights_preset {
@@ -470,7 +491,19 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             self.audit_log
                 .record(&prepared, format!("step_{}_decision", step));
 
-            let excluded_targets = compute_excluded_targets(&step_clicks);
+            let mut excluded_targets = compute_excluded_targets(&step_clicks);
+            for (lbl, remaining) in &sensitive_excluded {
+                if *remaining > 0 && !excluded_targets.contains(lbl) {
+                    excluded_targets.push(lbl.clone());
+                }
+            }
+            for (_, remaining) in &mut sensitive_excluded {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                }
+            }
+            sensitive_excluded.retain(|(_, r)| *r > 0);
+
             let decision =
                 self.decider
                     .decide_with_excluded(goal, &history, &prepared, &excluded_targets)?;
@@ -591,6 +624,83 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             break;
                         }
                         let tgt = decision.target.as_deref().unwrap_or("unknown");
+
+                        if let Some(sens) = decision.sensitive_noul {
+                            if sens >= SENSITIVE_BLOCK_THRESHOLD {
+                                if let Some(ref mut logger) = self.logger {
+                                    let evt = BlockedSensitiveEventRecord {
+                                        event: "blocked_sensitive".to_string(),
+                                        step,
+                                        target: tgt.to_string(),
+                                        point: pt,
+                                        sensitive_noul: sens,
+                                    };
+                                    let _ = logger.log_entry(&evt);
+                                }
+                                if let Some(entry) =
+                                    sensitive_excluded.iter_mut().find(|(l, _)| l == tgt)
+                                {
+                                    entry.1 = SENSITIVE_EXCLUDE_STEPS;
+                                } else {
+                                    sensitive_excluded
+                                        .push((tgt.to_string(), SENSITIVE_EXCLUDE_STEPS));
+                                }
+                                history.push(format!("blocked_sensitive '{}'", tgt));
+                                let elapsed = step_start.elapsed().as_secs_f64();
+                                total_step_secs += elapsed;
+                                steps_completed += 1;
+                                self.log_step(
+                                    step,
+                                    current_url,
+                                    &decision,
+                                    false,
+                                    elapsed,
+                                    win_rect,
+                                    &prepared,
+                                    full_screen_size,
+                                );
+                                step_clicks.push(None);
+                                if !self.timing.step_wait.is_zero() {
+                                    thread::sleep(self.timing.step_wait);
+                                }
+                                continue;
+                            }
+                        }
+
+                        if tgt.eq_ignore_ascii_case("checkout button") {
+                            if checkout_clicked {
+                                if let Some(ref mut logger) = self.logger {
+                                    let evt = CheckoutOnceEventRecord {
+                                        event: "checkout_once".to_string(),
+                                        step,
+                                        target: tgt.to_string(),
+                                        point: pt,
+                                    };
+                                    let _ = logger.log_entry(&evt);
+                                }
+                                history.push(format!("checkout_once '{}'", tgt));
+                                let elapsed = step_start.elapsed().as_secs_f64();
+                                total_step_secs += elapsed;
+                                steps_completed += 1;
+                                self.log_step(
+                                    step,
+                                    current_url,
+                                    &decision,
+                                    false,
+                                    elapsed,
+                                    win_rect,
+                                    &prepared,
+                                    full_screen_size,
+                                );
+                                step_clicks.push(None);
+                                if !self.timing.step_wait.is_zero() {
+                                    thread::sleep(self.timing.step_wait);
+                                }
+                                continue;
+                            }
+                            checkout_clicked = true;
+                        }
+
                         let fill_val = self.decider.fill_for(tgt).map(|s| s.to_string());
 
                         if let Some(ref val) = fill_val {

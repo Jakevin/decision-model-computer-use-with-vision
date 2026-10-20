@@ -13,6 +13,8 @@ pub const RESULTS_QUESTION_INSTRUCTIONS: &str =
     "Does the image show a Google Flights results list with flight prices?";
 pub const CHECKOUT_QUESTION_INSTRUCTIONS: &str =
     "Does the image show a ticket checkout or ticket selection page with ticket prices visible?";
+pub const SENSITIVE_QUESTION_INSTRUCTIONS: &str =
+    "Is the element at this target a sign-in, payment, place-order/purchase/pay button, or a personal-info input field (name, email, phone, card)?";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DoneCondition {
@@ -319,6 +321,7 @@ pub struct Decision {
     pub reasked: bool,
     pub text_to_type: Option<String>,
     pub results_noul: f64,
+    pub sensitive_noul: Option<f64>,
 }
 
 #[derive(Debug, Error)]
@@ -655,10 +658,11 @@ impl<B: DecisionBackend> VisionDecider<B> {
                     reasked: false,
                     text_to_type: None,
                     results_noul,
+                    sensitive_noul: None,
                 });
             }
 
-            let (mut bbox, mut box_conf) = self.ask_box(&state, img, &tgt)?;
+            let (mut bbox, mut box_conf, mut sensitive_noul) = self.ask_box(&state, img, &tgt)?;
             let mut reasked = false;
 
             if box_conf < LOW_CONFIDENCE_THRESHOLD {
@@ -666,9 +670,10 @@ impl<B: DecisionBackend> VisionDecider<B> {
                     .find_target_description(&tgt)
                     .map(|desc| format!("{} ({})", tgt, desc))
                     .unwrap_or_else(|| format!("Locate the interactive element: {}", tgt));
-                let (bbox2, conf2) = self.ask_box(&state, img, &longer)?;
+                let (bbox2, conf2, sens2) = self.ask_box(&state, img, &longer)?;
                 bbox = bbox2;
                 box_conf = conf2;
+                sensitive_noul = sens2.or(sensitive_noul);
                 reasked = true;
             }
 
@@ -685,6 +690,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 reasked,
                 text_to_type: fill_text,
                 results_noul,
+                sensitive_noul,
             });
         }
 
@@ -711,6 +717,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
             reasked: false,
             text_to_type,
             results_noul,
+            sensitive_noul: None,
         })
     }
 
@@ -719,12 +726,18 @@ impl<B: DecisionBackend> VisionDecider<B> {
         state: &str,
         img: &PreparedImage,
         instructions: &str,
-    ) -> Result<(BoundingBox, f64), DeciderError> {
+    ) -> Result<(BoundingBox, f64, Option<f64>), DeciderError> {
         let mut questions = BTreeMap::new();
         questions.insert(
             "target_box".to_string(),
             Question::Box {
                 instructions: instructions.to_string(),
+            },
+        );
+        questions.insert(
+            "sensitive".to_string(),
+            Question::Noul {
+                instructions: SENSITIVE_QUESTION_INSTRUCTIONS.to_string(),
             },
         );
         let req = Request {
@@ -734,8 +747,13 @@ impl<B: DecisionBackend> VisionDecider<B> {
             questions,
         };
         let resp = self.ask_backend(&req)?;
+        let sensitive_noul = match resp.answers.get("sensitive") {
+            Some(Answer::Noul { noul }) => Some(*noul),
+            Some(_) => return Err(DeciderError::UnexpectedAnswerType("sensitive".to_string())),
+            None => None,
+        };
         match resp.answers.get("target_box") {
-            Some(Answer::Box { bbox, confidence }) => Ok((*bbox, *confidence)),
+            Some(Answer::Box { bbox, confidence }) => Ok((*bbox, *confidence, sensitive_noul)),
             Some(_) => Err(DeciderError::UnexpectedAnswerType("target_box".to_string())),
             None => Err(DeciderError::MissingAnswer("target_box".to_string())),
         }
