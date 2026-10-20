@@ -9,6 +9,7 @@ use thiserror::Error;
 
 pub const DEFAULT_MODEL: &str = "vllm-sr/d3-turbo";
 pub const DEFAULT_ENDPOINT: &str = "https://decision.vllm-sr.ai/v1/systemone";
+pub const MAX_RETRY_AFTER_SECS: u64 = 60;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ApiKey(String);
@@ -206,6 +207,29 @@ fn sanitize_secret(input: &str, secret: &str) -> String {
     }
 }
 
+pub fn retry_decision(
+    status: u16,
+    code: Option<&str>,
+    retry_after: Option<u64>,
+    attempt: usize,
+    max: usize,
+) -> Option<Duration> {
+    if attempt >= max {
+        return None;
+    }
+    if status == 429 && code == Some("quota_exceeded") {
+        return None;
+    }
+    if !(status == 429 || (500..=599).contains(&status)) {
+        return None;
+    }
+    let secs = retry_after.unwrap_or(1);
+    if secs > MAX_RETRY_AFTER_SECS {
+        return None;
+    }
+    Some(Duration::from_secs(secs))
+}
+
 impl DecisionBackend for DecisionClient {
     fn ask(&self, req: &Request) -> Result<Response, ApiError> {
         req.validate()?;
@@ -230,22 +254,15 @@ impl DecisionBackend for DecisionClient {
             };
 
             let status = resp.status().as_u16();
-            let retry_after_secs = resp
+            let retry_after = resp
                 .headers()
                 .get(RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(1);
+                .and_then(|s| s.trim().parse::<u64>().ok());
 
             let body_text = resp
                 .text()
                 .map_err(|e| ApiError::Transport(sanitize_secret(&e.to_string(), secret)))?;
-
-            if (status == 429 || (500..=599).contains(&status)) && attempt < self.max_retries {
-                attempt += 1;
-                thread::sleep(Duration::from_secs(retry_after_secs.min(10)));
-                continue;
-            }
 
             if (200..300).contains(&status) {
                 let parsed: Response = serde_json::from_str(&body_text).map_err(|e| {
@@ -257,7 +274,18 @@ impl DecisionBackend for DecisionClient {
                 return Ok(parsed);
             }
 
-            if let Ok(env) = serde_json::from_str::<ErrorEnvelope>(&body_text) {
+            let parsed_err = serde_json::from_str::<ErrorEnvelope>(&body_text).ok();
+            let code = parsed_err.as_ref().map(|env| env.error.code.as_str());
+
+            if let Some(delay) =
+                retry_decision(status, code, retry_after, attempt, self.max_retries)
+            {
+                attempt += 1;
+                thread::sleep(delay);
+                continue;
+            }
+
+            if let Some(env) = parsed_err {
                 return Err(ApiError::RemoteError {
                     status,
                     error_type: sanitize_secret(&env.error.error_type, secret),
@@ -271,5 +299,59 @@ impl DecisionBackend for DecisionClient {
                 details: sanitize_secret(&body_text, secret),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_retry_decision_respects_retry_after_up_to_max() {
+        assert_eq!(
+            retry_decision(429, Some("rate_limit_exceeded"), None, 0, 2),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            retry_decision(429, Some("rate_limit_exceeded"), Some(25), 0, 2),
+            Some(Duration::from_secs(25))
+        );
+        assert_eq!(
+            retry_decision(503, None, Some(MAX_RETRY_AFTER_SECS), 1, 2),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn test_retry_decision_stops_on_quota_exceeded() {
+        assert_eq!(
+            retry_decision(429, Some("quota_exceeded"), None, 0, 2),
+            None
+        );
+        assert_eq!(
+            retry_decision(429, Some("quota_exceeded"), Some(5), 0, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn test_retry_decision_rejects_retry_after_exceeding_max() {
+        assert_eq!(
+            retry_decision(429, Some("rate_limit_exceeded"), Some(61), 0, 2),
+            None
+        );
+        assert_eq!(retry_decision(500, None, Some(120), 0, 2), None);
+    }
+
+    #[test]
+    fn test_retry_decision_respects_attempt_limit_and_status() {
+        assert_eq!(
+            retry_decision(429, Some("rate_limit_exceeded"), Some(5), 2, 2),
+            None
+        );
+        assert_eq!(retry_decision(502, None, Some(5), 3, 2), None);
+        assert_eq!(retry_decision(400, None, Some(5), 0, 2), None);
+        assert_eq!(retry_decision(401, Some("invalid_api_key"), None, 0, 2), None);
+        assert_eq!(retry_decision(200, None, None, 0, 2), None);
     }
 }
