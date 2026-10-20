@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use decision_cu::agent::{Agent, AgentError};
+use decision_cu::agent::{Agent, AgentError, Timing};
 use decision_cu::api::{ApiKey, DecisionClient};
 use decision_cu::decider::{TargetSpec, VisionDecider};
 use decision_cu::logging::{redact, RunLogger};
@@ -260,6 +260,7 @@ fn execute_run(
 
         let mut agent = Agent::new(screen, decider, input, policy)
             .with_browser(MacBrowser::new())
+            .with_timing(Timing::default())
             .with_start_url(start_url)
             .with_logger(logger)
             .with_dry_run(dry_run);

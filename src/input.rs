@@ -62,11 +62,21 @@ impl Input for EnigoInput {
 
     fn type_text(&mut self, text: &str) -> Result<(), InputError> {
         use enigo::Keyboard;
+        use std::thread;
+        use std::time::Duration;
         self.release_modifiers()?;
-        let res = self
-            .enigo
-            .text(text)
-            .map_err(|e| InputError::Platform(e.to_string()));
+        let mut res = Ok(());
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            let s = ch.to_string();
+            if let Err(e) = self.enigo.text(&s) {
+                res = Err(InputError::Platform(e.to_string()));
+                break;
+            }
+            if chars.peek().is_some() {
+                thread::sleep(Duration::from_millis(40));
+            }
+        }
         let _ = self.release_modifiers();
         res
     }

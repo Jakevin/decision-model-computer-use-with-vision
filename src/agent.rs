@@ -20,6 +20,39 @@ pub const MAX_TAB_EVENTS: usize = 2;
 pub const MAX_FRONTMOST_FAILURES: usize = 2;
 pub const ACTIVATE_CHROME_SLEEP_MS: u64 = 300;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Timing {
+    pub start_url_wait: Duration,
+    pub activate_chrome_wait: Duration,
+    pub before_fill_wait: Duration,
+    pub after_fill_wait: Duration,
+    pub post_action_wait: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            start_url_wait: Duration::from_secs(3),
+            activate_chrome_wait: Duration::from_millis(ACTIVATE_CHROME_SLEEP_MS),
+            before_fill_wait: Duration::from_millis(800),
+            after_fill_wait: Duration::from_millis(1500),
+            post_action_wait: Duration::from_millis(1000),
+        }
+    }
+}
+
+impl Timing {
+    pub fn zero() -> Self {
+        Self {
+            start_url_wait: Duration::ZERO,
+            activate_chrome_wait: Duration::ZERO,
+            before_fill_wait: Duration::ZERO,
+            after_fill_wait: Duration::ZERO,
+            post_action_wait: Duration::ZERO,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopReason {
     Done,
@@ -154,7 +187,7 @@ pub struct Agent<S: Screen, B: DecisionBackend, I: Input, Br: Browser = DefaultA
     policy: SafetyPolicy,
     browser: Br,
     start_url: Option<String>,
-    start_url_wait: Duration,
+    timing: Timing,
     audit_log: AuditLog,
     logger: Option<RunLogger>,
     dry_run: bool,
@@ -169,7 +202,7 @@ impl<S: Screen, B: DecisionBackend, I: Input> Agent<S, B, I, DefaultAllowedBrows
             policy,
             browser: DefaultAllowedBrowser::default(),
             start_url: None,
-            start_url_wait: Duration::from_secs(3),
+            timing: Timing::zero(),
             audit_log: AuditLog::new(),
             logger: None,
             dry_run: false,
@@ -186,7 +219,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             policy: self.policy,
             browser,
             start_url: self.start_url,
-            start_url_wait: self.start_url_wait,
+            timing: self.timing,
             audit_log: self.audit_log,
             logger: self.logger,
             dry_run: self.dry_run,
@@ -199,8 +232,17 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
     }
 
     pub fn with_start_url_wait(mut self, wait: Duration) -> Self {
-        self.start_url_wait = wait;
+        self.timing.start_url_wait = wait;
         self
+    }
+
+    pub fn with_timing(mut self, timing: Timing) -> Self {
+        self.timing = timing;
+        self
+    }
+
+    pub fn timing(&self) -> &Timing {
+        &self.timing
     }
 
     pub fn with_logger(mut self, logger: RunLogger) -> Self {
@@ -249,8 +291,8 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         if let Some(ref url) = self.start_url {
             let _ = self.browser.activate_chrome();
             let _ = self.browser.set_active_tab_url(url);
-            if !self.start_url_wait.is_zero() {
-                thread::sleep(self.start_url_wait);
+            if !self.timing.start_url_wait.is_zero() {
+                thread::sleep(self.timing.start_url_wait);
             }
         }
 
@@ -259,9 +301,11 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         for step in 0..max_steps {
             let step_start = Instant::now();
 
-            // Activate Chrome, sleep 300ms, and check frontmost app is Google Chrome
+            // Activate Chrome, sleep activate_chrome_wait, and check frontmost app is Google Chrome
             let _ = self.browser.activate_chrome();
-            thread::sleep(Duration::from_millis(ACTIVATE_CHROME_SLEEP_MS));
+            if !self.timing.activate_chrome_wait.is_zero() {
+                thread::sleep(self.timing.activate_chrome_wait);
+            }
             if !self.browser.is_chrome_frontmost() {
                 frontmost_failures += 1;
                 if frontmost_failures >= MAX_FRONTMOST_FAILURES {
@@ -452,14 +496,26 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
 
                         if let Some(val) = fill_val {
                             if !self.dry_run {
+                                if !self.timing.before_fill_wait.is_zero() {
+                                    thread::sleep(self.timing.before_fill_wait);
+                                }
                                 self.input.select_all()?;
                                 self.input.type_text(&val)?;
                                 self.input.release_modifiers()?;
+                                if !self.timing.after_fill_wait.is_zero() {
+                                    thread::sleep(self.timing.after_fill_wait);
+                                }
                             }
                             history.push(format!("clicked and typed '{}' into {}", val, tgt));
                         } else {
+                            if executed && !self.timing.post_action_wait.is_zero() {
+                                thread::sleep(self.timing.post_action_wait);
+                            }
                             history.push(format!("click '{}' at ({:.1}, {:.1})", tgt, pt.0, pt.1));
                         }
+                    }
+                    if executed && !self.timing.post_action_wait.is_zero() {
+                        thread::sleep(self.timing.post_action_wait);
                     }
                     let elapsed = step_start.elapsed().as_secs_f64();
                     total_step_secs += elapsed;
@@ -511,6 +567,9 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         self.input.key(KeyCode::Return)?;
                         self.input.release_modifiers()?;
                         executed = true;
+                        if !self.timing.post_action_wait.is_zero() {
+                            thread::sleep(self.timing.post_action_wait);
+                        }
                     }
                     history.push("press enter".to_string());
                     let elapsed = step_start.elapsed().as_secs_f64();
@@ -532,6 +591,9 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     if !self.dry_run {
                         self.input.scroll_vertical(-5)?;
                         executed = true;
+                        if !self.timing.post_action_wait.is_zero() {
+                            thread::sleep(self.timing.post_action_wait);
+                        }
                     }
                     history.push("scroll down".to_string());
                     let elapsed = step_start.elapsed().as_secs_f64();
