@@ -23,6 +23,7 @@ pub const RESULTS_MODEL_DONE_THRESHOLD: f64 = 0.5;
 pub const SENSITIVE_BLOCK_THRESHOLD: f64 = 0.5;
 pub const SENSITIVE_EXCLUDE_STEPS: usize = 3;
 pub const LOW_BOX_CONF_EXCLUDE_STEPS: usize = 2;
+pub const MAX_CONSECUTIVE_NOOP_STEPS: usize = 3;
 pub const DISMISS_CLOSEISH_THRESHOLD: f64 = 0.6;
 pub const MAX_TAB_EVENTS: usize = 2;
 pub const MAX_FRONTMOST_FAILURES: usize = 2;
@@ -392,6 +393,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         let mut step_clicks: Vec<Option<String>> = Vec::new();
         let mut last_click_point: Option<(f64, f64)> = None;
         let mut sensitive_excluded: Vec<(String, usize)> = Vec::new();
+        let mut consecutive_noop_steps = 0usize;
         let mut checkout_clicked = false;
 
         if self.policy.allowed_hosts.is_empty() {
@@ -667,6 +669,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         break;
                     } else {
                         // Only accept model "done" when results noul >= 0.5; otherwise treat as wait
+                        consecutive_noop_steps = 0;
                         history.push("wait".to_string());
                         let elapsed = step_start.elapsed().as_secs_f64();
                         total_step_secs += elapsed;
@@ -688,6 +691,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     }
                 }
                 ActionKind::Wait => {
+                    consecutive_noop_steps = 0;
                     history.push("wait".to_string());
                     let elapsed = step_start.elapsed().as_secs_f64();
                     total_step_secs += elapsed;
@@ -732,6 +736,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         } else {
                             sensitive_excluded.push((tgt.to_string(), LOW_BOX_CONF_EXCLUDE_STEPS));
                         }
+                        clicked_this_step = Some(format!("low_box_conf:{}", tgt));
                         history.push("wait".to_string());
                         let elapsed = step_start.elapsed().as_secs_f64();
                         total_step_secs += elapsed;
@@ -746,13 +751,17 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             &prepared,
                             full_screen_size,
                         );
-                        if self.policy.on_wait().is_err() {
-                            stop_reason = StopReason::MaxWaitsExceeded;
+                        consecutive_noop_steps += 1;
+                        if consecutive_noop_steps >= MAX_CONSECUTIVE_NOOP_STEPS {
+                            stop_reason = StopReason::SafetyBlocked(
+                                "3 consecutive no-op steps (low box confidence)".to_string(),
+                            );
                             break;
                         }
                     } else if popup_present < POPUP_PRESENT_THRESHOLD
                         || closeish < DISMISS_CLOSEISH_THRESHOLD
                     {
+                        consecutive_noop_steps = 0;
                         if let Some(ref mut logger) = self.logger {
                             let evt = DismissRefusedEventRecord {
                                 event: "dismiss_refused".to_string(),
@@ -783,6 +792,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             break;
                         }
                     } else {
+                        consecutive_noop_steps = 0;
                         self.policy.reset_wait();
                         if let Some(pt) = decision.click_point_screen_pt {
                             if let Err(e) = self.policy.check_click(pt, win_rect) {
@@ -885,16 +895,20 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             &prepared,
                             full_screen_size,
                         );
-                        if self.policy.on_wait().is_err() {
-                            stop_reason = StopReason::MaxWaitsExceeded;
+                        consecutive_noop_steps += 1;
+                        if consecutive_noop_steps >= MAX_CONSECUTIVE_NOOP_STEPS {
+                            stop_reason = StopReason::SafetyBlocked(
+                                "3 consecutive no-op steps (low box confidence)".to_string(),
+                            );
                             break;
                         }
-                        step_clicks.push(None);
+                        step_clicks.push(Some(format!("low_box_conf:{}", tgt)));
                         if !self.timing.step_wait.is_zero() {
                             thread::sleep(self.timing.step_wait);
                         }
                         continue;
                     }
+                    consecutive_noop_steps = 0;
                     self.policy.reset_wait();
                     if let Some(pt) = decision.click_point_screen_pt {
                         if let Err(e) = self.policy.check_click(pt, win_rect) {
@@ -1107,6 +1121,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     );
                 }
                 ActionKind::Type => {
+                    consecutive_noop_steps = 0;
                     self.policy.reset_wait();
                     let text = decision.text_to_type.as_deref().unwrap_or("");
                     if let Some(ref tgt) = decision.target {
@@ -1145,6 +1160,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     );
                 }
                 ActionKind::PressEnter => {
+                    consecutive_noop_steps = 0;
                     self.policy.reset_wait();
                     let check_pt = last_click_point.unwrap_or((
                         win_rect.x + win_rect.width / 2.0,
@@ -1178,6 +1194,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     );
                 }
                 ActionKind::Scroll => {
+                    consecutive_noop_steps = 0;
                     self.policy.reset_wait();
                     if !self.dry_run {
                         self.input.scroll_vertical(-5)?;

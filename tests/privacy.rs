@@ -1209,10 +1209,8 @@ fn events_and_generic_preset_target_criteria_and_targets_file() {
                 criteria.get("checkout button").unwrap().as_deref(),
                 Some("a 'Checkout', 'Continue' or 'Next' button that proceeds to checkout")
             );
-            assert_eq!(
-                criteria.get("popup close").unwrap().as_deref(),
-                Some("Close/X/Reject/Decline button of a cookie, newsletter or promo popup")
-            );
+            // Popup close is not offered in target choices unless popup_present noul confirmed a popup
+            assert!(!criteria.contains_key("popup close"));
             assert!(criteria.contains_key("nothing to click"));
         }
         _ => panic!("Expected target choice question"),
@@ -2275,6 +2273,189 @@ fn retry_on_transport_error_once_and_no_transport_retry_on_http_status() {
     assert_eq!(client2.requests_sent(), 1);
     let _ = handle2.join();
 }
+
+#[test]
+fn acc2_fixes_low_conf_exclusion_noop_cap_scroll_target_and_popup_target_gate() {
+    use decision_cu::decider::compute_excluded_targets;
+
+    // 1. Verify compute_excluded_targets is fed by low_box_conf events and excludes for at least 2 steps
+    let step_events = vec![Some("low_box_conf:活動卡片".to_string())];
+    assert_eq!(
+        compute_excluded_targets(&step_events),
+        vec!["活動卡片".to_string()]
+    );
+    let step_events_2 = vec![
+        Some("low_box_conf:活動卡片".to_string()),
+        None,
+    ];
+    assert_eq!(
+        compute_excluded_targets(&step_events_2),
+        vec!["活動卡片".to_string()]
+    );
+    let step_events_3 = vec![
+        Some("low_box_conf:活動卡片".to_string()),
+        None,
+        None,
+    ];
+    assert!(compute_excluded_targets(&step_events_3).is_empty());
+
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img: img.clone(),
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    // Scenario A (events-zh):
+    // Step 0: popup_present not yet confirmed -> "關閉彈窗" NOT offered in target choices.
+    //         Model chooses click "活動卡片", box conf 0.11 / re-ask 0.14 (< 0.2) -> low_box_conf (1st no-op).
+    // Step 1: "活動卡片" is excluded (1st of 2 steps), "關閉彈窗" still NOT offered (step 0 popup_present = 0.2 < 0.6).
+    //         Model chooses scroll (even if raw target choice was "關閉彈窗") -> Decision.target and step log target MUST be "向下捲動", resets no-op counter.
+    //         Step 1 returns popup_present = 0.85 (>= 0.6).
+    // Step 2: "活動卡片" is STILL excluded (2nd of 2 steps); "關閉彈窗" IS now offered because step 1 popup_present = 0.85 >= 0.6.
+    //         Model chooses wait (1st wait; note step 0 low_box_conf did NOT count toward wait limit!).
+    // Step 3: "活動卡片" is back in target choices after 2 excluded steps.
+    //         Model chooses wait (2nd consecutive wait; still <= max_consecutive_waits = 2, proving step 0 low_box_conf did not count as wait!).
+    // Step 4: Model chooses click "搜尋或活動分類" (low_box_conf, 1st consecutive no-op).
+    // Step 5: Model chooses click "立即報名按鈕" (low_box_conf, 2nd consecutive no-op).
+    // Step 6: Model chooses click "票種選項" (low_box_conf, 3rd consecutive no-op) -> stops with status "blocked" and reason "3 consecutive no-op steps (low box confidence)".
+    let backend = MockBackend::new(vec![
+        // Step 0: click "活動卡片" -> low_box_conf (popup_present = 0.2)
+        make_choice_response_with_results_and_popup("click", "活動卡片", 0.1, 0.2),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.11, 0.05),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.14, 0.05),
+        // Step 1: scroll with raw target "關閉彈窗" -> normalized to "向下捲動" (popup_present = 0.85)
+        make_choice_response_with_results_and_popup("scroll", "關閉彈窗", 0.1, 0.85),
+        // Step 2: wait (popup_present = 0.1)
+        make_choice_response_with_results_and_popup("wait", "nothing to click", 0.1, 0.1),
+        // Step 3: wait (popup_present = 0.1)
+        make_choice_response_with_results_and_popup("wait", "nothing to click", 0.1, 0.1),
+        // Step 4: click "搜尋或活動分類" -> low_box_conf (1st consecutive no-op)
+        make_choice_response_with_results_and_popup("click", "搜尋或活動分類", 0.1, 0.1),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.10, 0.05),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.12, 0.05),
+        // Step 5: click "立即報名按鈕" -> low_box_conf (2nd consecutive no-op)
+        make_choice_response_with_results_and_popup("click", "立即報名按鈕", 0.1, 0.1),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.09, 0.05),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.15, 0.05),
+        // Step 6: click "票種選項" -> low_box_conf (3rd consecutive no-op -> blocked!)
+        make_choice_response_with_results_and_popup("click", "票種選項", 0.1, 0.1),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.08, 0.05),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.13, 0.05),
+    ]);
+
+    let decider = VisionDecider::new(backend, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage);
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_acc2_fixes");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+    let summary_path = logger.summary_path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_flights_preset(false)
+        .with_start_url(Some("https://www.accupass.com".to_string()))
+        .with_logger(logger);
+
+    let summary = agent.run("Find Accupass event").unwrap();
+    assert_eq!(
+        summary.stop_reason,
+        StopReason::SafetyBlocked("3 consecutive no-op steps (low box confidence)".to_string())
+    );
+    assert_eq!(summary.steps_taken, 7);
+    assert_eq!(summary.clicks, 0);
+
+    let summary_json = summary.to_summary_json();
+    assert_eq!(summary_json.status, "blocked");
+    assert_eq!(
+        summary_json.reason,
+        "3 consecutive no-op steps (low box confidence)"
+    );
+
+    let summary_file_str = std::fs::read_to_string(&summary_path).unwrap();
+    let summary_file_val: serde_json::Value = serde_json::from_str(&summary_file_str).unwrap();
+    assert_eq!(summary_file_val["status"], "blocked");
+    assert_eq!(
+        summary_file_val["reason"],
+        "3 consecutive no-op steps (low box confidence)"
+    );
+
+    // Check step log records
+    let steps_str = std::fs::read_to_string(&steps_path).unwrap();
+    let step_records: Vec<serde_json::Value> = steps_str
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e.get("kind").is_some())
+        .collect();
+    assert_eq!(step_records.len(), 7);
+    // Step 1 was scroll: logged target must be "向下捲動", never "關閉彈窗"
+    assert_eq!(step_records[1]["kind"], "scroll");
+    assert_eq!(step_records[1]["target"], "向下捲動");
+    assert_eq!(
+        step_records[1]["decision"]["target"],
+        serde_json::Value::String("向下捲動".to_string())
+    );
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    // Inspect target choice questions sent to backend
+    let reqs = agent.decider().backend().requests.borrow();
+    // Step 0 choice request (reqs[0]): "關閉彈窗" NOT offered because popup_present not confirmed
+    match reqs[0].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(criteria.contains_key("活動卡片"));
+            assert!(!criteria.contains_key("關閉彈窗"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+    // Step 1 choice request (reqs[3]): "活動卡片" excluded (1st of 2 steps), "關閉彈窗" still NOT offered (step 0 popup_present = 0.2)
+    match reqs[3].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("活動卡片"));
+            assert!(!criteria.contains_key("關閉彈窗"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+    // Step 2 choice request (reqs[4]): "活動卡片" STILL excluded (2nd of 2 steps), "關閉彈窗" IS offered (step 1 popup_present = 0.85 >= 0.6)
+    match reqs[4].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("活動卡片"));
+            assert!(criteria.contains_key("關閉彈窗"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+    // Step 3 choice request (reqs[5]): "活動卡片" is back after 2 excluded steps, "關閉彈窗" NOT offered (step 2 popup_present = 0.1 < 0.6)
+    match reqs[5].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(criteria.contains_key("活動卡片"));
+            assert!(!criteria.contains_key("關閉彈窗"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+    // Step 5 choice request (reqs[9]): "搜尋或活動分類" excluded (from step 4 low_box_conf)
+    match reqs[9].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("搜尋或活動分類"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+    // Step 6 choice request (reqs[12]): both "搜尋或活動分類" (2nd step) and "立即報名按鈕" (1st step) excluded
+    match reqs[12].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("搜尋或活動分類"));
+            assert!(!criteria.contains_key("立即報名按鈕"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+}
+
 
 
 

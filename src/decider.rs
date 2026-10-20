@@ -449,6 +449,20 @@ pub fn clicked_targets_from_history(history: &[String]) -> Vec<String> {
         .collect()
 }
 
+pub fn extract_low_box_conf_target(entry: &str) -> Option<String> {
+    if let Some(rest) = entry.strip_prefix("low_box_conf:") {
+        let trimmed = rest.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(rest) = entry.strip_prefix("low_box_conf '") {
+        let end = rest.find('\'')?;
+        return Some(rest[..end].to_string());
+    }
+    None
+}
+
 pub fn compute_excluded_targets(step_clicks: &[Option<String>]) -> Vec<String> {
     let mut excluded = Vec::new();
     if step_clicks.len() >= 2 {
@@ -456,8 +470,15 @@ pub fn compute_excluded_targets(step_clicks: &[Option<String>]) -> Vec<String> {
             &step_clicks[step_clicks.len() - 2],
             &step_clicks[step_clicks.len() - 1],
         ) {
-            if prev1 == prev2 {
+            if prev1 == prev2 && extract_low_box_conf_target(prev1).is_none() {
                 excluded.push(prev1.clone());
+            }
+        }
+    }
+    for entry in step_clicks.iter().rev().take(2).flatten() {
+        if let Some(tgt) = extract_low_box_conf_target(entry) {
+            if !excluded.contains(&tgt) {
+                excluded.push(tgt);
             }
         }
     }
@@ -578,6 +599,31 @@ impl<B: DecisionBackend> VisionDecider<B> {
         }
     }
 
+    pub fn is_popup_close_target(&self, label: &str) -> bool {
+        let trimmed = label.trim();
+        trimmed.eq_ignore_ascii_case("popup close")
+            || trimmed.eq_ignore_ascii_case("close popup")
+            || trimmed == "關閉彈窗"
+    }
+
+    pub fn scroll_target_label(&self) -> &'static str {
+        match self.preset {
+            Some(Preset::EventsZh) => "向下捲動",
+            Some(_) => "scroll down",
+            None => {
+                if self
+                    .targets
+                    .iter()
+                    .any(|t| t.label == "關閉彈窗" || t.label == "活動卡片")
+                {
+                    "向下捲動"
+                } else {
+                    "scroll down"
+                }
+            }
+        }
+    }
+
     pub fn is_checkout_once_target(&self, label: &str) -> bool {
         let trimmed = label.trim();
         trimmed.eq_ignore_ascii_case("checkout button") || trimmed == "下一步按鈕"
@@ -643,8 +689,14 @@ impl<B: DecisionBackend> VisionDecider<B> {
         history: &[String],
         img: &PreparedImage,
     ) -> Result<Decision, DeciderError> {
-        let step_clicks: Vec<Option<String>> =
-            history.iter().map(|h| extract_clicked_target(h)).collect();
+        let step_clicks: Vec<Option<String>> = history
+            .iter()
+            .map(|h| {
+                extract_low_box_conf_target(h)
+                    .map(|t| format!("low_box_conf:{}", t))
+                    .or_else(|| extract_clicked_target(h))
+            })
+            .collect();
         let auto_excluded = compute_excluded_targets(&step_clicks);
         self.decide_with_excluded(goal, history, img, &auto_excluded)
     }
@@ -664,12 +716,18 @@ impl<B: DecisionBackend> VisionDecider<B> {
             .unwrap()
             .unwrap_or(0.0);
 
+        let popup_close = self.popup_close_label();
+        let popup_close_excluded = excluded_targets.iter().any(|ex| ex == popup_close);
+
         let mut kind_criteria = BTreeMap::new();
         kind_criteria.insert(
             "click".to_string(),
             Some("Click an interactive element on the page".to_string()),
         );
-        if self.allow_dismiss_popup() && prev_popup_present >= POPUP_PRESENT_THRESHOLD {
+        if self.allow_dismiss_popup()
+            && prev_popup_present >= POPUP_PRESENT_THRESHOLD
+            && !popup_close_excluded
+        {
             kind_criteria.insert(
                 "dismiss popup".to_string(),
                 Some("Close a cookie, newsletter or promo popup".to_string()),
@@ -704,6 +762,9 @@ impl<B: DecisionBackend> VisionDecider<B> {
 
         let mut target_criteria = BTreeMap::new();
         for t in &self.targets {
+            if self.is_popup_close_target(&t.label) && prev_popup_present < POPUP_PRESENT_THRESHOLD {
+                continue;
+            }
             if !excluded_targets.iter().any(|ex| ex == &t.label) {
                 target_criteria.insert(t.label.clone(), t.description.clone());
             }
@@ -904,10 +965,16 @@ impl<B: DecisionBackend> VisionDecider<B> {
             None
         };
 
+        let final_target = if action_kind == ActionKind::Scroll {
+            Some(self.scroll_target_label().to_string())
+        } else {
+            target_choice
+        };
+
         Ok(Decision {
             kind: action_kind,
             kind_confidence: kind_conf,
-            target: target_choice,
+            target: final_target,
             click_point_screen_pt: None,
             bbox: None,
             box_confidence: None,
