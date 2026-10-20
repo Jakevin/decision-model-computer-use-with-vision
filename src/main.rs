@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use decision_cu::agent::{Agent, AgentError, Timing, FLIGHTS_DEFAULT_URL_PREFIX};
 use decision_cu::api::{ApiKey, DecisionClient};
-use decision_cu::decider::{load_targets_file, Preset, VisionDecider};
+use decision_cu::decider::{load_targets_file, DoneCondition, Preset, VisionDecider};
 use decision_cu::logging::{redact, RunLogger};
 use decision_cu::safety::{resolve_allowed_url_prefixes, SafetyPolicy};
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,10 @@ pub enum Commands {
         #[arg(long = "targets-file", value_name = "PATH")]
         targets_file: Option<PathBuf>,
 
+        /// Done condition: flights-results, checkout-page, or model (defaults from --preset)
+        #[arg(long = "done-when", value_name = "CONDITION")]
+        done_when: Option<String>,
+
         /// Repeatable target-to-text fill mapping (e.g. --fill "origin field=Osaka")
         #[arg(long = "fill", value_name = "KEY=VALUE")]
         fill: Vec<String>,
@@ -79,6 +83,7 @@ pub struct CliResultOutput {
     pub status: String,
     pub steps: usize,
     pub reason: String,
+    pub done_condition: String,
     pub clicks: usize,
     pub requests_sent: usize,
     pub images_sent: usize,
@@ -93,6 +98,7 @@ impl CliResultOutput {
             status: status.to_string(),
             steps: 0,
             reason: reason.into(),
+            done_condition: "flights-results".to_string(),
             clicks: 0,
             requests_sent: 0,
             images_sent: 0,
@@ -140,6 +146,7 @@ pub fn resolve_start_url_preset(preset: &str) -> Result<String, String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_run(
     task: &str,
     max_steps: usize,
@@ -148,12 +155,21 @@ fn execute_run(
     allow_url_prefix: &[String],
     preset_str: &str,
     targets_file: Option<&std::path::Path>,
+    done_when: Option<&str>,
     fills: &[String],
     dry_run: bool,
 ) -> (CliResultOutput, Option<ApiKey>) {
     let preset = match Preset::from_name(preset_str) {
         Ok(p) => p,
         Err(e) => return (CliResultOutput::error_or_blocked("error", e), None),
+    };
+
+    let done_condition = match done_when {
+        Some(dw) => match DoneCondition::from_name(dw) {
+            Ok(dc) => dc,
+            Err(e) => return (CliResultOutput::error_or_blocked("error", e), None),
+        },
+        None => preset.default_done_condition(),
     };
 
     let targets = match targets_file {
@@ -201,7 +217,9 @@ fn execute_run(
         }
     };
 
-    let decider = VisionDecider::new(client, targets).with_type_values(type_values);
+    let decider = VisionDecider::new(client, targets)
+        .with_done_condition(done_condition)
+        .with_type_values(type_values);
 
     let preset_prefixes = if preset == Preset::Flights {
         vec![FLIGHTS_DEFAULT_URL_PREFIX.to_string()]
@@ -264,6 +282,7 @@ fn execute_run(
                         status: s.status,
                         steps: s.steps,
                         reason: redact(&s.reason, Some(&api_key)),
+                        done_condition: s.done_condition,
                         clicks: s.clicks,
                         requests_sent: s.requests_sent,
                         images_sent: s.images_sent,
@@ -323,6 +342,7 @@ fn main() -> ExitCode {
             allow_url_prefix,
             preset,
             targets_file,
+            done_when,
             fill,
             dry_run,
             json,
@@ -335,6 +355,7 @@ fn main() -> ExitCode {
                 &allow_url_prefix,
                 &preset,
                 targets_file.as_deref(),
+                done_when.as_deref(),
                 &fill,
                 dry_run,
             );
@@ -387,6 +408,8 @@ mod tests {
             "events",
             "--targets-file",
             "/tmp/custom_targets.json",
+            "--done-when",
+            "checkout-page",
             "--fill",
             "origin field=Osaka",
             "--fill",
@@ -404,6 +427,7 @@ mod tests {
                 allow_url_prefix,
                 preset,
                 targets_file,
+                done_when,
                 fill,
                 dry_run,
                 json,
@@ -427,6 +451,7 @@ mod tests {
                     targets_file.as_deref(),
                     Some(std::path::Path::new("/tmp/custom_targets.json"))
                 );
+                assert_eq!(done_when.as_deref(), Some("checkout-page"));
                 assert_eq!(fill.len(), 2);
                 let parsed = parse_fills(&fill).unwrap();
                 assert_eq!(parsed.get("origin field").unwrap(), "Osaka");
@@ -454,6 +479,7 @@ mod tests {
                 allow_url_prefix,
                 preset,
                 targets_file,
+                done_when,
                 fill,
                 dry_run,
                 json,
@@ -469,6 +495,7 @@ mod tests {
                 assert!(allow_url_prefix.is_empty());
                 assert_eq!(preset, "flights");
                 assert!(targets_file.is_none());
+                assert!(done_when.is_none());
                 assert!(fill.is_empty());
                 assert!(!dry_run);
                 assert!(!json);

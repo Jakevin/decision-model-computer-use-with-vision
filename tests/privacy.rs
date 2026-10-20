@@ -6,7 +6,8 @@ use decision_cu::api::{
 use decision_cu::capture::{CaptureError, Rect, Screen};
 use decision_cu::decider::{
     events_preset_targets, flights_preset_targets, generic_preset_targets, load_targets_file,
-    map_box_center_to_screen_pt, ActionKind, Preset, TargetSpec, VisionDecider,
+    map_box_center_to_screen_pt, ActionKind, DoneCondition, Preset, TargetSpec, VisionDecider,
+    CHECKOUT_QUESTION_INSTRUCTIONS,
 };
 use decision_cu::input::{Input, InputError, KeyCode};
 use decision_cu::logging::{redact, RunLogger};
@@ -1230,4 +1231,107 @@ fn events_and_generic_preset_target_criteria_and_targets_file() {
         )]
     );
     let _ = std::fs::remove_file(&temp_path);
+}
+
+#[test]
+fn checkout_page_done_after_two_consecutive_and_logs_noul_and_done_condition() {
+    assert_eq!(
+        Preset::Flights.default_done_condition(),
+        DoneCondition::FlightsResults
+    );
+    assert_eq!(
+        Preset::Events.default_done_condition(),
+        DoneCondition::CheckoutPage
+    );
+    assert_eq!(
+        Preset::Generic.default_done_condition(),
+        DoneCondition::Model
+    );
+    assert_eq!(
+        DoneCondition::from_name("flights-results").unwrap(),
+        DoneCondition::FlightsResults
+    );
+    assert_eq!(
+        DoneCondition::from_name("checkout-page").unwrap(),
+        DoneCondition::CheckoutPage
+    );
+    assert_eq!(
+        DoneCondition::from_name("model").unwrap(),
+        DoneCondition::Model
+    );
+    assert!(DoneCondition::from_name("invalid").is_err());
+
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    // Step 0: checkout noul 0.85 (1st high) -> clicks events menu
+    // Step 1: checkout noul 0.40 (resets consecutive count) -> clicks upcoming event card
+    // Step 2: checkout noul 0.82 (1st high) -> clicks tickets link
+    // Step 3: checkout noul 0.91 (2nd consecutive >= 0.8) -> done immediately!
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results("click", "events menu", 0.85),
+        make_box_response(0.4, 0.4, 0.6, 0.6, 0.95),
+        make_choice_response_with_results("click", "upcoming event card", 0.40),
+        make_box_response(0.4, 0.4, 0.6, 0.6, 0.95),
+        make_choice_response_with_results("click", "tickets link", 0.82),
+        make_box_response(0.4, 0.4, 0.6, 0.6, 0.95),
+        make_choice_response_with_results("wait", "nothing to click", 0.91),
+    ]);
+    let decider = VisionDecider::new(backend, Preset::Events.default_targets())
+        .with_done_condition(DoneCondition::CheckoutPage);
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_checkout_done");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+    let summary_path = logger.summary_path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_flights_preset(false)
+        .with_start_url(Some("https://www.google.com/travel/flights".to_string()))
+        .with_logger(logger);
+
+    let summary = agent.run("Find event checkout").unwrap();
+    assert_eq!(summary.stop_reason, StopReason::CheckoutPageWithPrices);
+    assert_eq!(summary.done_condition, "checkout-page");
+    assert_eq!(summary.steps_taken, 4);
+    assert_eq!(summary.clicks, 3);
+
+    // Verify checkout noul question instructions were sent on each step
+    let reqs = agent.decider().backend().requests.borrow();
+    match reqs[0].questions.get("results").unwrap() {
+        Question::Noul { instructions } => {
+            assert_eq!(instructions, CHECKOUT_QUESTION_INSTRUCTIONS);
+        }
+        _ => panic!("Expected noul question"),
+    }
+
+    // Verify step log records the noul each step and summary has done_condition
+    let steps_str = std::fs::read_to_string(&steps_path).unwrap();
+    let lines: Vec<&str> = steps_str.lines().collect();
+    assert_eq!(lines.len(), 4);
+    let s0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    let s1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let s2: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    let s3: serde_json::Value = serde_json::from_str(lines[3]).unwrap();
+    assert_eq!(s0["results_noul"], 0.85);
+    assert_eq!(s1["results_noul"], 0.40);
+    assert_eq!(s2["results_noul"], 0.82);
+    assert_eq!(s3["results_noul"], 0.91);
+
+    let summary_str = std::fs::read_to_string(&summary_path).unwrap();
+    let summary_val: serde_json::Value = serde_json::from_str(&summary_str).unwrap();
+    assert_eq!(summary_val["status"], "done");
+    assert_eq!(summary_val["done_condition"], "checkout-page");
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }

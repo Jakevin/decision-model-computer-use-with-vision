@@ -2,7 +2,7 @@ use crate::api::DecisionBackend;
 use crate::browser::{Browser, DefaultAllowedBrowser};
 use crate::capture::{changed_fraction, is_changed, CaptureError, Rect, Screen};
 use crate::decider::{
-    compute_excluded_targets, ActionKind, DeciderError, Decision, VisionDecider,
+    compute_excluded_targets, ActionKind, DeciderError, Decision, DoneCondition, VisionDecider,
 };
 use crate::input::{Input, InputError, KeyCode};
 use crate::logging::RunLogger;
@@ -64,6 +64,7 @@ impl Timing {
 pub enum StopReason {
     Done,
     ResultsPageWithPrices,
+    CheckoutPageWithPrices,
     StepLimitReached(usize),
     NoCrop,
     SafetyBlocked(String),
@@ -105,6 +106,7 @@ pub struct StepRecord {
     pub click_point: Option<(f64, f64)>,
     pub seconds: f64,
     pub results_noul: f64,
+    pub done_noul: f64,
     pub sent_image_crop_rect: Rect,
     pub sent_size: (u32, u32),
     pub full_screen_size: (u32, u32),
@@ -142,6 +144,7 @@ pub struct ReclickEventRecord {
 pub struct RunSummaryJson {
     pub status: String,
     pub reason: String,
+    pub done_condition: String,
     pub steps: usize,
     pub clicks: usize,
     pub requests_sent: usize,
@@ -155,6 +158,7 @@ pub struct RunSummaryJson {
 pub struct AgentRunSummary {
     pub steps_taken: usize,
     pub stop_reason: StopReason,
+    pub done_condition: String,
     pub history: Vec<String>,
     pub clicks: usize,
     pub requests_sent: usize,
@@ -175,6 +179,10 @@ impl AgentRunSummary {
                 "done".to_string(),
                 "results page with prices".to_string(),
             ),
+            StopReason::CheckoutPageWithPrices => (
+                "done".to_string(),
+                "checkout page with ticket prices".to_string(),
+            ),
             StopReason::StepLimitReached(n) => (
                 "step_limit".to_string(),
                 format!("Reached maximum step limit ({})", n),
@@ -193,6 +201,7 @@ impl AgentRunSummary {
         RunSummaryJson {
             status,
             reason,
+            done_condition: self.done_condition.clone(),
             steps: self.steps_taken,
             clicks: self.clicks,
             requests_sent: self.requests_sent,
@@ -256,6 +265,15 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
     pub fn with_flights_preset(mut self, flights_preset: bool) -> Self {
         self.flights_preset = flights_preset;
         self
+    }
+
+    pub fn with_done_condition(mut self, done_condition: DoneCondition) -> Self {
+        self.decider = self.decider.with_done_condition(done_condition);
+        self
+    }
+
+    pub fn done_condition(&self) -> DoneCondition {
+        self.decider.done_condition()
     }
 
     pub fn with_start_url(mut self, start_url: Option<String>) -> Self {
@@ -463,29 +481,39 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                 }
             }
 
-            if decision.results_noul >= RESULTS_DONE_CONSECUTIVE_THRESHOLD {
-                consecutive_results_high += 1;
-            } else {
-                consecutive_results_high = 0;
-            }
+            let done_condition = self.decider.done_condition();
+            if done_condition != DoneCondition::Model {
+                if decision.results_noul >= RESULTS_DONE_CONSECUTIVE_THRESHOLD {
+                    consecutive_results_high += 1;
+                } else {
+                    consecutive_results_high = 0;
+                }
 
-            if consecutive_results_high >= RESULTS_DONE_CONSECUTIVE_COUNT {
-                let elapsed = step_start.elapsed().as_secs_f64();
-                total_step_secs += elapsed;
-                steps_completed += 1;
-                history.push("results page with prices".to_string());
-                self.log_step(
-                    step,
-                    current_url,
-                    &decision,
-                    true,
-                    elapsed,
-                    win_rect,
-                    &prepared,
-                    full_screen_size,
-                );
-                stop_reason = StopReason::ResultsPageWithPrices;
-                break;
+                if consecutive_results_high >= RESULTS_DONE_CONSECUTIVE_COUNT {
+                    let elapsed = step_start.elapsed().as_secs_f64();
+                    total_step_secs += elapsed;
+                    steps_completed += 1;
+                    let (reason_str, sr) = match done_condition {
+                        DoneCondition::CheckoutPage => (
+                            "checkout page with ticket prices",
+                            StopReason::CheckoutPageWithPrices,
+                        ),
+                        _ => ("results page with prices", StopReason::ResultsPageWithPrices),
+                    };
+                    history.push(reason_str.to_string());
+                    self.log_step(
+                        step,
+                        current_url,
+                        &decision,
+                        true,
+                        elapsed,
+                        win_rect,
+                        &prepared,
+                        full_screen_size,
+                    );
+                    stop_reason = sr;
+                    break;
+                }
             }
 
             let mut executed = false;
@@ -493,7 +521,9 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
 
             match decision.kind {
                 ActionKind::Done => {
-                    if decision.results_noul >= RESULTS_MODEL_DONE_THRESHOLD {
+                    let model_done_ok = done_condition == DoneCondition::Model
+                        || decision.results_noul >= RESULTS_MODEL_DONE_THRESHOLD;
+                    if model_done_ok {
                         let elapsed = step_start.elapsed().as_secs_f64();
                         total_step_secs += elapsed;
                         steps_completed += 1;
@@ -756,6 +786,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         let summary = AgentRunSummary {
             steps_taken: steps_completed,
             stop_reason,
+            done_condition: self.decider.done_condition().as_str().to_string(),
             history,
             clicks,
             requests_sent: self.decider.requests_sent(),
@@ -838,6 +869,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                 click_point: decision.click_point_screen_pt,
                 seconds,
                 results_noul: decision.results_noul,
+                done_noul: decision.results_noul,
                 sent_image_crop_rect,
                 sent_size: prepared.sent_size_px,
                 full_screen_size,

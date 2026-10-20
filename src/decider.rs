@@ -11,6 +11,54 @@ pub const NOTHING_TO_CLICK: &str = "nothing to click";
 pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.2;
 pub const RESULTS_QUESTION_INSTRUCTIONS: &str =
     "Does the image show a Google Flights results list with flight prices?";
+pub const CHECKOUT_QUESTION_INSTRUCTIONS: &str =
+    "Does the image show a ticket checkout or ticket selection page with ticket prices visible?";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DoneCondition {
+    #[serde(rename = "flights-results")]
+    FlightsResults,
+    #[serde(rename = "checkout-page")]
+    CheckoutPage,
+    #[serde(rename = "model")]
+    Model,
+}
+
+impl Default for DoneCondition {
+    fn default() -> Self {
+        Self::FlightsResults
+    }
+}
+
+impl DoneCondition {
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        match name.trim().to_lowercase().as_str() {
+            "flights-results" => Ok(Self::FlightsResults),
+            "checkout-page" => Ok(Self::CheckoutPage),
+            "model" => Ok(Self::Model),
+            other => Err(format!(
+                "Invalid --done-when '{}': expected flights-results, checkout-page, or model",
+                other
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FlightsResults => "flights-results",
+            Self::CheckoutPage => "checkout-page",
+            Self::Model => "model",
+        }
+    }
+
+    pub fn noul_instructions(&self) -> Option<&'static str> {
+        match self {
+            Self::FlightsResults => Some(RESULTS_QUESTION_INSTRUCTIONS),
+            Self::CheckoutPage => Some(CHECKOUT_QUESTION_INSTRUCTIONS),
+            Self::Model => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetSpec {
@@ -67,6 +115,14 @@ impl Preset {
             Self::Flights => flights_preset_targets(),
             Self::Events => events_preset_targets(),
             Self::Generic => generic_preset_targets(),
+        }
+    }
+
+    pub fn default_done_condition(&self) -> DoneCondition {
+        match self {
+            Self::Flights => DoneCondition::FlightsResults,
+            Self::Events => DoneCondition::CheckoutPage,
+            Self::Generic => DoneCondition::Model,
         }
     }
 }
@@ -386,6 +442,7 @@ pub struct VisionDecider<B: DecisionBackend> {
     backend: B,
     model: String,
     targets: Vec<TargetSpec>,
+    done_condition: DoneCondition,
     pub type_values: BTreeMap<String, String>,
     requests_sent: AtomicUsize,
     images_sent: AtomicUsize,
@@ -397,10 +454,20 @@ impl<B: DecisionBackend> VisionDecider<B> {
             backend,
             model: DEFAULT_MODEL.to_string(),
             targets,
+            done_condition: DoneCondition::FlightsResults,
             type_values: BTreeMap::new(),
             requests_sent: AtomicUsize::new(0),
             images_sent: AtomicUsize::new(0),
         }
+    }
+
+    pub fn with_done_condition(mut self, done_condition: DoneCondition) -> Self {
+        self.done_condition = done_condition;
+        self
+    }
+
+    pub fn done_condition(&self) -> DoneCondition {
+        self.done_condition
     }
 
     pub fn with_type_values(mut self, type_values: BTreeMap<String, String>) -> Self {
@@ -531,12 +598,14 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 criteria: target_criteria,
             },
         );
-        questions.insert(
-            "results".to_string(),
-            Question::Noul {
-                instructions: RESULTS_QUESTION_INSTRUCTIONS.to_string(),
-            },
-        );
+        if let Some(instructions) = self.done_condition.noul_instructions() {
+            questions.insert(
+                "results".to_string(),
+                Question::Noul {
+                    instructions: instructions.to_string(),
+                },
+            );
+        }
 
         let req1 = Request {
             model: self.model.clone(),
