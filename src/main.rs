@@ -111,7 +111,7 @@ pub fn flights_preset_targets() -> Vec<TargetSpec> {
         ),
         TargetSpec::new(
             "one way option",
-            Some("'One way' item in that open dropdown".to_string()),
+            Some("The menu row with the text 'One way', second item in the small open list (Round trip, One way, Multi-city) just below the 'Round trip' button".to_string()),
         ),
         TargetSpec::new(
             "origin field",
