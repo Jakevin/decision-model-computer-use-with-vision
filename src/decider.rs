@@ -15,6 +15,8 @@ pub const CHECKOUT_QUESTION_INSTRUCTIONS: &str =
     "Does the image show a ticket checkout or ticket selection page with ticket prices visible?";
 pub const SENSITIVE_QUESTION_INSTRUCTIONS: &str =
     "Is the element at this target a sign-in, payment, place-order/purchase/pay button, or a personal-info input field (name, email, phone, card)?";
+pub const CLOSEISH_QUESTION_INSTRUCTIONS: &str =
+    "Is this button a Close, X, Reject, Decline or No-thanks control (not Accept, Subscribe or Sign up)?";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DoneCondition {
@@ -272,6 +274,8 @@ pub fn parse_targets_json(raw: &str) -> Result<Vec<TargetSpec>, String> {
 pub enum ActionKind {
     #[serde(rename = "click")]
     Click,
+    #[serde(rename = "dismiss popup")]
+    DismissPopup,
     #[serde(rename = "type")]
     Type,
     #[serde(rename = "press enter")]
@@ -288,6 +292,7 @@ impl ActionKind {
     pub fn from_choice(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
             "click" => Some(Self::Click),
+            "dismiss popup" | "dismiss_popup" => Some(Self::DismissPopup),
             "type" => Some(Self::Type),
             "press enter" | "press_enter" => Some(Self::PressEnter),
             "scroll" => Some(Self::Scroll),
@@ -300,6 +305,7 @@ impl ActionKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Click => "click",
+            Self::DismissPopup => "dismiss popup",
             Self::Type => "type",
             Self::PressEnter => "press enter",
             Self::Scroll => "scroll",
@@ -322,6 +328,7 @@ pub struct Decision {
     pub text_to_type: Option<String>,
     pub results_noul: f64,
     pub sensitive_noul: Option<f64>,
+    pub closeish_noul: Option<f64>,
 }
 
 #[derive(Debug, Error)]
@@ -445,6 +452,7 @@ pub struct VisionDecider<B: DecisionBackend> {
     backend: B,
     model: String,
     targets: Vec<TargetSpec>,
+    preset: Option<Preset>,
     done_condition: DoneCondition,
     pub type_values: BTreeMap<String, String>,
     requests_sent: AtomicUsize,
@@ -457,10 +465,28 @@ impl<B: DecisionBackend> VisionDecider<B> {
             backend,
             model: DEFAULT_MODEL.to_string(),
             targets,
+            preset: None,
             done_condition: DoneCondition::FlightsResults,
             type_values: BTreeMap::new(),
             requests_sent: AtomicUsize::new(0),
             images_sent: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn with_preset(mut self, preset: Preset) -> Self {
+        self.preset = Some(preset);
+        self
+    }
+
+    pub fn preset(&self) -> Option<Preset> {
+        self.preset
+    }
+
+    pub fn allow_dismiss_popup(&self) -> bool {
+        match self.preset {
+            Some(Preset::Events | Preset::Generic) => true,
+            Some(Preset::Flights) => false,
+            None => self.targets.iter().any(|t| t.label == "popup close"),
         }
     }
 
@@ -545,6 +571,12 @@ impl<B: DecisionBackend> VisionDecider<B> {
             "click".to_string(),
             Some("Click an interactive element on the page".to_string()),
         );
+        if self.allow_dismiss_popup() {
+            kind_criteria.insert(
+                "dismiss popup".to_string(),
+                Some("Close a cookie, newsletter or promo popup".to_string()),
+            );
+        }
         if active_fill_target.is_some() {
             kind_criteria.insert(
                 "type".to_string(),
@@ -642,6 +674,42 @@ impl<B: DecisionBackend> VisionDecider<B> {
         let action_kind = ActionKind::from_choice(&kind_choice)
             .ok_or_else(|| DeciderError::UnknownActionKind(kind_choice.clone()))?;
 
+        if action_kind == ActionKind::DismissPopup {
+            let tgt = "popup close".to_string();
+            let (mut bbox, mut box_conf, mut closeish_noul) =
+                self.ask_dismiss_popup_box(&state, img, &tgt)?;
+            let mut reasked = false;
+
+            if box_conf < LOW_CONFIDENCE_THRESHOLD {
+                let longer = self
+                    .find_target_description(&tgt)
+                    .map(|desc| format!("{} ({})", tgt, desc))
+                    .unwrap_or_else(|| format!("Locate the interactive element: {}", tgt));
+                let (bbox2, conf2, closeish2) =
+                    self.ask_dismiss_popup_box(&state, img, &longer)?;
+                bbox = bbox2;
+                box_conf = conf2;
+                closeish_noul = closeish2.or(closeish_noul);
+                reasked = true;
+            }
+
+            let pt = map_box_center_to_screen_pt(&bbox, img);
+            return Ok(Decision {
+                kind: ActionKind::DismissPopup,
+                kind_confidence: kind_conf,
+                target: Some(tgt),
+                click_point_screen_pt: Some(pt),
+                bbox: Some(bbox),
+                box_confidence: Some(box_conf),
+                confidence: box_conf,
+                reasked,
+                text_to_type: None,
+                results_noul,
+                sensitive_noul: None,
+                closeish_noul,
+            });
+        }
+
         if action_kind == ActionKind::Click {
             let tgt = target_choice
                 .clone()
@@ -659,6 +727,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                     text_to_type: None,
                     results_noul,
                     sensitive_noul: None,
+                    closeish_noul: None,
                 });
             }
 
@@ -691,6 +760,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 text_to_type: fill_text,
                 results_noul,
                 sensitive_noul,
+                closeish_noul: None,
             });
         }
 
@@ -718,6 +788,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
             text_to_type,
             results_noul,
             sensitive_noul: None,
+            closeish_noul: None,
         })
     }
 
@@ -754,6 +825,44 @@ impl<B: DecisionBackend> VisionDecider<B> {
         };
         match resp.answers.get("target_box") {
             Some(Answer::Box { bbox, confidence }) => Ok((*bbox, *confidence, sensitive_noul)),
+            Some(_) => Err(DeciderError::UnexpectedAnswerType("target_box".to_string())),
+            None => Err(DeciderError::MissingAnswer("target_box".to_string())),
+        }
+    }
+
+    fn ask_dismiss_popup_box(
+        &self,
+        state: &str,
+        img: &PreparedImage,
+        instructions: &str,
+    ) -> Result<(BoundingBox, f64, Option<f64>), DeciderError> {
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "target_box".to_string(),
+            Question::Box {
+                instructions: instructions.to_string(),
+            },
+        );
+        questions.insert(
+            "closeish".to_string(),
+            Question::Noul {
+                instructions: CLOSEISH_QUESTION_INSTRUCTIONS.to_string(),
+            },
+        );
+        let req = Request {
+            model: self.model.clone(),
+            state: state.to_string(),
+            images: vec![img.data_url.clone()],
+            questions,
+        };
+        let resp = self.ask_backend(&req)?;
+        let closeish_noul = match resp.answers.get("closeish") {
+            Some(Answer::Noul { noul }) => Some(*noul),
+            Some(_) => return Err(DeciderError::UnexpectedAnswerType("closeish".to_string())),
+            None => None,
+        };
+        match resp.answers.get("target_box") {
+            Some(Answer::Box { bbox, confidence }) => Ok((*bbox, *confidence, closeish_noul)),
             Some(_) => Err(DeciderError::UnexpectedAnswerType("target_box".to_string())),
             None => Err(DeciderError::MissingAnswer("target_box".to_string())),
         }

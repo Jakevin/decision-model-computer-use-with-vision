@@ -41,6 +41,10 @@ Options:
       --max-steps <MAX_STEPS>      Maximum number of steps before stopping [default: 30]
       --start-url <URL>            Activate Chrome and navigate active tab to this URL before step 0
       --start-url-preset <PRESET>  Best-effort start URL preset (e.g. one-way), mutually exclusive with --start-url
+      --allow-url-prefix <PREFIX>  Repeatable allowed URL prefix (https scheme, exact host or *.domain, path prefix)
+      --preset <PRESET>            Target preset: flights, events, or generic [default: flights]
+      --targets-file <PATH>        Path to a JSON file containing custom targets ([{"label":..,"description":..}])
+      --done-when <CONDITION>      Done condition: flights-results, checkout-page, or model (defaults from --preset)
       --fill <KEY=VALUE>           Repeatable target-to-text fill mapping (e.g. --fill "origin field=Osaka")
       --dry-run                    Perform capture and decision making without executing mouse/keyboard actions
       --json                       Print a single final JSON result object to stdout ({status, steps, reason, ...})
@@ -108,7 +112,9 @@ Detailed per-step logs are written to `./runs/<timestamp>/steps.jsonl` and the r
 
 - **Chrome-Window Crop Only**: If no `Google Chrome` window is found (`crop == None`) or the cropped area is `< 50x50` px, `decision-cu` stops immediately (`status: "blocked"`, exit code `4`) and sends **zero** bytes over the network.
 - **Tab & Address Strip Guard**: Any click with `y < window.y + 80.0` points is rejected (`ClickInTabStrip`) so the agent cannot switch tabs, edit the URL bar, or click window close/minimize buttons.
-- **Read-Only & No Sign-In / Purchase**: Targets matching forbidden words (`"sign in"`, `"signin"`, `"log in"`, `"login"`, `"password"`, `"book"`, `"purchase"`, `"pay"`, `"checkout"`, `"buy"`, `"credit card"`) are refused (`ForbiddenTarget`), and password/secret typing is blocked.
+- **URL Allowlist (`--allow-url-prefix`)**: Only `https://` URLs matching configured `--allow-url-prefix` entries (exact host or `*.domain` subdomain wildcard + path prefix) are permitted (`https://www.google.com/travel/flights` for `flights` preset, or derived from `--start-url`'s host when unspecified).
+- **Read-Only, Sensitive-Target Gate & Checkout-Once**: Targets matching forbidden words (`"sign in"`, `"signin"`, `"log in"`, `"login"`, `"password"`, `"book"`, `"purchase"`, `"pay"`, `"place order"`, `"buy"`, `"credit card"`) are refused (`ForbiddenTarget`); `--fill` is refused for personal-info labels (`name`, `email`, `phone`, `card`, `password`); every click `box` request also asks a `"sensitive"` `noul` question and blocks the click (`blocked_sensitive`, excluding the target for 3 steps) if `sensitive >= 0.5`; and `"checkout button"` is clicked at most once per run (`checkout_once`).
+- **Dismiss-Popup Gate**: In `events` and `generic` presets, action kind `"dismiss popup"` locates `"popup close"` and checks `noul` `"closeish"` (`"Is this button a Close, X, Reject, Decline or No-thanks control (not Accept, Subscribe or Sign up)?"`), clicking only when `closeish >= 0.6` and otherwise logging `dismiss_refused` and treating the step as `wait`.
 - **Modifier Hygiene**: `Shift`, `Control`, `Alt`, and `Meta` keys are explicitly released before and after every mouse or keyboard action.
 
 ## Privacy Note

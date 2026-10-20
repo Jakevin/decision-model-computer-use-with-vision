@@ -7,7 +7,7 @@ use decision_cu::capture::{CaptureError, Rect, Screen};
 use decision_cu::decider::{
     events_preset_targets, flights_preset_targets, generic_preset_targets, load_targets_file,
     map_box_center_to_screen_pt, ActionKind, DoneCondition, Preset, TargetSpec, VisionDecider,
-    CHECKOUT_QUESTION_INSTRUCTIONS, SENSITIVE_QUESTION_INSTRUCTIONS,
+    CHECKOUT_QUESTION_INSTRUCTIONS, CLOSEISH_QUESTION_INSTRUCTIONS, SENSITIVE_QUESTION_INSTRUCTIONS,
 };
 use decision_cu::input::{Input, InputError, KeyCode};
 use decision_cu::logging::{redact, RunLogger};
@@ -1485,4 +1485,122 @@ fn checkout_button_allowed_at_most_once_per_run() {
     let log_str = std::fs::read_to_string(&steps_path).unwrap();
     assert!(log_str.contains("\"checkout_once\""));
     let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+fn make_box_response_with_closeish(
+    top: f64,
+    left: f64,
+    bottom: f64,
+    right: f64,
+    confidence: f64,
+    closeish_noul: f64,
+) -> Response {
+    let mut resp = make_box_response(top, left, bottom, right, confidence);
+    resp.answers.insert(
+        "closeish".to_string(),
+        Answer::Noul {
+            noul: closeish_noul,
+        },
+    );
+    resp
+}
+
+#[test]
+fn dismiss_popup_refused_when_closeish_low_and_clicked_when_high() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img: img.clone(),
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    // Flights preset must NOT include "dismiss popup" in kind criteria
+    let flights_decider = VisionDecider::new(
+        MockBackend::new(vec![make_choice_response_with_results(
+            "done",
+            "nothing to click",
+            0.7,
+        )]),
+        Preset::Flights.default_targets(),
+    )
+    .with_preset(Preset::Flights);
+    let prepared = prepare_image(&img, Some(window), 2.0).unwrap();
+    let _ = flights_decider
+        .decide("Search flights", &[], &prepared)
+        .unwrap();
+    let flights_reqs = flights_decider.backend().requests.borrow();
+    match flights_reqs[0].questions.get("kind").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("dismiss popup"));
+        }
+        _ => panic!("Expected kind choice question"),
+    }
+
+    // Events preset:
+    // Step 0: chooses "dismiss popup" -> box for "popup close" + closeish = 0.3 (< 0.6) -> refused, logs 'dismiss_refused', treated as wait
+    // Step 1: chooses "dismiss popup" -> box for "popup close" + closeish = 0.9 (>= 0.6) -> clicked!
+    // Step 2: done
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results("dismiss popup", "nothing to click", 0.2),
+        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.95, 0.3),
+        make_choice_response_with_results("dismiss popup", "nothing to click", 0.2),
+        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.95, 0.9),
+        make_choice_response_with_results("done", "nothing to click", 0.7),
+    ]);
+
+    let decider = VisionDecider::new(backend, Preset::Events.default_targets())
+        .with_preset(Preset::Events)
+        .with_done_condition(DoneCondition::CheckoutPage);
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_dismiss_popup");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_logger(logger);
+    let summary = agent.run("Dismiss popup and proceed").unwrap();
+
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.steps_taken, 3);
+    // Refused at step 0 (closeish 0.3), clicked at step 1 (closeish 0.9) -> 1 click total
+    assert_eq!(summary.clicks, 1);
+    assert_eq!(agent.input().clicks.len(), 1);
+    assert_eq!(summary.history[0], "wait");
+    assert!(summary.history[1].starts_with("click 'popup close'"));
+
+    let log_str = std::fs::read_to_string(&steps_path).unwrap();
+    assert!(log_str.contains("\"dismiss_refused\""));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    let reqs = agent.decider().backend().requests.borrow();
+    // Verify "dismiss popup" is in kind criteria with exact description
+    match reqs[0].questions.get("kind").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert_eq!(
+                criteria.get("dismiss popup").unwrap().as_deref(),
+                Some("Close a cookie, newsletter or promo popup")
+            );
+        }
+        _ => panic!("Expected kind choice question"),
+    }
+    // Verify box request asks for "popup close" and "closeish" noul in the same request
+    match reqs[1].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => {
+            assert_eq!(instructions, "popup close");
+        }
+        _ => panic!("Expected target_box question"),
+    }
+    match reqs[1].questions.get("closeish").unwrap() {
+        Question::Noul { instructions } => {
+            assert_eq!(instructions, CLOSEISH_QUESTION_INSTRUCTIONS);
+        }
+        _ => panic!("Expected closeish noul question"),
+    }
 }

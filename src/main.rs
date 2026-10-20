@@ -3,7 +3,7 @@ use decision_cu::agent::{Agent, AgentError, Timing, FLIGHTS_DEFAULT_URL_PREFIX};
 use decision_cu::api::{ApiKey, DecisionClient};
 use decision_cu::decider::{load_targets_file, DoneCondition, Preset, VisionDecider};
 use decision_cu::logging::{redact, RunLogger};
-use decision_cu::safety::{resolve_allowed_url_prefixes, SafetyPolicy};
+use decision_cu::safety::{is_sensitive_fill_label, resolve_allowed_url_prefixes, SafetyPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -129,6 +129,12 @@ pub fn parse_fills(fills: &[String]) -> Result<BTreeMap<String, String>, String>
         if key.is_empty() {
             return Err(format!("Invalid --fill '{}': key cannot be empty", entry));
         }
+        if is_sensitive_fill_label(key) {
+            return Err(format!(
+                "Refusing --fill for sensitive label '{}'",
+                key
+            ));
+        }
         map.insert(key.to_string(), v.to_string());
     }
     Ok(map)
@@ -218,6 +224,7 @@ fn execute_run(
     };
 
     let decider = VisionDecider::new(client, targets)
+        .with_preset(preset)
         .with_done_condition(done_condition)
         .with_type_values(type_values);
 

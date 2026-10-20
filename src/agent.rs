@@ -7,7 +7,9 @@ use crate::decider::{
 use crate::input::{Input, InputError, KeyCode};
 use crate::logging::RunLogger;
 use crate::privacy::{prepare_image, AuditLog, PreparedImage, PrivacyError};
-use crate::safety::{resolve_allowed_url_prefixes, SafetyError, SafetyPolicy};
+use crate::safety::{
+    is_sensitive_fill_label, resolve_allowed_url_prefixes, SafetyError, SafetyPolicy,
+};
 use serde::{Deserialize, Serialize};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,6 +21,7 @@ pub const RESULTS_DONE_CONSECUTIVE_COUNT: usize = 2;
 pub const RESULTS_MODEL_DONE_THRESHOLD: f64 = 0.5;
 pub const SENSITIVE_BLOCK_THRESHOLD: f64 = 0.5;
 pub const SENSITIVE_EXCLUDE_STEPS: usize = 3;
+pub const DISMISS_CLOSEISH_THRESHOLD: f64 = 0.6;
 pub const MAX_TAB_EVENTS: usize = 2;
 pub const MAX_FRONTMOST_FAILURES: usize = 2;
 pub const ACTIVATE_CHROME_SLEEP_MS: u64 = 300;
@@ -157,6 +160,15 @@ pub struct CheckoutOnceEventRecord {
     pub step: usize,
     pub target: String,
     pub point: (f64, f64),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DismissRefusedEventRecord {
+    pub event: String,
+    pub step: usize,
+    pub target: String,
+    pub point: Option<(f64, f64)>,
+    pub closeish_noul: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -615,6 +627,76 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         break;
                     }
                 }
+                ActionKind::DismissPopup => {
+                    let closeish = decision.closeish_noul.unwrap_or(0.0);
+                    let tgt = decision.target.as_deref().unwrap_or("popup close");
+                    if closeish < DISMISS_CLOSEISH_THRESHOLD {
+                        if let Some(ref mut logger) = self.logger {
+                            let evt = DismissRefusedEventRecord {
+                                event: "dismiss_refused".to_string(),
+                                step,
+                                target: tgt.to_string(),
+                                point: decision.click_point_screen_pt,
+                                closeish_noul: closeish,
+                            };
+                            let _ = logger.log_entry(&evt);
+                        }
+                        history.push("wait".to_string());
+                        let elapsed = step_start.elapsed().as_secs_f64();
+                        total_step_secs += elapsed;
+                        steps_completed += 1;
+                        self.log_step(
+                            step,
+                            current_url,
+                            &decision,
+                            false,
+                            elapsed,
+                            win_rect,
+                            &prepared,
+                            full_screen_size,
+                        );
+                        if self.policy.on_wait().is_err() {
+                            stop_reason = StopReason::MaxWaitsExceeded;
+                            break;
+                        }
+                    } else {
+                        self.policy.reset_wait();
+                        if let Some(pt) = decision.click_point_screen_pt {
+                            self.policy.check_click(pt, win_rect)?;
+                            if let Err(reason) = self.check_unoccluded_at(step, pt) {
+                                stop_reason = StopReason::SafetyBlocked(reason);
+                                break;
+                            }
+                            if !self.dry_run {
+                                self.input.click(pt.0, pt.1)?;
+                                executed = true;
+                            }
+                            clicks += 1;
+                            clicked_this_step = Some(tgt.to_string());
+                            last_click_point = Some(pt);
+                            if executed && !self.timing.post_action_wait.is_zero() {
+                                thread::sleep(self.timing.post_action_wait);
+                            }
+                            history.push(format!("click '{}' at ({:.1}, {:.1})", tgt, pt.0, pt.1));
+                        }
+                        if executed && !self.timing.post_action_wait.is_zero() {
+                            thread::sleep(self.timing.post_action_wait);
+                        }
+                        let elapsed = step_start.elapsed().as_secs_f64();
+                        total_step_secs += elapsed;
+                        steps_completed += 1;
+                        self.log_step(
+                            step,
+                            current_url,
+                            &decision,
+                            executed,
+                            elapsed,
+                            win_rect,
+                            &prepared,
+                            full_screen_size,
+                        );
+                    }
+                }
                 ActionKind::Click => {
                     self.policy.reset_wait();
                     if let Some(pt) = decision.click_point_screen_pt {
@@ -704,7 +786,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         let fill_val = self.decider.fill_for(tgt).map(|s| s.to_string());
 
                         if let Some(ref val) = fill_val {
-                            if is_sensitive_text(val) {
+                            if is_sensitive_fill_label(tgt) || is_sensitive_text(val) {
                                 return Err(AgentError::Safety(SafetyError::SensitiveTextBlocked));
                             }
                         }

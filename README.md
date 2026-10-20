@@ -81,6 +81,10 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 - `--max-steps <MAX_STEPS>`: Maximum number of steps before stopping (default `30`).
 - `--start-url <URL>`: Activate Chrome and navigate active tab to this URL before step 0.
 - `--start-url-preset <PRESET>`: Best-effort start URL preset (e.g. `one-way`, mapping to `https://www.google.com/travel/flights?hl=en&q=one%20way%20flights`), mutually exclusive with `--start-url`.
+- `--allow-url-prefix <PREFIX>`: Repeatable allowed URL prefix (https scheme, exact host or `*.domain`, path prefix).
+- `--preset <PRESET>`: Target preset: `flights`, `events`, or `generic` (default `flights`).
+- `--targets-file <PATH>`: Path to a JSON file containing custom targets (`[{"label":..,"description":..}]`).
+- `--done-when <CONDITION>`: Done condition: `flights-results`, `checkout-page`, or `model` (defaults from `--preset`).
 - `--fill <KEY=VALUE>`: Repeatable target-to-text fill mapping (e.g. `--fill "origin field=Osaka"`).
 - `--dry-run`: Perform capture and decision making without executing mouse/keyboard actions.
 - `--json`: Print a single final JSON result object to stdout (`{status, steps, reason, ...}`).
@@ -119,12 +123,13 @@ See [`skills/decision-computer-use/SKILL.md`](skills/decision-computer-use/SKILL
 
 ### Safety Rules
 
-Enforced by `SafetyPolicy` (`src/safety.rs`) and `Agent` (`src/agent.rs`):
+Enforced by `SafetyPolicy` (`src/safety.rs`), `VisionDecider` (`src/decider.rs`), and `Agent` (`src/agent.rs`):
 - **Protected Tab & Address Bar Strip**: Any click with `y < window.y + 80.0` points is blocked with `SafetyError::ClickInTabStrip`, preventing the agent from switching tabs, typing arbitrary URLs in the address bar, or closing the browser window.
-- **Window Bounds Check**: Clicks outside the Chrome window rectangle are rejected.
-- **Allowed Hosts Prefix Check**: URL verification restricts navigation to allowed host prefixes (`www.google.com/travel/flights` by default).
-- **Read-Only & Forbidden Target Filter**: Refuses to interact with targets containing sensitive or transactional words (`"sign in"`, `"login"`, `"password"`, `"book"`, `"purchase"`, `"pay"`, `"checkout"`, `"buy"`, `"credit card"`), and never types passwords or secrets.
-- **Loop Termination Limits**: Automatically halts when `"done"` is returned, when `max_steps` (default `30`) is reached, or after `> 2` consecutive `"wait"` actions.
+- **Window Bounds & Unoccluded Frontmost Checks**: Clicks outside the Chrome window rectangle are rejected, and before every click/type/key action `Google Chrome` must be both the frontmost app and the topmost window at the target screen point.
+- **Allowed URL Prefix Check (`--allow-url-prefix`)**: URL verification parses `https://` URLs and matches against repeatable `--allow-url-prefix` entries (exact host or `*.domain` subdomain wildcard, plus path prefix). The `flights` preset defaults to `https://www.google.com/travel/flights`; if neither `--allow-url-prefix` nor a preset provides an allowlist, it is derived from `--start-url`'s host.
+- **Read-Only, Sensitive-Target Gate & Forbidden Target Filter**: Refuses targets containing forbidden words (`"sign in"`, `"login"`, `"password"`, `"book"`, `"purchase"`, `"pay"`, `"place order"`, `"buy"`, `"credit card"`), refuses `--fill` for personal-info labels (`name`, `email`, `phone`, `card`, `password`), and asks a `"sensitive"` `noul` question alongside every click `box` query—blocking the click (`blocked_sensitive`) and excluding that target for the next 3 steps whenever `sensitive >= 0.5`.
+- **Checkout-Once & Dismiss-Popup Gates**: Target `"checkout button"` may be clicked at most once per run (subsequent attempts log `checkout_once` and do not click). Action kind `"dismiss popup"` (available in `events` and `generic` presets) queries `"popup close"` together with a `"closeish"` `noul` check and clicks only if `closeish >= 0.6` (otherwise logging `dismiss_refused` and treating the step as `wait`).
+- **Loop Termination Limits**: Automatically halts when the configured `--done-when` condition (`flights-results`, `checkout-page`, or `model`) is satisfied, when `max_steps` (default `30`) is reached, or after `> 2` consecutive `"wait"` actions.
 
 ### Privacy Note
 
@@ -223,6 +228,10 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 - `--max-steps <MAX_STEPS>`：最大步數上限（預設 `30`）。
 - `--start-url <URL>`：於第 0 步前喚醒 Chrome 並將前景視窗使用中分頁導向此網址。
 - `--start-url-preset <PRESET>`：盡力而為（best-effort）的起始網址預設集（例如 `one-way` 對應 `https://www.google.com/travel/flights?hl=en&q=one%20way%20flights`），與 `--start-url` 互斥。
+- `--allow-url-prefix <PREFIX>`：可重複指定的允許網址前綴（僅限 `https`、精確網域或 `*.domain` 子網域萬用字元、以及路徑前綴）。
+- `--preset <PRESET>`：目標預設集：`flights`、`events` 或 `generic`（預設為 `flights`）。
+- `--targets-file <PATH>`：自訂目標 JSON 檔案路徑（格式為 `[{"label":..,"description":..}]`）。
+- `--done-when <CONDITION>`：完成條件：`flights-results`、`checkout-page` 或 `model`（預設依 `--preset` 自動決定）。
 - `--fill <KEY=VALUE>`：可重複指定的目標欄位填入文字對應（例如 `--fill "origin field=Osaka"`）。
 - `--dry-run`：乾跑模式，不執行實際滑鼠或鍵盤動作。
 - `--json`：於標準輸出印出單一 JSON 結果物件（`{status, steps, reason, ...}`）。
@@ -254,9 +263,11 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 ### 安全規則 (Safety Rules)
 
 - **分頁列與網址列保護（Tab Strip Protection）**：任何位於 `y < window.y + 80.0` 點座標的點擊都會被 `ClickInTabStrip` 攔截，防止代理程式切換分頁、修改網址列或關閉視窗。
-- **允許網域前綴檢查**：預設僅允許 `www.google.com/travel/flights`。
-- **唯讀與敏感目標攔截**：禁止點擊包含 `"sign in"`、`"book"`、`"purchase"`、`"pay"`、`"checkout"` 等字詞的目標，且絕不輸入密碼或金鑰。
-- **自動停止條件**：當回傳 `"done"`、達到步數上限（預設 30 步）或連續等待（`wait`）超過 2 次時自動停止。
+- **視窗範圍與遮擋檢查（Frontmost & Unoccluded Checks）**：拒絕視窗範圍外的點擊，且每次點擊或輸入前皆確認 `Google Chrome` 為前景應用且目標座標未被其他視窗遮擋。
+- **允許網址前綴檢查（`--allow-url-prefix`）**：僅允許 `https://` 網址並比對網域（支援精確網域或 `*.domain` 子網域）與路徑前綴；`flights` 預設為 `https://www.google.com/travel/flights`，若未指定則由 `--start-url` 的網域自動推導。
+- **唯讀與敏感目標雙重攔截**：禁止點擊包含 `"sign in"`、`"book"`、`"purchase"`、`"pay"`、`"place order"`、`"buy"`、`"credit card"` 等字詞的目標，拒絕為 `name`/`email`/`phone`/`card`/`password` 欄位設定 `--fill`，並在每次 `box` 定位查詢時同步詢問 `"sensitive"` `noul`（若 `>= 0.5` 則記錄 `blocked_sensitive`、不執行點擊，並在接下來 3 步排除該目標）。
+- **結帳按鈕單次限制與彈窗關閉守門（Checkout-Once & Dismiss-Popup Gate）**：`"checkout button"` 每次執行最多僅允許點擊一次（第二次記錄 `checkout_once` 並略過）；`"dismiss popup"` 動作（僅於 `events` 與 `generic` 預設集提供）會同步詢問 `"closeish"` `noul`，僅在 `closeish >= 0.6` 時點擊 `"popup close"`（否則記錄 `dismiss_refused` 並視為 `wait`）。
+- **自動停止條件**：當達成 `--done-when` 完成條件（`flights-results`、`checkout-page` 或 `model`）、達到步數上限（預設 30 步）或連續等待（`wait`）超過 2 次時自動停止。
 
 ### 隱私聲明 (Privacy Note)
 
