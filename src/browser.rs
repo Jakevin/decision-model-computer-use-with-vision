@@ -12,6 +12,12 @@ pub enum BrowserError {
 pub trait Browser {
     fn active_tab_url(&self) -> Option<String>;
     fn set_active_tab_url(&mut self, url: &str) -> Result<(), BrowserError>;
+    fn tab_count(&self) -> Option<usize> {
+        Some(1)
+    }
+    fn front_window_id(&self) -> Option<String> {
+        Some("1".to_string())
+    }
     fn activate_chrome(&mut self) -> bool {
         self.is_chrome_frontmost()
     }
@@ -38,6 +44,14 @@ impl<T: Browser + ?Sized> Browser for Box<T> {
         (**self).set_active_tab_url(url)
     }
 
+    fn tab_count(&self) -> Option<usize> {
+        (**self).tab_count()
+    }
+
+    fn front_window_id(&self) -> Option<String> {
+        (**self).front_window_id()
+    }
+
     fn activate_chrome(&mut self) -> bool {
         (**self).activate_chrome()
     }
@@ -62,6 +76,14 @@ impl<T: Browser + ?Sized> Browser for &mut T {
 
     fn set_active_tab_url(&mut self, url: &str) -> Result<(), BrowserError> {
         (**self).set_active_tab_url(url)
+    }
+
+    fn tab_count(&self) -> Option<usize> {
+        (**self).tab_count()
+    }
+
+    fn front_window_id(&self) -> Option<String> {
+        (**self).front_window_id()
     }
 
     fn activate_chrome(&mut self) -> bool {
@@ -166,6 +188,35 @@ pub fn is_chrome_frontmost() -> bool {
         .unwrap_or(false)
 }
 
+pub fn tab_count() -> Option<usize> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"Google Chrome\" to count tabs of front window")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+pub fn front_window_id() -> Option<String> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"Google Chrome\" to get id of front window")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
 pub fn go_back() -> Result<(), BrowserError> {
     let output = Command::new("osascript")
         .arg("-e")
@@ -197,6 +248,14 @@ impl Browser for MacBrowser {
 
     fn set_active_tab_url(&mut self, url: &str) -> Result<(), BrowserError> {
         set_active_tab_url(url)
+    }
+
+    fn tab_count(&self) -> Option<usize> {
+        tab_count()
+    }
+
+    fn front_window_id(&self) -> Option<String> {
+        front_window_id()
     }
 
     fn activate_chrome(&mut self) -> bool {

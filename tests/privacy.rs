@@ -7,7 +7,8 @@ use decision_cu::capture::{CaptureError, Rect, Screen};
 use decision_cu::decider::{
     events_preset_targets, flights_preset_targets, generic_preset_targets, load_targets_file,
     map_box_center_to_screen_pt, ActionKind, DoneCondition, Preset, TargetSpec, VisionDecider,
-    CHECKOUT_QUESTION_INSTRUCTIONS, CLOSEISH_QUESTION_INSTRUCTIONS, SENSITIVE_QUESTION_INSTRUCTIONS,
+    CHECKOUT_QUESTION_INSTRUCTIONS, CLOSEISH_QUESTION_INSTRUCTIONS,
+    POPUP_PRESENT_QUESTION_INSTRUCTIONS, SENSITIVE_QUESTION_INSTRUCTIONS,
 };
 use decision_cu::input::{Input, InputError, KeyCode};
 use decision_cu::logging::{redact, RunLogger};
@@ -1516,6 +1517,22 @@ fn make_box_response_with_closeish(
     resp
 }
 
+fn make_choice_response_with_results_and_popup(
+    kind: &str,
+    target: &str,
+    results_noul: f64,
+    popup_present_noul: f64,
+) -> Response {
+    let mut resp = make_choice_response_with_results(kind, target, results_noul);
+    resp.answers.insert(
+        "popup_present".to_string(),
+        Answer::Noul {
+            noul: popup_present_noul,
+        },
+    );
+    resp
+}
+
 #[test]
 fn dismiss_popup_refused_when_closeish_low_and_clicked_when_high() {
     let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
@@ -1531,7 +1548,7 @@ fn dismiss_popup_refused_when_closeish_low_and_clicked_when_high() {
         scale: 2.0,
     };
 
-    // Flights preset must NOT include "dismiss popup" in kind criteria
+    // Flights preset must NOT include "dismiss popup" in kind criteria and must NOT include "popup_present"
     let flights_decider = VisionDecider::new(
         MockBackend::new(vec![make_choice_response_with_results(
             "done",
@@ -1552,17 +1569,37 @@ fn dismiss_popup_refused_when_closeish_low_and_clicked_when_high() {
         }
         _ => panic!("Expected kind choice question"),
     }
+    assert!(!flights_reqs[0].questions.contains_key("popup_present"));
 
     // Events preset:
-    // Step 0: chooses "dismiss popup" -> box for "popup close" + closeish = 0.3 (< 0.6) -> refused, logs 'dismiss_refused', treated as wait
-    // Step 1: chooses "dismiss popup" -> box for "popup close" + closeish = 0.9 (>= 0.6) -> clicked!
-    // Step 2: done
+    // Step 0: 1st request has "popup_present" noul, "dismiss popup" is NOT in kind criteria yet (no prev step);
+    //         returns scroll + popup_present = 0.85 (>= 0.6)
+    // Step 1: prev popup_present = 0.85 >= 0.6 -> "dismiss popup" IS in kind criteria;
+    //         chooses "dismiss popup" (popup_present = 0.80 >= 0.6) -> box for "popup close" + closeish = 0.3 (< 0.6) -> refused, logs 'dismiss_refused'
+    // Step 2: prev popup_present = 0.80 >= 0.6 -> "dismiss popup" IS in kind criteria;
+    //         chooses "dismiss popup" (popup_present = 0.40 < 0.6) -> box for "popup close" + closeish = 0.9 (>= 0.6) -> refused because this step's popup_present < 0.6!
+    // Step 3: prev popup_present = 0.40 < 0.6 -> "dismiss popup" is NOT in kind criteria;
+    //         clicks "events menu" (popup_present = 0.90 >= 0.6) -> resets wait counter
+    // Step 4: prev popup_present = 0.90 >= 0.6 -> "dismiss popup" IS in kind criteria;
+    //         chooses "dismiss popup" (popup_present = 0.92 >= 0.6) -> box for "popup close" + closeish = 0.9 (>= 0.6) -> clicked!
+    // Step 5: done
     let backend = MockBackend::new(vec![
-        make_choice_response_with_results("dismiss popup", "nothing to click", 0.2),
+        // Step 0 (1 req)
+        make_choice_response_with_results_and_popup("scroll", "nothing to click", 0.1, 0.85),
+        // Step 1 (2 reqs): closeish = 0.3 < 0.6 -> refused
+        make_choice_response_with_results_and_popup("dismiss popup", "nothing to click", 0.2, 0.80),
         make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.95, 0.3),
-        make_choice_response_with_results("dismiss popup", "nothing to click", 0.2),
+        // Step 2 (2 reqs): popup_present = 0.40 < 0.6 (even though closeish = 0.9) -> refused
+        make_choice_response_with_results_and_popup("dismiss popup", "nothing to click", 0.2, 0.40),
         make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.95, 0.9),
-        make_choice_response_with_results("done", "nothing to click", 0.7),
+        // Step 3 (2 reqs): prev popup_present = 0.40 < 0.6, so click "events menu", popup_present = 0.90
+        make_choice_response_with_results_and_popup("click", "events menu", 0.2, 0.90),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.05),
+        // Step 4 (2 reqs): prev popup_present = 0.90 >= 0.6, this step popup_present = 0.92 >= 0.6, closeish = 0.9 >= 0.6 -> executed!
+        make_choice_response_with_results_and_popup("dismiss popup", "nothing to click", 0.2, 0.92),
+        make_box_response_with_closeish(0.4, 0.4, 0.6, 0.6, 0.95, 0.9),
+        // Step 5 (1 req)
+        make_choice_response_with_results_and_popup("done", "nothing to click", 0.7, 0.1),
     ]);
 
     let decider = VisionDecider::new(backend, Preset::Events.default_targets())
@@ -1579,20 +1616,40 @@ fn dismiss_popup_refused_when_closeish_low_and_clicked_when_high() {
     let summary = agent.run("Dismiss popup and proceed").unwrap();
 
     assert_eq!(summary.stop_reason, StopReason::Done);
-    assert_eq!(summary.steps_taken, 3);
-    // Refused at step 0 (closeish 0.3), clicked at step 1 (closeish 0.9) -> 1 click total
-    assert_eq!(summary.clicks, 1);
-    assert_eq!(agent.input().clicks.len(), 1);
-    assert_eq!(summary.history[0], "wait");
-    assert!(summary.history[1].starts_with("click 'popup close'"));
+    assert_eq!(summary.steps_taken, 6);
+    // Clicked at step 3 ("events menu") and step 4 ("popup close") -> 2 clicks total
+    assert_eq!(summary.clicks, 2);
+    assert_eq!(agent.input().clicks.len(), 2);
+    assert_eq!(summary.history[0], "scroll down");
+    assert_eq!(summary.history[1], "wait");
+    assert_eq!(summary.history[2], "wait");
+    assert!(summary.history[3].starts_with("click 'events menu'"));
+    assert!(summary.history[4].starts_with("click 'popup close'"));
 
     let log_str = std::fs::read_to_string(&steps_path).unwrap();
-    assert!(log_str.contains("\"dismiss_refused\""));
+    let refused_count = log_str
+        .lines()
+        .filter(|l| l.contains("\"dismiss_refused\""))
+        .count();
+    assert_eq!(refused_count, 2);
     let _ = std::fs::remove_dir_all(&temp_dir);
 
     let reqs = agent.decider().backend().requests.borrow();
-    // Verify "dismiss popup" is in kind criteria with exact description
+    // Step 0 first request (reqs[0]): has "popup_present" noul, does NOT have "dismiss popup" in kind criteria
+    match reqs[0].questions.get("popup_present").unwrap() {
+        Question::Noul { instructions } => {
+            assert_eq!(instructions, POPUP_PRESENT_QUESTION_INSTRUCTIONS);
+        }
+        _ => panic!("Expected popup_present noul question"),
+    }
     match reqs[0].questions.get("kind").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("dismiss popup"));
+        }
+        _ => panic!("Expected kind choice question"),
+    }
+    // Step 1 first request (reqs[1]): prev popup_present was 0.85 >= 0.6 -> "dismiss popup" IS in kind criteria
+    match reqs[1].questions.get("kind").unwrap() {
         Question::Choice { criteria, .. } => {
             assert_eq!(
                 criteria.get("dismiss popup").unwrap().as_deref(),
@@ -1601,18 +1658,32 @@ fn dismiss_popup_refused_when_closeish_low_and_clicked_when_high() {
         }
         _ => panic!("Expected kind choice question"),
     }
-    // Verify box request asks for "popup close" and "closeish" noul in the same request
-    match reqs[1].questions.get("target_box").unwrap() {
+    // Verify box request (reqs[2]) asks for "popup close" and "closeish" noul in the same request
+    match reqs[2].questions.get("target_box").unwrap() {
         Question::Box { instructions } => {
             assert_eq!(instructions, "popup close");
         }
         _ => panic!("Expected target_box question"),
     }
-    match reqs[1].questions.get("closeish").unwrap() {
+    match reqs[2].questions.get("closeish").unwrap() {
         Question::Noul { instructions } => {
             assert_eq!(instructions, CLOSEISH_QUESTION_INSTRUCTIONS);
         }
         _ => panic!("Expected closeish noul question"),
+    }
+    // Step 3 first request (reqs[5]): prev popup_present was 0.40 < 0.6 -> "dismiss popup" is NOT in kind criteria
+    match reqs[5].questions.get("kind").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("dismiss popup"));
+        }
+        _ => panic!("Expected kind choice question"),
+    }
+    // Step 4 first request (reqs[7]): prev popup_present was 0.90 >= 0.6 -> "dismiss popup" IS in kind criteria
+    match reqs[7].questions.get("kind").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(criteria.contains_key("dismiss popup"));
+        }
+        _ => panic!("Expected kind choice question"),
     }
 }
 
@@ -1808,4 +1879,168 @@ fn summary_on_error_reports_done_condition_and_requests_sent_and_blocked_steps_h
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+struct TabTrackingBrowser {
+    urls: RefCell<VecDeque<Option<String>>>,
+    tab_counts: RefCell<VecDeque<Option<usize>>>,
+    window_ids: RefCell<VecDeque<Option<String>>>,
+    set_urls: Vec<String>,
+    back_calls: usize,
+}
+
+impl TabTrackingBrowser {
+    fn new(
+        urls: Vec<Option<String>>,
+        tab_counts: Vec<Option<usize>>,
+        window_ids: Vec<Option<String>>,
+    ) -> Self {
+        Self {
+            urls: RefCell::new(VecDeque::from(urls)),
+            tab_counts: RefCell::new(VecDeque::from(tab_counts)),
+            window_ids: RefCell::new(VecDeque::from(window_ids)),
+            set_urls: Vec::new(),
+            back_calls: 0,
+        }
+    }
+}
+
+impl decision_cu::browser::Browser for TabTrackingBrowser {
+    fn active_tab_url(&self) -> Option<String> {
+        self.urls.borrow_mut().pop_front().flatten()
+    }
+
+    fn set_active_tab_url(&mut self, url: &str) -> Result<(), decision_cu::browser::BrowserError> {
+        self.set_urls.push(url.to_string());
+        Ok(())
+    }
+
+    fn tab_count(&self) -> Option<usize> {
+        let mut q = self.tab_counts.borrow_mut();
+        if q.len() > 1 {
+            q.pop_front().flatten()
+        } else {
+            q.front().cloned().flatten()
+        }
+    }
+
+    fn front_window_id(&self) -> Option<String> {
+        let mut q = self.window_ids.borrow_mut();
+        if q.len() > 1 {
+            q.pop_front().flatten()
+        } else {
+            q.front().cloned().flatten()
+        }
+    }
+
+    fn go_back(&mut self) -> Result<(), decision_cu::browser::BrowserError> {
+        self.back_calls += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn stops_on_new_tab_when_tab_count_increases_or_window_changes() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img: img.clone(),
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    // Case 1: tab_count increases from 2 at start -> 2 at step 0 -> 3 before step 1 capture
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results_and_popup("click", "events menu", 0.1, 0.1),
+        make_box_response_with_sensitive(0.4, 0.4, 0.6, 0.6, 0.95, 0.05),
+    ]);
+    let decider = VisionDecider::new(backend, Preset::Events.default_targets())
+        .with_preset(Preset::Events)
+        .with_done_condition(DoneCondition::CheckoutPage);
+
+    let browser = TabTrackingBrowser::new(
+        vec![
+            Some("https://example.com/events".to_string()),
+            Some("https://tickets.partner.example/event-123".to_string()),
+        ],
+        vec![Some(2), Some(2), Some(3)],
+        vec![Some("win-100".to_string())],
+    );
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_new_tab_count");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+    let summary_path = logger.summary_path().to_path_buf();
+
+    let policy = SafetyPolicy::default()
+        .with_allowed_prefixes(vec!["https://example.com".to_string()]);
+    let mut agent = Agent::new(screen, decider, MockInput::default(), policy)
+        .with_browser(browser)
+        .with_flights_preset(false)
+        .with_logger(logger);
+
+    let summary = agent.run("Open event").unwrap();
+    assert_eq!(
+        summary.stop_reason,
+        StopReason::SafetyBlocked("new tab opened".to_string())
+    );
+    assert_eq!(summary.steps_taken, 1);
+    assert_eq!(summary.clicks, 1);
+    // Must NOT navigate away or close anything
+    assert!(agent.browser().set_urls.is_empty());
+    assert_eq!(agent.browser().back_calls, 0);
+
+    let summary_str = std::fs::read_to_string(&summary_path).unwrap();
+    let summary_json: serde_json::Value = serde_json::from_str(&summary_str).unwrap();
+    assert_eq!(summary_json["status"], "blocked");
+    assert_eq!(summary_json["reason"], "new tab opened");
+
+    let steps_str = std::fs::read_to_string(&steps_path).unwrap();
+    let new_tab_events: Vec<serde_json::Value> = steps_str
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("new_tab"))
+        .collect();
+    assert_eq!(new_tab_events.len(), 1);
+    assert_eq!(new_tab_events[0]["step"], 1);
+    assert_eq!(
+        new_tab_events[0]["url"],
+        "https://tickets.partner.example/event-123"
+    );
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    // Case 2: front_window_id changes at step 0 before capture -> nothing sent, stops blocked
+    let screen2 = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+    let decider2 = VisionDecider::new(MockBackend::new(vec![]), Preset::Generic.default_targets())
+        .with_preset(Preset::Generic)
+        .with_done_condition(DoneCondition::Model);
+    let browser2 = TabTrackingBrowser::new(
+        vec![Some("https://example.com/popup-window".to_string())],
+        vec![Some(1), Some(1)],
+        vec![Some("win-100".to_string()), Some("win-200".to_string())],
+    );
+    let policy2 = SafetyPolicy::default()
+        .with_allowed_prefixes(vec!["https://example.com".to_string()]);
+    let mut agent2 = Agent::new(screen2, decider2, MockInput::default(), policy2)
+        .with_browser(browser2)
+        .with_flights_preset(false);
+
+    let summary2 = agent2.run("Browse site").unwrap();
+    assert_eq!(
+        summary2.stop_reason,
+        StopReason::SafetyBlocked("new tab opened".to_string())
+    );
+    assert_eq!(summary2.steps_taken, 0);
+    assert_eq!(summary2.requests_sent, 0);
+}
+
 

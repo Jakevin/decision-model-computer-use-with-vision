@@ -3,7 +3,7 @@ use crate::browser::{Browser, DefaultAllowedBrowser};
 use crate::capture::{changed_fraction, is_changed, CaptureError, Rect, Screen};
 use crate::decider::{
     compute_excluded_targets, ActionKind, DeciderError, Decision, DoneCondition, VisionDecider,
-    LOW_CONFIDENCE_THRESHOLD,
+    LOW_CONFIDENCE_THRESHOLD, POPUP_PRESENT_THRESHOLD,
 };
 use crate::input::{Input, InputError, KeyCode};
 use crate::logging::RunLogger;
@@ -130,6 +130,15 @@ pub struct TabEventRecord {
     pub tab_events: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewTabEventRecord {
+    pub event: String,
+    pub step: usize,
+    pub url: Option<String>,
+    pub tab_count: Option<usize>,
+    pub front_window_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OccludedEventRecord {
     pub event: String,
@@ -171,6 +180,7 @@ pub struct DismissRefusedEventRecord {
     pub target: String,
     pub point: Option<(f64, f64)>,
     pub closeish_noul: f64,
+    pub popup_present_noul: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -405,6 +415,9 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             }
         }
 
+        let initial_tab_count = self.browser.tab_count();
+        let initial_window_id = self.browser.front_window_id();
+
         let mut stop_reason = StopReason::StepLimitReached(max_steps);
         let mut run_err: Option<AgentError> = None;
 
@@ -428,8 +441,32 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             }
             frontmost_failures = 0;
 
-            // Read active tab URL before capture
+            // Read active tab URL and check if a new tab/window opened before capture
             let current_url = self.browser.active_tab_url();
+            let cur_tab_count = self.browser.tab_count();
+            let cur_window_id = self.browser.front_window_id();
+            let tab_count_increased = match (initial_tab_count, cur_tab_count) {
+                (Some(init), Some(cur)) => cur > init,
+                _ => false,
+            };
+            let window_changed = match (&initial_window_id, &cur_window_id) {
+                (Some(init), Some(cur)) => cur != init,
+                _ => false,
+            };
+            if tab_count_increased || window_changed {
+                if let Some(ref mut logger) = self.logger {
+                    let evt = NewTabEventRecord {
+                        event: "new_tab".to_string(),
+                        step,
+                        url: current_url.clone(),
+                        tab_count: cur_tab_count,
+                        front_window_id: cur_window_id,
+                    };
+                    let _ = logger.log_entry(&evt);
+                }
+                stop_reason = StopReason::SafetyBlocked("new tab opened".to_string());
+                break;
+            }
             if self.flights_preset
                 && current_url
                     .as_deref()
@@ -673,6 +710,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                 ActionKind::DismissPopup => {
                     let box_conf = decision.box_confidence.unwrap_or(0.0);
                     let closeish = decision.closeish_noul.unwrap_or(0.0);
+                    let popup_present = decision.popup_present_noul.unwrap_or(0.0);
                     let tgt = decision.target.as_deref().unwrap_or("popup close");
                     if box_conf < LOW_CONFIDENCE_THRESHOLD {
                         if let Some(ref mut logger) = self.logger {
@@ -711,7 +749,9 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             stop_reason = StopReason::MaxWaitsExceeded;
                             break;
                         }
-                    } else if closeish < DISMISS_CLOSEISH_THRESHOLD {
+                    } else if popup_present < POPUP_PRESENT_THRESHOLD
+                        || closeish < DISMISS_CLOSEISH_THRESHOLD
+                    {
                         if let Some(ref mut logger) = self.logger {
                             let evt = DismissRefusedEventRecord {
                                 event: "dismiss_refused".to_string(),
@@ -719,6 +759,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                                 target: tgt.to_string(),
                                 point: decision.click_point_screen_pt,
                                 closeish_noul: closeish,
+                                popup_present_noul: decision.popup_present_noul,
                             };
                             let _ = logger.log_entry(&evt);
                         }

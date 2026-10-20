@@ -17,6 +17,9 @@ pub const SENSITIVE_QUESTION_INSTRUCTIONS: &str =
     "Is the element at this target a sign-in, payment, place-order/purchase/pay button, or a personal-info input field (name, email, phone, card)?";
 pub const CLOSEISH_QUESTION_INSTRUCTIONS: &str =
     "Is this button a Close, X, Reject, Decline or No-thanks control (not Accept, Subscribe or Sign up)?";
+pub const POPUP_PRESENT_QUESTION_INSTRUCTIONS: &str =
+    "Is a popup, modal dialog, cookie banner or overlay currently covering part of the page?";
+pub const POPUP_PRESENT_THRESHOLD: f64 = 0.6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DoneCondition {
@@ -329,6 +332,7 @@ pub struct Decision {
     pub results_noul: f64,
     pub sensitive_noul: Option<f64>,
     pub closeish_noul: Option<f64>,
+    pub popup_present_noul: Option<f64>,
 }
 
 #[derive(Debug, Error)]
@@ -457,6 +461,7 @@ pub struct VisionDecider<B: DecisionBackend> {
     pub type_values: BTreeMap<String, String>,
     requests_sent: AtomicUsize,
     images_sent: AtomicUsize,
+    last_popup_present: std::sync::Mutex<Option<f64>>,
 }
 
 impl<B: DecisionBackend> VisionDecider<B> {
@@ -470,6 +475,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
             type_values: BTreeMap::new(),
             requests_sent: AtomicUsize::new(0),
             images_sent: AtomicUsize::new(0),
+            last_popup_present: std::sync::Mutex::new(None),
         }
     }
 
@@ -565,13 +571,18 @@ impl<B: DecisionBackend> VisionDecider<B> {
     ) -> Result<Decision, DeciderError> {
         let state = format_state(goal, history);
         let active_fill_target = pending_fill_target(history, &self.type_values);
+        let prev_popup_present = self
+            .last_popup_present
+            .lock()
+            .unwrap()
+            .unwrap_or(0.0);
 
         let mut kind_criteria = BTreeMap::new();
         kind_criteria.insert(
             "click".to_string(),
             Some("Click an interactive element on the page".to_string()),
         );
-        if self.allow_dismiss_popup() {
+        if self.allow_dismiss_popup() && prev_popup_present >= POPUP_PRESENT_THRESHOLD {
             kind_criteria.insert(
                 "dismiss popup".to_string(),
                 Some("Close a cookie, newsletter or promo popup".to_string()),
@@ -641,6 +652,14 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 },
             );
         }
+        if self.allow_dismiss_popup() {
+            questions.insert(
+                "popup_present".to_string(),
+                Question::Noul {
+                    instructions: POPUP_PRESENT_QUESTION_INSTRUCTIONS.to_string(),
+                },
+            );
+        }
 
         let req1 = Request {
             model: self.model.clone(),
@@ -670,6 +689,13 @@ impl<B: DecisionBackend> VisionDecider<B> {
             Some(_) => return Err(DeciderError::UnexpectedAnswerType("results".to_string())),
             None => 0.0,
         };
+
+        let popup_present_noul = match resp1.answers.get("popup_present") {
+            Some(Answer::Noul { noul }) => Some(*noul),
+            Some(_) => return Err(DeciderError::UnexpectedAnswerType("popup_present".to_string())),
+            None => None,
+        };
+        *self.last_popup_present.lock().unwrap() = popup_present_noul;
 
         let action_kind = ActionKind::from_choice(&kind_choice)
             .ok_or_else(|| DeciderError::UnknownActionKind(kind_choice.clone()))?;
@@ -711,6 +737,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 results_noul,
                 sensitive_noul: None,
                 closeish_noul,
+                popup_present_noul,
             });
         }
 
@@ -732,6 +759,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                     results_noul,
                     sensitive_noul: None,
                     closeish_noul: None,
+                    popup_present_noul,
                 });
             }
 
@@ -773,6 +801,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 results_noul,
                 sensitive_noul,
                 closeish_noul: None,
+                popup_present_noul,
             });
         }
 
@@ -801,6 +830,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
             results_noul,
             sensitive_noul: None,
             closeish_noul: None,
+            popup_present_noul,
         })
     }
 
