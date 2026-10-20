@@ -37,13 +37,14 @@ Run the computer-use agent loop toward a specified task/goal
 Usage: decision-cu run [OPTIONS] --task <TASK>
 
 Options:
-      --task <TASK>            Natural language task/goal to accomplish (alias: --goal) [alias: --goal]
-      --max-steps <MAX_STEPS>  Maximum number of steps before stopping [default: 30]
-      --start-url <URL>        Activate Chrome and navigate active tab to this URL before step 0
-      --fill <KEY=VALUE>       Repeatable target-to-text fill mapping (e.g. --fill "origin field=Osaka")
-      --dry-run                Perform capture and decision making without executing mouse/keyboard actions
-      --json                   Print a single final JSON result object to stdout ({status, steps, reason, ...})
-  -h, --help                   Print help
+      --task <TASK>                Natural language task/goal to accomplish (alias: --goal) [alias: --goal]
+      --max-steps <MAX_STEPS>      Maximum number of steps before stopping [default: 30]
+      --start-url <URL>            Activate Chrome and navigate active tab to this URL before step 0
+      --start-url-preset <PRESET>  Best-effort start URL preset (e.g. one-way), mutually exclusive with --start-url
+      --fill <KEY=VALUE>           Repeatable target-to-text fill mapping (e.g. --fill "origin field=Osaka")
+      --dry-run                    Perform capture and decision making without executing mouse/keyboard actions
+      --json                       Print a single final JSON result object to stdout ({status, steps, reason, ...})
+  -h, --help                       Print help
 ```
 
 ### Example Invocations

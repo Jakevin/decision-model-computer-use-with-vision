@@ -1,6 +1,6 @@
 use crate::api::DecisionBackend;
 use crate::browser::{Browser, DefaultAllowedBrowser};
-use crate::capture::{CaptureError, Rect, Screen};
+use crate::capture::{screen_changed, CaptureError, Rect, Screen};
 use crate::decider::{
     compute_excluded_targets, ActionKind, DeciderError, Decision, VisionDecider,
 };
@@ -27,16 +27,20 @@ pub struct Timing {
     pub before_fill_wait: Duration,
     pub after_fill_wait: Duration,
     pub post_action_wait: Duration,
+    pub dropdown_reclick_wait: Duration,
+    pub step_wait: Duration,
 }
 
 impl Default for Timing {
     fn default() -> Self {
         Self {
-            start_url_wait: Duration::from_secs(3),
+            start_url_wait: Duration::from_secs(5),
             activate_chrome_wait: Duration::from_millis(ACTIVATE_CHROME_SLEEP_MS),
             before_fill_wait: Duration::from_millis(800),
-            after_fill_wait: Duration::from_millis(1500),
+            after_fill_wait: Duration::from_millis(1000),
             post_action_wait: Duration::from_millis(1000),
+            dropdown_reclick_wait: Duration::from_millis(700),
+            step_wait: Duration::from_millis(2500),
         }
     }
 }
@@ -49,6 +53,8 @@ impl Timing {
             before_fill_wait: Duration::ZERO,
             after_fill_wait: Duration::ZERO,
             post_action_wait: Duration::ZERO,
+            dropdown_reclick_wait: Duration::ZERO,
+            step_wait: Duration::ZERO,
         }
     }
 }
@@ -120,6 +126,15 @@ pub struct OccludedEventRecord {
     pub step: usize,
     pub app: String,
     pub point: (f64, f64),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReclickEventRecord {
+    pub event: String,
+    pub step: usize,
+    pub target: String,
+    pub point: (f64, f64),
+    pub changed: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -559,6 +574,31 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             }
                             history.push(format!("clicked and typed '{}' into {}", val, tgt));
                         } else {
+                            if !self.dry_run && tgt == "trip type dropdown" {
+                                if !self.timing.dropdown_reclick_wait.is_zero() {
+                                    thread::sleep(self.timing.dropdown_reclick_wait);
+                                }
+                                let after = self.screen.capture()?;
+                                let diff = screen_changed(&full, &after);
+                                if diff < 1.0 {
+                                    if let Err(reason) = self.check_unoccluded_at(step, pt) {
+                                        stop_reason = StopReason::SafetyBlocked(reason);
+                                        break;
+                                    }
+                                    self.input.click(pt.0, pt.1)?;
+                                    clicks += 1;
+                                    if let Some(ref mut logger) = self.logger {
+                                        let evt = ReclickEventRecord {
+                                            event: "reclick_unchanged".to_string(),
+                                            step,
+                                            target: tgt.to_string(),
+                                            point: pt,
+                                            changed: diff,
+                                        };
+                                        let _ = logger.log_entry(&evt);
+                                    }
+                                }
+                            }
                             if executed && !self.timing.post_action_wait.is_zero() {
                                 thread::sleep(self.timing.post_action_wait);
                             }
@@ -679,6 +719,9 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                 }
             }
             step_clicks.push(clicked_this_step);
+            if !self.timing.step_wait.is_zero() {
+                thread::sleep(self.timing.step_wait);
+            }
         }
 
         let avg_seconds_per_step = if steps_completed > 0 {

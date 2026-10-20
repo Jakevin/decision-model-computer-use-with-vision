@@ -32,8 +32,20 @@ pub enum Commands {
         max_steps: usize,
 
         /// Activate Chrome and navigate active tab to this URL before step 0
-        #[arg(long = "start-url", value_name = "URL")]
+        #[arg(
+            long = "start-url",
+            value_name = "URL",
+            conflicts_with = "start_url_preset"
+        )]
         start_url: Option<String>,
+
+        /// Best-effort start URL preset (e.g. one-way), mutually exclusive with --start-url
+        #[arg(
+            long = "start-url-preset",
+            value_name = "PRESET",
+            conflicts_with = "start_url"
+        )]
+        start_url_preset: Option<String>,
 
         /// Repeatable target-to-text fill mapping (e.g. --fill "origin field=Osaka")
         #[arg(long = "fill", value_name = "KEY=VALUE")]
@@ -103,83 +115,70 @@ pub fn parse_fills(fills: &[String]) -> Result<BTreeMap<String, String>, String>
     Ok(map)
 }
 
+pub fn resolve_start_url_preset(preset: &str) -> Result<String, String> {
+    match preset.trim() {
+        "one-way" => {
+            Ok("https://www.google.com/travel/flights?hl=en&q=one%20way%20flights".to_string())
+        }
+        other => Err(format!(
+            "Invalid --start-url-preset '{}': expected 'one-way'",
+            other
+        )),
+    }
+}
+
 pub fn flights_preset_targets() -> Vec<TargetSpec> {
     vec![
         TargetSpec::new(
             "trip type dropdown",
-            Some("'Round trip' dropdown at top-left of search form".to_string()),
-        ),
-        TargetSpec::new(
-            "one way option",
-            Some("The menu row with the text 'One way', second item in the small open list (Round trip, One way, Multi-city) just below the 'Round trip' button".to_string()),
-        ),
-        TargetSpec::new(
-            "origin field",
             Some(
-                "The departure city or airport text input field ('Where from?') on Google Flights"
+                "the small dropdown labelled 'Round trip' at the top left of the search form"
                     .to_string(),
             ),
         ),
         TargetSpec::new(
+            "one way option",
+            Some("the menu item that reads 'One way' in the open trip-type list".to_string()),
+        ),
+        TargetSpec::new(
+            "origin field",
+            Some("the left text field of the search form, showing the origin city".to_string()),
+        ),
+        TargetSpec::new(
             "origin suggestion",
             Some(
-                "First airport/city suggestion row in the list under the from field".to_string(),
+                "the suggestion row reading 'Kansai International Airport' with code KIX"
+                    .to_string(),
             ),
         ),
         TargetSpec::new(
             "destination field",
             Some(
-                "The arrival city or airport text input field ('Where to?') on Google Flights"
-                    .to_string(),
+                "the text field labelled 'Where to?' to the right of the origin field".to_string(),
             ),
         ),
         TargetSpec::new(
             "destination suggestion",
-            Some("First airport/city suggestion row in the list under the to field".to_string()),
+            Some(
+                "the suggestion row reading 'Taiwan Taoyuan International Airport' with code TPE"
+                    .to_string(),
+            ),
         ),
         TargetSpec::new(
             "departure date",
-            Some(
-                "The departure date selector input box on the Google Flights search form"
-                    .to_string(),
-            ),
+            Some("the date field labelled 'Departure' at the right of the search form".to_string()),
         ),
         TargetSpec::new(
             "departure date option",
-            Some("The day cell for the requested date in the open calendar".to_string()),
-        ),
-        TargetSpec::new(
-            "return date",
-            Some(
-                "The return date selector input box on the Google Flights search form".to_string(),
-            ),
+            Some("the number 3 under November 2026 in the open date picker".to_string()),
         ),
         TargetSpec::new(
             "done button",
-            Some(
-                "The blue 'Done' confirmation button inside the date picker calendar popover"
-                    .to_string(),
-            ),
+            Some("the blue 'Done' button at the bottom right of the date picker".to_string()),
         ),
         TargetSpec::new(
             "search button",
-            Some(
-                "The pill-shaped blue 'Search' or 'Explore' button with a magnifying glass icon"
-                    .to_string(),
-            ),
-        ),
-        TargetSpec::new(
-            "nonstop filter",
-            Some(
-                "The 'Stops' filter button or 'Nonstop only' filter option in the flight results bar"
-                    .to_string(),
-            ),
-        ),
-        TargetSpec::new(
-            "sort by cheapest",
-            Some(
-                "The 'Cheapest' tab or sort option above the list of available flights".to_string(),
-            ),
+            Some("the blue 'Search' button under the search form".to_string()),
         ),
     ]
 }
@@ -188,9 +187,19 @@ fn execute_run(
     task: &str,
     max_steps: usize,
     start_url: Option<String>,
+    start_url_preset: Option<String>,
     fills: &[String],
     dry_run: bool,
 ) -> (CliResultOutput, Option<ApiKey>) {
+    let resolved_start_url = match (start_url, start_url_preset) {
+        (Some(u), _) => Some(u),
+        (None, Some(preset)) => match resolve_start_url_preset(&preset) {
+            Ok(u) => Some(u),
+            Err(e) => return (CliResultOutput::error_or_blocked("error", e), None),
+        },
+        (None, None) => None,
+    };
+
     let type_values = match parse_fills(fills) {
         Ok(m) => m,
         Err(e) => return (CliResultOutput::error_or_blocked("error", e), None),
@@ -261,7 +270,7 @@ fn execute_run(
         let mut agent = Agent::new(screen, decider, input, policy)
             .with_browser(MacBrowser::new())
             .with_timing(Timing::default())
-            .with_start_url(start_url)
+            .with_start_url(resolved_start_url)
             .with_logger(logger)
             .with_dry_run(dry_run);
 
@@ -309,7 +318,7 @@ fn execute_run(
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (decider, policy, logger, task, start_url, dry_run);
+        let _ = (decider, policy, logger, task, resolved_start_url, dry_run);
         (
             CliResultOutput::error_or_blocked(
                 "error",
@@ -328,11 +337,19 @@ fn main() -> ExitCode {
             task,
             max_steps,
             start_url,
+            start_url_preset,
             fill,
             dry_run,
             json,
         } => {
-            let (out, key_opt) = execute_run(&task, max_steps, start_url, &fill, dry_run);
+            let (out, key_opt) = execute_run(
+                &task,
+                max_steps,
+                start_url,
+                start_url_preset,
+                &fill,
+                dry_run,
+            );
             let code = out.exit_code();
 
             if json {
@@ -384,6 +401,7 @@ mod tests {
                 task,
                 max_steps,
                 start_url,
+                start_url_preset,
                 fill,
                 dry_run,
                 json,
@@ -394,6 +412,7 @@ mod tests {
                     start_url.as_deref(),
                     Some("https://www.google.com/travel/flights")
                 );
+                assert!(start_url_preset.is_none());
                 assert_eq!(fill.len(), 2);
                 let parsed = parse_fills(&fill).unwrap();
                 assert_eq!(parsed.get("origin field").unwrap(), "Osaka");
@@ -403,12 +422,21 @@ mod tests {
             }
         }
 
-        let c2 = Cli::try_parse_from(["decision-cu", "run", "--goal", "legacy alias"]).unwrap();
+        let c2 = Cli::try_parse_from([
+            "decision-cu",
+            "run",
+            "--goal",
+            "legacy alias",
+            "--start-url-preset",
+            "one-way",
+        ])
+        .unwrap();
         match c2.command {
             Commands::Run {
                 task,
                 max_steps,
                 start_url,
+                start_url_preset,
                 fill,
                 dry_run,
                 json,
@@ -416,11 +444,29 @@ mod tests {
                 assert_eq!(task, "legacy alias");
                 assert_eq!(max_steps, 30);
                 assert!(start_url.is_none());
+                assert_eq!(start_url_preset.as_deref(), Some("one-way"));
+                assert_eq!(
+                    resolve_start_url_preset("one-way").unwrap(),
+                    "https://www.google.com/travel/flights?hl=en&q=one%20way%20flights"
+                );
                 assert!(fill.is_empty());
                 assert!(!dry_run);
                 assert!(!json);
             }
         }
+
+        // Mutually exclusive: --start-url and --start-url-preset cannot be combined
+        let conflict = Cli::try_parse_from([
+            "decision-cu",
+            "run",
+            "--task",
+            "test",
+            "--start-url",
+            "https://www.google.com/travel/flights",
+            "--start-url-preset",
+            "one-way",
+        ]);
+        assert!(conflict.is_err());
     }
 
     #[test]

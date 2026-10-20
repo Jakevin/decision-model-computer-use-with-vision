@@ -23,7 +23,7 @@ An agent skill definition is also included at [`skills/decision-computer-use/SKI
    - **Stage 2 (`box` question)**: When the chosen action kind is `click` (and the target is not `"nothing to click"`), sends a second request with a `"box"` question to locate the bounding box of the chosen target label.
    - **Low-Confidence Re-Ask**: If the returned bounding box confidence is `< 0.2`, the decider automatically re-asks once using the target's longer descriptive prompt.
 3. **Coordinate Mapping & Input Execution (`src/input.rs`)**:
-   - Computes the centre of the fractional bounding box `((left + right) / 2, (top + bottom) / 2)`, maps it from cropped pixel coordinates back into macOS screen points using the window origin and display scale factor, validates all safety rules, and performs the action via `enigo` (explicitly releasing `Shift`, `Control`, `Alt`, and `Meta` modifiers before and after every action).
+   - Computes the centre of the fractional bounding box `((left + right) / 2, (top + bottom) / 2)`, maps it from cropped pixel coordinates back into macOS screen points using the window origin and display scale factor, validates all safety rules, and performs the action via `core-graphics` (`CGEvent` posted to `CGEventTapLocation::HID` from `HIDSystemState`, explicitly releasing `Shift`, `Control`, `Option`, and `Command` modifiers before and after every action).
 
 ### macOS Installation & Permissions
 
@@ -74,6 +74,7 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 - `--task <TASK>` (alias `--goal <TASK>`): Natural language task/goal to accomplish.
 - `--max-steps <MAX_STEPS>`: Maximum number of steps before stopping (default `30`).
 - `--start-url <URL>`: Activate Chrome and navigate active tab to this URL before step 0.
+- `--start-url-preset <PRESET>`: Best-effort start URL preset (e.g. `one-way`, mapping to `https://www.google.com/travel/flights?hl=en&q=one%20way%20flights`), mutually exclusive with `--start-url`.
 - `--fill <KEY=VALUE>`: Repeatable target-to-text fill mapping (e.g. `--fill "origin field=Osaka"`).
 - `--dry-run`: Perform capture and decision making without executing mouse/keyboard actions.
 - `--json`: Print a single final JSON result object to stdout (`{status, steps, reason, ...}`).
@@ -184,6 +185,7 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 - `--task <TASK>`（別名 `--goal <TASK>`）：指定自然語言任務目標。
 - `--max-steps <MAX_STEPS>`：最大步數上限（預設 `30`）。
 - `--start-url <URL>`：於第 0 步前喚醒 Chrome 並將前景視窗使用中分頁導向此網址。
+- `--start-url-preset <PRESET>`：盡力而為（best-effort）的起始網址預設集（例如 `one-way` 對應 `https://www.google.com/travel/flights?hl=en&q=one%20way%20flights`），與 `--start-url` 互斥。
 - `--fill <KEY=VALUE>`：可重複指定的目標欄位填入文字對應（例如 `--fill "origin field=Osaka"`）。
 - `--dry-run`：乾跑模式，不執行實際滑鼠或鍵盤動作。
 - `--json`：於標準輸出印出單一 JSON 結果物件（`{status, steps, reason, ...}`）。

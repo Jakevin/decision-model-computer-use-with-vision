@@ -139,9 +139,9 @@ impl decision_cu::browser::Browser for SequenceBrowser {
         Ok(())
     }
 
-    fn activate_chrome(&mut self) -> Result<(), decision_cu::browser::BrowserError> {
+    fn activate_chrome(&mut self) -> bool {
         self.activated += 1;
-        Ok(())
+        true
     }
 
     fn go_back(&mut self) -> Result<(), decision_cu::browser::BrowserError> {
@@ -392,6 +392,21 @@ fn waits_limit() {
     let summary = agent.run("Search flights").unwrap();
     assert_eq!(summary.stop_reason, StopReason::MaxWaitsExceeded);
     assert_eq!(summary.steps_taken, 3);
+
+    // After 2 waits (step 0 and step 1), step 2's kind criteria must omit "wait"
+    let reqs = agent.decider().backend().requests.borrow();
+    match reqs[0].questions.get("kind").unwrap() {
+        Question::Choice { criteria, .. } => assert!(criteria.contains_key("wait")),
+        _ => panic!("Expected choice question"),
+    }
+    match reqs[1].questions.get("kind").unwrap() {
+        Question::Choice { criteria, .. } => assert!(criteria.contains_key("wait")),
+        _ => panic!("Expected choice question"),
+    }
+    match reqs[2].questions.get("kind").unwrap() {
+        Question::Choice { criteria, .. } => assert!(!criteria.contains_key("wait")),
+        _ => panic!("Expected choice question"),
+    }
 }
 
 #[test]
@@ -817,9 +832,9 @@ impl decision_cu::browser::Browser for FrontmostSequenceBrowser {
         Ok(())
     }
 
-    fn activate_chrome(&mut self) -> Result<(), decision_cu::browser::BrowserError> {
+    fn activate_chrome(&mut self) -> bool {
         self.activated += 1;
-        Ok(())
+        true
     }
 
     fn frontmost_app(&self) -> Option<String> {
@@ -1036,7 +1051,7 @@ fn explore_url_goes_back_sends_nothing_and_adds_history_hint() {
 }
 
 #[test]
-fn previous_target_and_repeated_target_excluded_from_criteria() {
+fn repeated_target_excluded_after_two_consecutive_steps_and_dropdown_reclicked_when_unchanged() {
     let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
     let window = Rect {
         x: 0.0,
@@ -1050,21 +1065,17 @@ fn previous_target_and_repeated_target_excluded_from_criteria() {
         scale: 2.0,
     };
 
-    // Step 0: click "trip type dropdown" (req 0 = choice, req 1 = box)
-    // Step 1: click "one way option" (req 2 = choice -> must omit "trip type dropdown", req 3 = box)
-    // Step 2: click "trip type dropdown" again (req 4 = choice -> omits "one way option", req 5 = box)
-    // Step 3: scroll (req 6 = choice -> "trip type dropdown" now clicked 2x in last 3 steps, so excluded for next 3 steps: steps 3, 4, 5!)
-    // Step 4: scroll (req 7 = choice -> "trip type dropdown" still excluded)
-    // Step 5: done (req 8 = choice -> "trip type dropdown" still excluded)
+    // Step 0: click "trip type dropdown" (req 0 = choice, req 1 = box) -> screen unchanged so re-clicks once
+    // Step 1: click "trip type dropdown" again (req 2 = choice -> NOT excluded yet after 1 step; req 3 = box)
+    // Step 2: click "one way option" (req 4 = choice -> MUST exclude "trip type dropdown" after 2 consecutive steps; req 5 = box)
+    // Step 3: done (req 6 = choice -> "trip type dropdown" no longer excluded since step 2 clicked "one way option")
     let backend = MockBackend::new(vec![
+        make_choice_response_with_results("click", "trip type dropdown", 0.1),
+        make_box_response(0.4, 0.4, 0.6, 0.6, 0.95),
         make_choice_response_with_results("click", "trip type dropdown", 0.1),
         make_box_response(0.4, 0.4, 0.6, 0.6, 0.95),
         make_choice_response_with_results("click", "one way option", 0.1),
         make_box_response(0.4, 0.4, 0.6, 0.6, 0.95),
-        make_choice_response_with_results("click", "trip type dropdown", 0.1),
-        make_box_response(0.4, 0.4, 0.6, 0.6, 0.95),
-        make_choice_response_with_results("scroll", "nothing to click", 0.1),
-        make_choice_response_with_results("scroll", "nothing to click", 0.1),
         make_choice_response_with_results("done", "nothing to click", 0.7),
     ]);
 
@@ -1077,17 +1088,41 @@ fn previous_target_and_repeated_target_excluded_from_criteria() {
         ],
     );
 
-    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default());
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_reclick");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_logger(logger);
     let summary = agent.run("Select one way").unwrap();
     assert_eq!(summary.stop_reason, StopReason::Done);
 
+    // Step 0 and Step 1 clicked "trip type dropdown" on unchanged MockScreen, so each re-clicked once (2 + 2 + 1 = 5 clicks total)
+    assert_eq!(summary.clicks, 5);
+    let log_str = std::fs::read_to_string(&steps_path).unwrap();
+    assert!(log_str.contains("\"reclick_unchanged\""));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
     let reqs = agent.decider().backend().requests.borrow();
 
-    // Step 1 choice request (reqs[2]): must omit "trip type dropdown" and include step-order hint in state
+    // Step 1 choice request (reqs[2]): after only 1 click, "trip type dropdown" is still allowed
     assert!(reqs[2]
         .state
         .contains("Targets already clicked: trip type dropdown"));
     match reqs[2].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(criteria.contains_key("trip type dropdown"));
+            assert!(criteria.contains_key("one way option"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+
+    // Step 2 choice request (reqs[4]): after 2 consecutive clicks on "trip type dropdown", it is excluded!
+    assert!(reqs[4]
+        .state
+        .contains("Targets already clicked: trip type dropdown -> trip type dropdown"));
+    match reqs[4].questions.get("target").unwrap() {
         Question::Choice { criteria, .. } => {
             assert!(!criteria.contains_key("trip type dropdown"));
             assert!(criteria.contains_key("one way option"));
@@ -1096,29 +1131,12 @@ fn previous_target_and_repeated_target_excluded_from_criteria() {
         _ => panic!("Expected target choice question"),
     }
 
-    // Step 2 choice request (reqs[4]): must omit "one way option"
-    assert!(reqs[4]
-        .state
-        .contains("Targets already clicked: trip type dropdown -> one way option"));
-    match reqs[4].questions.get("target").unwrap() {
+    // Step 3 choice request (reqs[6]): after clicking "one way option" at step 2, last 2 steps are not the same target
+    match reqs[6].questions.get("target").unwrap() {
         Question::Choice { criteria, .. } => {
-            assert!(!criteria.contains_key("one way option"));
             assert!(criteria.contains_key("trip type dropdown"));
+            assert!(criteria.contains_key("one way option"));
         }
         _ => panic!("Expected target choice question"),
-    }
-
-    // Steps 3, 4, 5 choice requests (reqs[6], reqs[7], reqs[8]): "trip type dropdown" excluded for 3 steps
-    for idx in [6usize, 7, 8] {
-        match reqs[idx].questions.get("target").unwrap() {
-            Question::Choice { criteria, .. } => {
-                assert!(
-                    !criteria.contains_key("trip type dropdown"),
-                    "trip type dropdown should be excluded at request index {}",
-                    idx
-                );
-            }
-            _ => panic!("Expected target choice question"),
-        }
     }
 }

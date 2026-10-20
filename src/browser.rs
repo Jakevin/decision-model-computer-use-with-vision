@@ -1,4 +1,6 @@
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -10,8 +12,8 @@ pub enum BrowserError {
 pub trait Browser {
     fn active_tab_url(&self) -> Option<String>;
     fn set_active_tab_url(&mut self, url: &str) -> Result<(), BrowserError>;
-    fn activate_chrome(&mut self) -> Result<(), BrowserError> {
-        Ok(())
+    fn activate_chrome(&mut self) -> bool {
+        self.is_chrome_frontmost()
     }
     fn frontmost_app(&self) -> Option<String> {
         Some("Google Chrome".to_string())
@@ -36,7 +38,7 @@ impl<T: Browser + ?Sized> Browser for Box<T> {
         (**self).set_active_tab_url(url)
     }
 
-    fn activate_chrome(&mut self) -> Result<(), BrowserError> {
+    fn activate_chrome(&mut self) -> bool {
         (**self).activate_chrome()
     }
 
@@ -62,7 +64,7 @@ impl<T: Browser + ?Sized> Browser for &mut T {
         (**self).set_active_tab_url(url)
     }
 
-    fn activate_chrome(&mut self) -> Result<(), BrowserError> {
+    fn activate_chrome(&mut self) -> bool {
         (**self).activate_chrome()
     }
 
@@ -116,19 +118,28 @@ pub fn set_active_tab_url(url: &str) -> Result<(), BrowserError> {
     }
 }
 
-pub fn activate_chrome() -> Result<(), BrowserError> {
-    let output = Command::new("osascript")
+pub fn activate_chrome() -> bool {
+    let _ = Command::new("osascript")
         .arg("-e")
         .arg("tell application \"Google Chrome\" to activate")
-        .output()
-        .map_err(|e| BrowserError::CommandFailed(e.to_string()))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(BrowserError::CommandFailed(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ))
+        .output();
+
+    for _ in 0..30 {
+        if is_chrome_frontmost() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
     }
+
+    if !is_chrome_frontmost() {
+        let _ = Command::new("osascript")
+            .arg("-e")
+            .arg("tell application \"System Events\" to set frontmost of process \"Google Chrome\" to true")
+            .output();
+        thread::sleep(Duration::from_millis(300));
+    }
+
+    is_chrome_frontmost()
 }
 
 pub fn frontmost_app() -> Option<String> {
@@ -188,7 +199,7 @@ impl Browser for MacBrowser {
         set_active_tab_url(url)
     }
 
-    fn activate_chrome(&mut self) -> Result<(), BrowserError> {
+    fn activate_chrome(&mut self) -> bool {
         activate_chrome()
     }
 
@@ -229,8 +240,8 @@ impl Browser for DefaultAllowedBrowser {
         Ok(())
     }
 
-    fn activate_chrome(&mut self) -> Result<(), BrowserError> {
+    fn activate_chrome(&mut self) -> bool {
         self.activated += 1;
-        Ok(())
+        true
     }
 }

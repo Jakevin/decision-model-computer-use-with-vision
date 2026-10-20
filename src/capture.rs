@@ -95,6 +95,22 @@ pub fn topmost_app_at(_x_pt: f64, _y_pt: f64) -> Option<String> {
     None
 }
 
+pub fn screen_changed(a: &RgbaImage, b: &RgbaImage) -> f64 {
+    use image::imageops::{grayscale, resize, FilterType};
+
+    let gray_a = grayscale(a);
+    let gray_b = grayscale(b);
+    let thumb_a = resize(&gray_a, 64, 36, FilterType::Triangle);
+    let thumb_b = resize(&gray_b, 64, 36, FilterType::Triangle);
+
+    let mut total_diff = 0.0f64;
+    let count = (64 * 36) as f64;
+    for (pa, pb) in thumb_a.pixels().zip(thumb_b.pixels()) {
+        total_diff += (pa[0] as f64 - pb[0] as f64).abs();
+    }
+    total_diff / count
+}
+
 #[derive(Debug, Error)]
 pub enum CaptureError {
     #[error("No primary monitor found")]
@@ -261,5 +277,16 @@ mod tests {
                 height: 916.0,
             }
         );
+    }
+
+    #[test]
+    fn screen_changed_identical_and_different_images() {
+        let img1 = RgbaImage::from_pixel(200, 100, image::Rgba([50, 50, 50, 255]));
+        let img2 = RgbaImage::from_pixel(200, 100, image::Rgba([50, 50, 50, 255]));
+        let img3 = RgbaImage::from_pixel(200, 100, image::Rgba([200, 200, 200, 255]));
+
+        assert_eq!(screen_changed(&img1, &img2), 0.0);
+        let diff = screen_changed(&img1, &img3);
+        assert!(diff > 100.0, "expected large diff, got {}", diff);
     }
 }

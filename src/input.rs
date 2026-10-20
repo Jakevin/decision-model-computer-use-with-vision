@@ -30,105 +30,199 @@ pub trait Input {
 }
 
 #[cfg(target_os = "macos")]
-pub struct EnigoInput {
-    enigo: enigo::Enigo,
-}
+pub struct QuartzInput;
 
 #[cfg(target_os = "macos")]
-impl EnigoInput {
+pub type EnigoInput = QuartzInput;
+
+#[cfg(target_os = "macos")]
+impl QuartzInput {
     pub fn new() -> Result<Self, InputError> {
-        let settings = enigo::Settings::default();
-        let enigo =
-            enigo::Enigo::new(&settings).map_err(|e| InputError::Platform(e.to_string()))?;
-        Ok(Self { enigo })
+        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+        let _ = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|()| InputError::Platform("Failed to create CGEventSource".to_string()))?;
+        Ok(Self)
+    }
+
+    fn event_source(
+    ) -> Result<core_graphics::event_source::CGEventSource, InputError> {
+        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+        CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|()| InputError::Platform("Failed to create CGEventSource".to_string()))
     }
 }
 
 #[cfg(target_os = "macos")]
-impl Input for EnigoInput {
+impl Default for QuartzInput {
+    fn default() -> Self {
+        Self
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Input for QuartzInput {
     fn click(&mut self, x: f64, y: f64) -> Result<(), InputError> {
-        use enigo::{Button, Coordinate, Direction, Mouse};
+        use core_graphics::event::{
+            CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton,
+        };
+        use core_graphics::geometry::CGPoint;
+        use std::thread;
+        use std::time::Duration;
+
         self.release_modifiers()?;
-        self.enigo
-            .move_mouse(x.round() as i32, y.round() as i32, Coordinate::Abs)
-            .map_err(|e| InputError::Platform(e.to_string()))?;
-        let res = self
-            .enigo
-            .button(Button::Left, Direction::Click)
-            .map_err(|e| InputError::Platform(e.to_string()));
+        let source = Self::event_source()?;
+        let pt = CGPoint::new(x, y);
+
+        let moved = CGEvent::new_mouse_event(
+            source.clone(),
+            CGEventType::MouseMoved,
+            pt,
+            CGMouseButton::Left,
+        )
+        .map_err(|()| InputError::Platform("Failed to create MouseMoved CGEvent".to_string()))?;
+        moved.set_flags(CGEventFlags::CGEventFlagNull);
+        moved.post(CGEventTapLocation::HID);
+        thread::sleep(Duration::from_millis(40));
+
+        let down_res = CGEvent::new_mouse_event(
+            source.clone(),
+            CGEventType::LeftMouseDown,
+            pt,
+            CGMouseButton::Left,
+        )
+        .map_err(|()| InputError::Platform("Failed to create LeftMouseDown CGEvent".to_string()))
+        .map(|ev| {
+            ev.set_flags(CGEventFlags::CGEventFlagNull);
+            ev.post(CGEventTapLocation::HID);
+        });
+        thread::sleep(Duration::from_millis(40));
+
+        let up_res = CGEvent::new_mouse_event(
+            source,
+            CGEventType::LeftMouseUp,
+            pt,
+            CGMouseButton::Left,
+        )
+        .map_err(|()| InputError::Platform("Failed to create LeftMouseUp CGEvent".to_string()))
+        .map(|ev| {
+            ev.set_flags(CGEventFlags::CGEventFlagNull);
+            ev.post(CGEventTapLocation::HID);
+        });
+        thread::sleep(Duration::from_millis(40));
+
         let _ = self.release_modifiers();
-        res
+        down_res?;
+        up_res
     }
 
     fn type_text(&mut self, text: &str) -> Result<(), InputError> {
-        use enigo::Keyboard;
+        use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
         use std::thread;
         use std::time::Duration;
+
         self.release_modifiers()?;
-        let mut res = Ok(());
-        let mut chars = text.chars().peekable();
-        while let Some(ch) = chars.next() {
-            let s = ch.to_string();
-            if let Err(e) = self.enigo.text(&s) {
-                res = Err(InputError::Platform(e.to_string()));
-                break;
-            }
-            if chars.peek().is_some() {
-                thread::sleep(Duration::from_millis(40));
-            }
+        let source = Self::event_source()?;
+        let mut buf = [0u8; 4];
+
+        for ch in text.chars() {
+            let s = ch.encode_utf8(&mut buf);
+            let down = CGEvent::new_keyboard_event(source.clone(), 0, true).map_err(|()| {
+                InputError::Platform("Failed to create key down CGEvent".to_string())
+            })?;
+            down.set_flags(CGEventFlags::CGEventFlagNull);
+            down.set_string(s);
+            down.post(CGEventTapLocation::HID);
+
+            let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
+                .map_err(|()| InputError::Platform("Failed to create key up CGEvent".to_string()))?;
+            up.set_flags(CGEventFlags::CGEventFlagNull);
+            up.set_string(s);
+            up.post(CGEventTapLocation::HID);
+
+            thread::sleep(Duration::from_millis(30));
         }
+
         let _ = self.release_modifiers();
-        res
+        Ok(())
     }
 
     fn key(&mut self, key: KeyCode) -> Result<(), InputError> {
-        use enigo::{Direction, Key, Keyboard};
+        use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
+
         self.release_modifiers()?;
-        let k = match key {
-            KeyCode::Return => Key::Return,
-            KeyCode::Escape => Key::Escape,
-            KeyCode::Tab => Key::Tab,
-            KeyCode::Backspace => Key::Backspace,
-            KeyCode::DownArrow => Key::DownArrow,
-            KeyCode::UpArrow => Key::UpArrow,
+        let source = Self::event_source()?;
+        let code: CGKeyCode = match key {
+            KeyCode::Return => 36,
+            KeyCode::Escape => 53,
+            KeyCode::Tab => 48,
+            KeyCode::Backspace => 51,
+            KeyCode::DownArrow => 125,
+            KeyCode::UpArrow => 126,
         };
-        let res = self
-            .enigo
-            .key(k, Direction::Click)
-            .map_err(|e| InputError::Platform(e.to_string()));
+
+        let down = CGEvent::new_keyboard_event(source.clone(), code, true)
+            .map_err(|()| InputError::Platform("Failed to create key down CGEvent".to_string()))?;
+        down.set_flags(CGEventFlags::CGEventFlagNull);
+        down.post(CGEventTapLocation::HID);
+
+        let up = CGEvent::new_keyboard_event(source, code, false)
+            .map_err(|()| InputError::Platform("Failed to create key up CGEvent".to_string()))?;
+        up.set_flags(CGEventFlags::CGEventFlagNull);
+        up.post(CGEventTapLocation::HID);
+
         let _ = self.release_modifiers();
-        res
+        Ok(())
     }
 
     fn scroll_vertical(&mut self, amount: i32) -> Result<(), InputError> {
-        use enigo::{Axis, Mouse};
+        use core_graphics::event::{
+            CGEvent, CGEventFlags, CGEventTapLocation, ScrollEventUnit,
+        };
+
         self.release_modifiers()?;
-        let res = self
-            .enigo
-            .scroll(amount, Axis::Vertical)
-            .map_err(|e| InputError::Platform(e.to_string()));
+        let source = Self::event_source()?;
+        let ev = CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 1, amount, 0, 0)
+            .map_err(|()| InputError::Platform("Failed to create scroll CGEvent".to_string()))?;
+        ev.set_flags(CGEventFlags::CGEventFlagNull);
+        ev.post(CGEventTapLocation::HID);
         let _ = self.release_modifiers();
-        res
+        Ok(())
     }
 
     fn release_modifiers(&mut self) -> Result<(), InputError> {
-        use enigo::{Direction, Key, Keyboard};
-        for modifier in [Key::Shift, Key::Control, Key::Alt, Key::Meta] {
-            let _ = self.enigo.key(modifier, Direction::Release);
+        use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
+
+        let source = Self::event_source()?;
+        // Shift = 56, Control = 59, Option = 58, Command = 55
+        for code in [56 as CGKeyCode, 59, 58, 55] {
+            if let Ok(up) = CGEvent::new_keyboard_event(source.clone(), code, false) {
+                up.set_flags(CGEventFlags::CGEventFlagNull);
+                up.post(CGEventTapLocation::HID);
+            }
         }
         Ok(())
     }
 
     fn select_all(&mut self) -> Result<(), InputError> {
-        use enigo::{Direction, Key, Keyboard};
+        use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+
         self.release_modifiers()?;
-        let _ = self.enigo.key(Key::Meta, Direction::Press);
-        let res = self
-            .enigo
-            .key(Key::Unicode('a'), Direction::Click)
-            .map_err(|e| InputError::Platform(e.to_string()));
-        let _ = self.enigo.key(Key::Meta, Direction::Release);
-        let _ = self.release_modifiers();
-        res
+        let source = Self::event_source()?;
+
+        let down = CGEvent::new_keyboard_event(source.clone(), 0, true).map_err(|()| {
+            InputError::Platform("Failed to create select_all down CGEvent".to_string())
+        })?;
+        down.set_flags(CGEventFlags::CGEventFlagCommand);
+        down.set_string("a");
+        down.post(CGEventTapLocation::HID);
+
+        let up = CGEvent::new_keyboard_event(source, 0, false).map_err(|()| {
+            InputError::Platform("Failed to create select_all up CGEvent".to_string())
+        })?;
+        up.set_flags(CGEventFlags::CGEventFlagCommand);
+        up.set_string("a");
+        up.post(CGEventTapLocation::HID);
+
+        self.release_modifiers()
     }
 }

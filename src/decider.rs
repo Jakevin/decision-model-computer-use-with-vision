@@ -132,37 +132,16 @@ pub fn clicked_targets_from_history(history: &[String]) -> Vec<String> {
 
 pub fn compute_excluded_targets(step_clicks: &[Option<String>]) -> Vec<String> {
     let mut excluded = Vec::new();
-    let n = step_clicks.len();
-    if n == 0 {
-        return excluded;
-    }
-
-    // (1) Target clicked in the immediately previous step
-    if let Some(Some(prev)) = step_clicks.last() {
-        excluded.push(prev.clone());
-    }
-
-    // (3) If the same target would be clicked 3 times within the last 5 steps
-    // (or was triggered within the last 3 steps), exclude it for 3 steps.
-    for offset in 0..3 {
-        if n < offset {
-            break;
-        }
-        let end = n - offset;
-        let start = end.saturating_sub(4);
-        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-        for item in &step_clicks[start..end] {
-            if let Some(ref t) = item {
-                *counts.entry(t.as_str()).or_insert(0) += 1;
-            }
-        }
-        for (t, count) in counts {
-            if count >= 2 && !excluded.iter().any(|e| e == t) {
-                excluded.push(t.to_string());
+    if step_clicks.len() >= 2 {
+        if let (Some(prev1), Some(prev2)) = (
+            &step_clicks[step_clicks.len() - 2],
+            &step_clicks[step_clicks.len() - 1],
+        ) {
+            if prev1 == prev2 {
+                excluded.push(prev1.clone());
             }
         }
     }
-
     excluded
 }
 
@@ -327,10 +306,14 @@ impl<B: DecisionBackend> VisionDecider<B> {
             "scroll".to_string(),
             Some("Scroll down the page to reveal more content".to_string()),
         );
-        kind_criteria.insert(
-            "wait".to_string(),
-            Some("Wait for the page to finish loading".to_string()),
-        );
+        let last_two_are_waits =
+            history.len() >= 2 && history.iter().rev().take(2).all(|h| h == "wait");
+        if !last_two_are_waits {
+            kind_criteria.insert(
+                "wait".to_string(),
+                Some("Wait for the page to finish loading".to_string()),
+            );
+        }
         kind_criteria.insert(
             "done".to_string(),
             Some("The goal has been achieved or no further action is needed".to_string()),
