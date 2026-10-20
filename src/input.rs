@@ -10,9 +10,11 @@ pub enum KeyCode {
     DownArrow,
     UpArrow,
     PageDown,
+    PageUp,
 }
 
 pub const DEFAULT_SCROLL_DELTA_PX: i32 = -400;
+pub const DEFAULT_SCROLL_UP_DELTA_PX: i32 = 400;
 
 #[derive(Debug, Error)]
 pub enum InputError {
@@ -173,6 +175,7 @@ impl Input for QuartzInput {
             KeyCode::DownArrow => 125,
             KeyCode::UpArrow => 126,
             KeyCode::PageDown => 121,
+            KeyCode::PageUp => 116,
         };
 
         let down = CGEvent::new_keyboard_event(source.clone(), code, true)

@@ -2836,9 +2836,15 @@ fn f6_card_boxing_reask_content_crop_2x_mapping_wide_card_ok_and_short_primary_e
     let decider = VisionDecider::new(backend, Preset::EventsZh.default_targets())
         .with_preset(Preset::EventsZh)
         .with_done_condition(DoneCondition::CheckoutPage);
+    let browser = SequenceBrowser::new(vec![
+        Some("https://www.accupass.com".to_string()),
+        Some("https://www.accupass.com/event/251021".to_string()),
+        Some("https://www.accupass.com/event/251021".to_string()),
+    ]);
     let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_browser(browser)
         .with_flights_preset(false)
-        .with_start_url(Some("https://www.google.com/travel/flights".to_string()));
+        .with_start_url(Some("https://www.accupass.com".to_string()));
 
     let summary = agent.run("Click Accupass card via content crop").unwrap();
     assert_eq!(summary.stop_reason, StopReason::Done);
@@ -3034,9 +3040,15 @@ fn f6_no_available_targets_wait_counts_as_noop_and_stops_blocked() {
     .with_preset(Preset::EventsZh)
     .with_done_condition(DoneCondition::CheckoutPage);
 
+    let browser = SequenceBrowser::new(vec![
+        Some("https://www.accupass.com".to_string()),
+        Some("https://www.accupass.com/event/251021".to_string()),
+        Some("https://www.accupass.com/event/251021".to_string()),
+    ]);
     let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_browser(browser)
         .with_flights_preset(false)
-        .with_start_url(Some("https://www.google.com/travel/flights".to_string()));
+        .with_start_url(Some("https://www.accupass.com".to_string()));
 
     let summary = agent.run("Stop when no available targets").unwrap();
     assert_eq!(
@@ -3053,6 +3065,272 @@ fn f6_no_available_targets_wait_counts_as_noop_and_stops_blocked() {
     assert_eq!(json.status, "blocked");
     assert_eq!(json.reason, "no available targets");
 }
+
+fn make_choice_response_with_results_popup_and_footer(
+    kind: &str,
+    target: &str,
+    results_noul: f64,
+    popup_present_noul: f64,
+    footer_noul: f64,
+) -> Response {
+    let mut resp =
+        make_choice_response_with_results_and_popup(kind, target, results_noul, popup_present_noul);
+    resp.answers.insert(
+        "footer".to_string(),
+        Answer::Noul {
+            noul: footer_noul,
+        },
+    );
+    resp
+}
+
+#[test]
+fn f7_event_page_priority_and_footer_scroll_reversal_with_direction_logging() {
+    use decision_cu::decider::{
+        ScrollDirection, EVENT_PAGE_REGISTER_DESC, FOOTER_QUESTION_INSTRUCTIONS,
+    };
+    use decision_cu::input::{DEFAULT_SCROLL_DELTA_PX, DEFAULT_SCROLL_UP_DELTA_PX};
+
+    let base_img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let scrolled_img = make_changed_img([40, 100, 160, 255]);
+    let scrolled_up_img = make_changed_img([180, 70, 50, 255]);
+    let window = Rect {
+        x: 100.0,
+        y: 50.0,
+        width: 800.0,
+        height: 600.0,
+    };
+
+    let screen = SequenceScreen::new(
+        vec![
+            base_img.clone(),
+            base_img.clone(),
+            scrolled_img.clone(),
+            scrolled_img.clone(),
+            scrolled_up_img.clone(),
+            scrolled_up_img.clone(),
+        ],
+        Some(window),
+        2.0,
+    );
+
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results_popup_and_footer("scroll", "向下捲動", 0.2, 0.1, 0.1),
+        make_box_response(0.3, 0.6, 0.4, 0.8, 0.85),
+        make_choice_response_with_results_popup_and_footer("scroll", "向下捲動", 0.2, 0.1, 0.72),
+        make_box_response(0.3, 0.6, 0.4, 0.8, 0.05),
+        make_box_response(0.5, 0.2, 0.6, 0.8, 0.08),
+        make_choice_response_with_results_popup_and_footer("scroll", "向上捲動", 0.3, 0.1, 0.1),
+        make_box_response(0.3, 0.6, 0.4, 0.8, 0.05),
+        make_box_response(0.5, 0.2, 0.6, 0.8, 0.08),
+        make_choice_response_with_results_popup_and_footer("done", "nothing to click", 0.9, 0.1, 0.1),
+    ]);
+
+    let decider = VisionDecider::new(backend, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage);
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_f7_event_priority_and_scroll");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_flights_preset(false)
+        .with_start_url(Some("https://www.accupass.com/event/251021".to_string()))
+        .with_logger(logger);
+
+    let summary = agent.run("Register on Accupass event page").unwrap();
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.steps_taken, 4);
+    assert_eq!(summary.clicks, 1);
+    assert!(summary.history[0].starts_with("click '立即報名按鈕'"));
+    assert_eq!(summary.history[2], "scroll up");
+    assert_eq!(agent.decider().scroll_direction(), ScrollDirection::Up);
+
+    let reqs = agent.decider().backend().requests.borrow();
+    match reqs[0].questions.get("footer").unwrap() {
+        Question::Noul { instructions } => {
+            assert_eq!(instructions, FOOTER_QUESTION_INSTRUCTIONS);
+        }
+        _ => panic!("Expected footer noul question"),
+    }
+    match reqs[1].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => {
+            assert_eq!(instructions, EVENT_PAGE_REGISTER_DESC);
+        }
+        _ => panic!("Expected box question for 立即報名按鈕"),
+    }
+
+    assert_eq!(agent.input().scrolls_at.len(), 2);
+    assert_eq!(agent.input().scrolls_at[0].2, DEFAULT_SCROLL_UP_DELTA_PX);
+    assert_eq!(agent.input().scrolls_at[1].2, DEFAULT_SCROLL_UP_DELTA_PX);
+    assert_ne!(DEFAULT_SCROLL_DELTA_PX, DEFAULT_SCROLL_UP_DELTA_PX);
+
+    let log_str = std::fs::read_to_string(&steps_path).unwrap();
+    let scroll_events: Vec<serde_json::Value> = log_str
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("scroll"))
+        .collect();
+    assert_eq!(scroll_events.len(), 2);
+    assert_eq!(scroll_events[0]["direction"], "up");
+    assert_eq!(scroll_events[1]["direction"], "up");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn f7_card_click_no_navigation_retries_real_link_and_blocks_if_still_unchanged() {
+    use decision_cu::decider::{CARD_LINK_RETRY_IMAGE_DESC, CARD_LINK_RETRY_TITLE_DESC};
+
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 100.0,
+        y: 50.0,
+        width: 800.0,
+        height: 600.0,
+    };
+
+    let screen1 = MockScreen {
+        img: img.clone(),
+        rect: Some(window),
+        scale: 2.0,
+    };
+    let backend1 = MockBackend::new(vec![
+        make_choice_response_with_results_and_popup("click", "活動卡片", 0.1, 0.1),
+        make_box_response(0.3, 0.2, 0.5, 0.5, 0.85),
+        make_box_response(0.3, 0.2, 0.4, 0.5, 0.12),
+        make_box_response(0.3, 0.2, 0.5, 0.5, 0.88),
+    ]);
+    let decider1 = VisionDecider::new(backend1, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage);
+    let browser1 = SequenceBrowser::new(vec![
+        Some("https://www.accupass.com".to_string()),
+        Some("https://www.accupass.com".to_string()),
+        Some("https://www.accupass.com".to_string()),
+    ]);
+    let mut agent1 = Agent::new(screen1, decider1, MockInput::default(), SafetyPolicy::default())
+        .with_browser(browser1)
+        .with_flights_preset(false)
+        .with_start_url(Some("https://www.accupass.com".to_string()));
+
+    let summary1 = agent1.run("Click card that fails to navigate").unwrap();
+    assert_eq!(
+        summary1.stop_reason,
+        StopReason::SafetyBlocked("card click did not navigate".to_string())
+    );
+    assert_eq!(summary1.clicks, 2);
+    let json1 = summary1.to_summary_json();
+    assert_eq!(json1.status, "blocked");
+    assert_eq!(json1.reason, "card click did not navigate");
+
+    let reqs1 = agent1.decider().backend().requests.borrow();
+    match reqs1[2].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => assert_eq!(instructions, CARD_LINK_RETRY_TITLE_DESC),
+        _ => panic!("Expected retry title link box question"),
+    }
+    match reqs1[3].questions.get("target_box").unwrap() {
+        Question::Box { instructions } => assert_eq!(instructions, CARD_LINK_RETRY_IMAGE_DESC),
+        _ => panic!("Expected retry image link box question"),
+    }
+
+    let screen2 = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+    let backend2 = MockBackend::new(vec![
+        make_choice_response_with_results_and_popup("click", "活動卡片", 0.1, 0.1),
+        make_box_response(0.3, 0.2, 0.5, 0.5, 0.85),
+        make_box_response(0.32, 0.22, 0.38, 0.48, 0.91),
+        make_choice_response_with_results_and_popup("done", "nothing to click", 0.9, 0.1),
+    ]);
+    let decider2 = VisionDecider::new(backend2, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage);
+    let browser2 = SequenceBrowser::new(vec![
+        Some("https://www.accupass.com".to_string()),
+        Some("https://www.accupass.com".to_string()),
+        Some("https://www.accupass.com/event/999".to_string()),
+        Some("https://www.accupass.com/event/999".to_string()),
+    ]);
+    let mut agent2 = Agent::new(screen2, decider2, MockInput::default(), SafetyPolicy::default())
+        .with_browser(browser2)
+        .with_flights_preset(false)
+        .with_start_url(Some("https://www.accupass.com".to_string()));
+
+    let summary2 = agent2.run("Click card that navigates on retry").unwrap();
+    assert_eq!(summary2.stop_reason, StopReason::Done);
+    assert_eq!(summary2.clicks, 2);
+}
+
+#[test]
+fn f7_reappearing_popup_closed_at_most_once_more_then_ignored() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 100.0,
+        y: 50.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results_and_popup("wait", "nothing to click", 0.1, 0.9),
+        make_choice_response_with_results_and_popup("dismiss popup", "關閉彈窗", 0.2, 0.9),
+        make_box_response_with_closeish(0.80, 0.05, 0.90, 0.15, 0.90, 0.95),
+        make_choice_response_with_results_and_popup("dismiss popup", "關閉彈窗", 0.3, 0.9),
+        make_box_response_with_closeish(0.81, 0.06, 0.91, 0.16, 0.88, 0.95),
+        make_choice_response_with_results_and_popup("done", "nothing to click", 0.9, 0.9),
+    ]);
+
+    let decider = VisionDecider::new(backend, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage);
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_flights_preset(false)
+        .with_start_url(Some("https://www.accupass.com".to_string()));
+
+    let summary = agent.run("Ignore popup after closing reappearance once").unwrap();
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.clicks, 2);
+    assert_eq!(agent.decider().closed_popups().len(), 1);
+    assert_eq!(agent.decider().closed_popups()[0].count, 2);
+
+    let reqs = agent.decider().backend().requests.borrow();
+    match reqs[1].questions.get("kind").unwrap() {
+        Question::Choice { criteria, .. } => assert!(criteria.contains_key("dismiss popup")),
+        _ => panic!("Expected kind choice"),
+    }
+    match reqs[3].questions.get("kind").unwrap() {
+        Question::Choice { criteria, .. } => assert!(criteria.contains_key("dismiss popup")),
+        _ => panic!("Expected kind choice"),
+    }
+    match reqs[5].questions.get("kind").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(
+                !criteria.contains_key("dismiss popup"),
+                "dismiss popup must not be offered after closing reappearing popup once"
+            );
+        }
+        _ => panic!("Expected kind choice"),
+    }
+    match reqs[5].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(
+                !criteria.contains_key("關閉彈窗"),
+                "關閉彈窗 must not be offered after closing reappearing popup once"
+            );
+        }
+        _ => panic!("Expected target choice"),
+    }
+}
+
 
 
 

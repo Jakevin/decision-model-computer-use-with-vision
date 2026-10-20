@@ -29,6 +29,52 @@ pub const POPUP_COOKIE_REASK_DESCRIPTIONS: &[&str] = &[
     POPUP_REASK_AGREE_DESC,
     POPUP_REASK_COOKIE_CLOSE_X_DESC,
 ];
+pub const EVENT_PAGE_REGISTER_DESC: &str = "立即報名 或 購票 或 報名 按鈕";
+pub const EVENT_PAGE_TICKET_DESC: &str = "票種列表中第一列或價格最低的票種選項";
+pub const FOOTER_QUESTION_INSTRUCTIONS: &str = "頁面底部的頁尾區塊（關於我們/客服中心）";
+pub const FOOTER_DETECTED_THRESHOLD: f64 = 0.5;
+pub const CARD_LINK_RETRY_TITLE_DESC: &str = "活動卡片的標題文字連結";
+pub const CARD_LINK_RETRY_IMAGE_DESC: &str = "活動卡片的圖片";
+pub const CARD_LINK_RETRY_DESCRIPTIONS: &[&str] = &[
+    CARD_LINK_RETRY_TITLE_DESC,
+    CARD_LINK_RETRY_IMAGE_DESC,
+];
+pub const MAX_POPUP_CLOSE_COUNT: usize = 2;
+pub const POPUP_LOCATION_PROXIMITY_FRAC: f64 = 0.15;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScrollDirection {
+    #[serde(rename = "down")]
+    Down,
+    #[serde(rename = "up")]
+    Up,
+}
+
+impl Default for ScrollDirection {
+    fn default() -> Self {
+        Self::Down
+    }
+}
+
+impl ScrollDirection {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Down => "down",
+            Self::Up => "up",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClosedPopupMemory {
+    pub description: String,
+    pub center_frac: Option<(f64, f64)>,
+    pub count: usize,
+}
+
+pub fn is_event_page_url(url: Option<&str>) -> bool {
+    url.map(|u| u.contains("/event/")).unwrap_or(false)
+}
 pub const RESULTS_QUESTION_INSTRUCTIONS: &str =
     "Does the image show a Google Flights results list with flight prices?";
 pub const CHECKOUT_QUESTION_INSTRUCTIONS: &str =
@@ -419,6 +465,8 @@ pub struct Decision {
     pub sensitive_noul: Option<f64>,
     pub closeish_noul: Option<f64>,
     pub popup_present_noul: Option<f64>,
+    #[serde(default)]
+    pub footer_noul: Option<f64>,
 }
 
 #[derive(Debug, Error)]
@@ -644,6 +692,9 @@ pub struct VisionDecider<B: DecisionBackend> {
     requests_sent: AtomicUsize,
     images_sent: AtomicUsize,
     last_popup_present: std::sync::Mutex<Option<f64>>,
+    current_url: std::sync::Mutex<Option<String>>,
+    scroll_direction: std::sync::Mutex<ScrollDirection>,
+    closed_popups: std::sync::Mutex<Vec<ClosedPopupMemory>>,
 }
 
 impl<B: DecisionBackend> VisionDecider<B> {
@@ -658,7 +709,109 @@ impl<B: DecisionBackend> VisionDecider<B> {
             requests_sent: AtomicUsize::new(0),
             images_sent: AtomicUsize::new(0),
             last_popup_present: std::sync::Mutex::new(None),
+            current_url: std::sync::Mutex::new(None),
+            scroll_direction: std::sync::Mutex::new(ScrollDirection::Down),
+            closed_popups: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn set_current_url(&self, url: Option<String>) {
+        *self.current_url.lock().unwrap() = url;
+    }
+
+    pub fn current_url(&self) -> Option<String> {
+        self.current_url.lock().unwrap().clone()
+    }
+
+    pub fn is_on_event_page(&self) -> bool {
+        let guard = self.current_url.lock().unwrap();
+        is_event_page_url(guard.as_deref())
+    }
+
+    pub fn scroll_direction(&self) -> ScrollDirection {
+        *self.scroll_direction.lock().unwrap()
+    }
+
+    pub fn set_scroll_direction(&self, dir: ScrollDirection) {
+        *self.scroll_direction.lock().unwrap() = dir;
+    }
+
+    pub fn closed_popups(&self) -> Vec<ClosedPopupMemory> {
+        self.closed_popups.lock().unwrap().clone()
+    }
+
+    pub fn record_closed_popup(
+        &self,
+        description: impl Into<String>,
+        center_frac: Option<(f64, f64)>,
+    ) -> usize {
+        let desc = description.into();
+        let mut guard = self.closed_popups.lock().unwrap();
+        for entry in guard.iter_mut() {
+            let loc_match = match (entry.center_frac, center_frac) {
+                (Some((x1, y1)), Some((x2, y2))) => {
+                    (x1 - x2).abs() <= POPUP_LOCATION_PROXIMITY_FRAC
+                        && (y1 - y2).abs() <= POPUP_LOCATION_PROXIMITY_FRAC
+                }
+                _ => false,
+            };
+            if loc_match || entry.description == desc {
+                entry.count += 1;
+                if entry.center_frac.is_none() {
+                    entry.center_frac = center_frac;
+                }
+                return entry.count;
+            }
+        }
+        guard.push(ClosedPopupMemory {
+            description: desc,
+            center_frac,
+            count: 1,
+        });
+        1
+    }
+
+    pub fn is_popup_exhausted(
+        &self,
+        description: &str,
+        center_frac: Option<(f64, f64)>,
+    ) -> bool {
+        let guard = self.closed_popups.lock().unwrap();
+        guard.iter().any(|entry| {
+            if entry.count < MAX_POPUP_CLOSE_COUNT {
+                return false;
+            }
+            let loc_match = match (entry.center_frac, center_frac) {
+                (Some((x1, y1)), Some((x2, y2))) => {
+                    (x1 - x2).abs() <= POPUP_LOCATION_PROXIMITY_FRAC
+                        && (y1 - y2).abs() <= POPUP_LOCATION_PROXIMITY_FRAC
+                }
+                _ => false,
+            };
+            loc_match || entry.description == description
+        })
+    }
+
+    pub fn is_any_popup_exhausted(&self) -> bool {
+        self.closed_popups
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.count >= MAX_POPUP_CLOSE_COUNT)
+    }
+
+    pub fn resolve_card_link_retry_box(
+        &self,
+        state: &str,
+        img: &PreparedImage,
+    ) -> Result<Option<(BoundingBox, f64, Option<f64>)>, DeciderError> {
+        for desc in CARD_LINK_RETRY_DESCRIPTIONS {
+            let (bbox, conf, sens) = self.ask_box(state, img, desc)?;
+            if conf >= LOW_CONFIDENCE_THRESHOLD {
+                return Ok(Some((bbox, conf, sens)));
+            }
+        }
+        Ok(None)
     }
 
     pub fn with_preset(mut self, preset: Preset) -> Self {
@@ -702,20 +855,20 @@ impl<B: DecisionBackend> VisionDecider<B> {
     }
 
     pub fn scroll_target_label(&self) -> &'static str {
-        match self.preset {
-            Some(Preset::EventsZh) => "向下捲動",
-            Some(_) => "scroll down",
-            None => {
-                if self
-                    .targets
-                    .iter()
-                    .any(|t| t.label == "關閉彈窗" || t.label == "活動卡片")
-                {
-                    "向下捲動"
-                } else {
-                    "scroll down"
-                }
-            }
+        let up = self.scroll_direction() == ScrollDirection::Up;
+        let zh = match self.preset {
+            Some(Preset::EventsZh) => true,
+            Some(_) => false,
+            None => self
+                .targets
+                .iter()
+                .any(|t| t.label == "關閉彈窗" || t.label == "活動卡片"),
+        };
+        match (zh, up) {
+            (true, false) => "向下捲動",
+            (true, true) => "向上捲動",
+            (false, false) => "scroll down",
+            (false, true) => "scroll up",
         }
     }
 
@@ -784,8 +937,11 @@ impl<B: DecisionBackend> VisionDecider<B> {
             .lock()
             .unwrap()
             .unwrap_or(0.0);
+        let popup_exhausted = self.is_any_popup_exhausted();
         self.targets.iter().any(|t| {
-            if self.is_popup_close_target(&t.label) && prev_popup_present < POPUP_PRESENT_THRESHOLD {
+            if self.is_popup_close_target(&t.label)
+                && (prev_popup_present < POPUP_PRESENT_THRESHOLD || popup_exhausted)
+            {
                 return false;
             }
             !excluded_targets.iter().any(|ex| ex == &t.label)
@@ -887,7 +1043,8 @@ impl<B: DecisionBackend> VisionDecider<B> {
             .unwrap_or(0.0);
 
         let popup_close = self.popup_close_label();
-        let popup_close_excluded = excluded_targets.iter().any(|ex| ex == popup_close);
+        let popup_close_excluded =
+            excluded_targets.iter().any(|ex| ex == popup_close) || self.is_any_popup_exhausted();
 
         let mut kind_criteria = BTreeMap::new();
         kind_criteria.insert(
@@ -913,10 +1070,12 @@ impl<B: DecisionBackend> VisionDecider<B> {
             "press enter".to_string(),
             Some("Press Return to confirm the current input".to_string()),
         );
-        kind_criteria.insert(
-            "scroll".to_string(),
-            Some("Scroll down the page to reveal more content".to_string()),
-        );
+        let scroll_desc = if self.scroll_direction() == ScrollDirection::Up {
+            "Scroll up the page to reveal content above"
+        } else {
+            "Scroll down the page to reveal more content"
+        };
+        kind_criteria.insert("scroll".to_string(), Some(scroll_desc.to_string()));
         let last_two_are_waits =
             history.len() >= 2 && history.iter().rev().take(2).all(|h| h == "wait");
         if !last_two_are_waits {
@@ -931,8 +1090,11 @@ impl<B: DecisionBackend> VisionDecider<B> {
         );
 
         let mut target_criteria = BTreeMap::new();
+        let popup_exhausted = self.is_any_popup_exhausted();
         for t in &self.targets {
-            if self.is_popup_close_target(&t.label) && prev_popup_present < POPUP_PRESENT_THRESHOLD {
+            if self.is_popup_close_target(&t.label)
+                && (prev_popup_present < POPUP_PRESENT_THRESHOLD || popup_exhausted)
+            {
                 continue;
             }
             if !excluded_targets.iter().any(|ex| ex == &t.label) {
@@ -978,6 +1140,14 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 },
             );
         }
+        if self.preset == Some(Preset::EventsZh) || self.is_on_event_page() {
+            questions.insert(
+                "footer".to_string(),
+                Question::Noul {
+                    instructions: FOOTER_QUESTION_INSTRUCTIONS.to_string(),
+                },
+            );
+        }
 
         let req1 = Request {
             model: self.model.clone(),
@@ -1015,6 +1185,15 @@ impl<B: DecisionBackend> VisionDecider<B> {
         };
         *self.last_popup_present.lock().unwrap() = popup_present_noul;
 
+        let footer_noul = match resp1.answers.get("footer") {
+            Some(Answer::Noul { noul }) => Some(*noul),
+            Some(_) => return Err(DeciderError::UnexpectedAnswerType("footer".to_string())),
+            None => None,
+        };
+        if footer_noul.unwrap_or(0.0) >= FOOTER_DETECTED_THRESHOLD {
+            self.set_scroll_direction(ScrollDirection::Up);
+        }
+
         let action_kind = ActionKind::from_choice(&kind_choice)
             .ok_or_else(|| DeciderError::UnknownActionKind(kind_choice.clone()))?;
 
@@ -1033,6 +1212,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 sensitive_noul: None,
                 closeish_noul: None,
                 popup_present_noul,
+                footer_noul,
             });
         }
 
@@ -1055,6 +1235,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                     sensitive_noul: None,
                     closeish_noul: None,
                     popup_present_noul,
+                    footer_noul,
                 });
             }
 
@@ -1085,7 +1266,41 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 sensitive_noul,
                 closeish_noul: None,
                 popup_present_noul,
+                footer_noul,
             });
+        }
+
+        if action_kind == ActionKind::Scroll && self.is_on_event_page() {
+            for (priority_label, priority_desc) in [
+                ("立即報名按鈕", EVENT_PAGE_REGISTER_DESC),
+                ("票種選項", EVENT_PAGE_TICKET_DESC),
+            ] {
+                let has_target = self.targets.iter().any(|t| t.label == priority_label);
+                let is_excluded = excluded_targets.iter().any(|ex| ex == priority_label);
+                if has_target && !is_excluded {
+                    let (bbox, box_conf, sensitive_noul) =
+                        self.ask_box(&state, img, priority_desc)?;
+                    if box_conf >= LOW_CONFIDENCE_THRESHOLD {
+                        let pt = Some(map_box_center_to_screen_pt(&bbox, img));
+                        return Ok(Decision {
+                            kind: ActionKind::Click,
+                            kind_confidence: kind_conf,
+                            target: Some(priority_label.to_string()),
+                            click_point_screen_pt: pt,
+                            bbox: Some(bbox),
+                            box_confidence: Some(box_conf),
+                            confidence: box_conf,
+                            reasked: true,
+                            text_to_type: None,
+                            results_noul,
+                            sensitive_noul,
+                            closeish_noul: None,
+                            popup_present_noul,
+                            footer_noul,
+                        });
+                    }
+                }
+            }
         }
 
         let text_to_type = if action_kind == ActionKind::Type {
@@ -1120,6 +1335,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
             sensitive_noul: None,
             closeish_noul: None,
             popup_present_noul,
+            footer_noul,
         })
     }
 
@@ -1134,6 +1350,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
             .target
             .clone()
             .unwrap_or_else(|| self.popup_close_label().to_string());
+        let mut matched_desc = tgt.clone();
         let (mut bbox, mut box_conf, mut closeish_noul) =
             self.ask_dismiss_popup_box(state, img, &tgt)?;
         let mut reasked = false;
@@ -1152,6 +1369,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 bbox = b;
                 box_conf = c;
                 closeish_noul = cl.or(closeish_noul);
+                matched_desc = desc.to_string();
                 if box_conf >= LOW_CONFIDENCE_THRESHOLD {
                     break;
                 }
@@ -1180,6 +1398,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                     bbox = mapped_box;
                     box_conf = cc;
                     closeish_noul = cl.or(closeish_noul);
+                    matched_desc = desc.to_string();
                     if box_conf >= LOW_CONFIDENCE_THRESHOLD {
                         break;
                     }
@@ -1187,10 +1406,23 @@ impl<B: DecisionBackend> VisionDecider<B> {
             }
         }
 
-        let valid = box_conf >= LOW_CONFIDENCE_THRESHOLD && is_popup_box_width_ok(&bbox);
+        let mut valid = box_conf >= LOW_CONFIDENCE_THRESHOLD && is_popup_box_width_ok(&bbox);
         if !valid && box_conf >= LOW_CONFIDENCE_THRESHOLD {
             // Reject boxes larger than 15% of window width (never click link or ad body)
             box_conf = 0.0;
+        }
+
+        let center = bbox.center();
+        if valid && self.is_popup_exhausted(&matched_desc, Some(center)) {
+            valid = false;
+            box_conf = 0.0;
+        }
+
+        if valid
+            && closeish_noul.unwrap_or(0.0) >= 0.6
+            && decision.popup_present_noul.unwrap_or(1.0) >= POPUP_PRESENT_THRESHOLD
+        {
+            self.record_closed_popup(matched_desc, Some(center));
         }
 
         let pt = if valid {

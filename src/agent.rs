@@ -2,10 +2,14 @@ use crate::api::DecisionBackend;
 use crate::browser::{Browser, DefaultAllowedBrowser};
 use crate::capture::{changed_fraction, is_changed, CaptureError, Rect, Screen};
 use crate::decider::{
-    compute_excluded_targets, format_state, low_box_conf_exclude_steps, ActionKind, DeciderError,
-    Decision, DoneCondition, VisionDecider, LOW_CONFIDENCE_THRESHOLD, POPUP_PRESENT_THRESHOLD,
+    compute_excluded_targets, format_state, low_box_conf_exclude_steps,
+    map_box_center_to_screen_pt, ActionKind, DeciderError, Decision, DoneCondition,
+    ScrollDirection, VisionDecider, FOOTER_DETECTED_THRESHOLD, LOW_CONFIDENCE_THRESHOLD,
+    POPUP_PRESENT_THRESHOLD,
 };
-use crate::input::{Input, InputError, KeyCode, DEFAULT_SCROLL_DELTA_PX};
+use crate::input::{
+    Input, InputError, KeyCode, DEFAULT_SCROLL_DELTA_PX, DEFAULT_SCROLL_UP_DELTA_PX,
+};
 use crate::logging::RunLogger;
 use crate::privacy::{prepare_image, AuditLog, PreparedImage, PrivacyError};
 use crate::safety::{
@@ -198,6 +202,7 @@ pub struct LowBoxConfEventRecord {
 pub struct ScrollEventRecord {
     pub event: String,
     pub step: usize,
+    pub direction: String,
     pub method: String,
     pub scroll_point: (f64, f64),
     pub focus_click_point: Option<(f64, f64)>,
@@ -594,6 +599,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             }
             sensitive_excluded.retain(|(_, r)| *r > 0);
 
+            self.decider.set_current_url(current_url.clone());
             let no_available_targets = !self.decider.has_available_targets(&excluded_targets);
 
             let mut decision = match self.decider.decide_with_excluded_defer_popup_with_audit(
@@ -774,6 +780,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     }
 
                     if escaped_changed {
+                        self.decider.record_closed_popup("escape", None);
                         consecutive_noop_steps = 0;
                         self.policy.reset_wait();
                         executed = true;
@@ -1207,6 +1214,118 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             if executed && !self.timing.post_action_wait.is_zero() {
                                 thread::sleep(self.timing.post_action_wait);
                             }
+                            if !self.dry_run && tgt == "活動卡片" {
+                                let post_url = self.browser.active_tab_url();
+                                let post_tabs = self.browser.tab_count();
+                                let post_win = self.browser.front_window_id();
+                                let new_tab_or_win = match (initial_tab_count, post_tabs) {
+                                    (Some(init), Some(cur)) => cur > init,
+                                    _ => false,
+                                } || match (&initial_window_id, &post_win) {
+                                    (Some(init), Some(cur)) => cur != init,
+                                    _ => false,
+                                };
+                                let url_changed = post_url != current_url;
+                                if !url_changed && !new_tab_or_win {
+                                    let state = format_state(goal, &history);
+                                    let retry_res = self
+                                        .decider
+                                        .resolve_card_link_retry_box(&state, &prepared);
+                                    let retry_opt = match retry_res {
+                                        Ok(opt) => opt,
+                                        Err(e) => {
+                                            run_err = Some(AgentError::Decider(e));
+                                            break;
+                                        }
+                                    };
+                                    let mut navigated = false;
+                                    if let Some((retry_bbox, _retry_conf, _retry_sens)) = retry_opt
+                                    {
+                                        let retry_pt =
+                                            map_box_center_to_screen_pt(&retry_bbox, &prepared);
+                                        if let Err(e) =
+                                            self.policy.check_click(retry_pt, win_rect)
+                                        {
+                                            let elapsed = step_start.elapsed().as_secs_f64();
+                                            total_step_secs += elapsed;
+                                            steps_completed += 1;
+                                            self.log_step(
+                                                step,
+                                                current_url,
+                                                &decision,
+                                                executed,
+                                                elapsed,
+                                                win_rect,
+                                                &prepared,
+                                                full_screen_size,
+                                            );
+                                            run_err = Some(AgentError::Safety(e));
+                                            break;
+                                        }
+                                        if let Err(reason) =
+                                            self.check_unoccluded_at(step, retry_pt)
+                                        {
+                                            let elapsed = step_start.elapsed().as_secs_f64();
+                                            total_step_secs += elapsed;
+                                            steps_completed += 1;
+                                            self.log_step(
+                                                step,
+                                                current_url,
+                                                &decision,
+                                                executed,
+                                                elapsed,
+                                                win_rect,
+                                                &prepared,
+                                                full_screen_size,
+                                            );
+                                            stop_reason = StopReason::SafetyBlocked(reason);
+                                            break;
+                                        }
+                                        self.input.click(retry_pt.0, retry_pt.1)?;
+                                        clicks += 1;
+                                        last_click_point = Some(retry_pt);
+                                        if !self.timing.post_action_wait.is_zero() {
+                                            thread::sleep(self.timing.post_action_wait);
+                                        }
+                                        let post_retry_url = self.browser.active_tab_url();
+                                        let post_retry_tabs = self.browser.tab_count();
+                                        let post_retry_win = self.browser.front_window_id();
+                                        let retry_new_tab =
+                                            match (initial_tab_count, post_retry_tabs) {
+                                                (Some(init), Some(cur)) => cur > init,
+                                                _ => false,
+                                            } || match (&initial_window_id, &post_retry_win) {
+                                                (Some(init), Some(cur)) => cur != init,
+                                                _ => false,
+                                            };
+                                        navigated =
+                                            post_retry_url != current_url || retry_new_tab;
+                                    }
+                                    if !navigated {
+                                        history.push(format!(
+                                            "click '{}' at ({:.1}, {:.1})",
+                                            tgt, pt.0, pt.1
+                                        ));
+                                        let elapsed = step_start.elapsed().as_secs_f64();
+                                        total_step_secs += elapsed;
+                                        steps_completed += 1;
+                                        self.log_step(
+                                            step,
+                                            current_url,
+                                            &decision,
+                                            executed,
+                                            elapsed,
+                                            win_rect,
+                                            &prepared,
+                                            full_screen_size,
+                                        );
+                                        stop_reason = StopReason::SafetyBlocked(
+                                            "card click did not navigate".to_string(),
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
                             history.push(format!("click '{}' at ({:.1}, {:.1})", tgt, pt.0, pt.1));
                         }
                     }
@@ -1343,16 +1462,23 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         break;
                     }
 
+                    let dir = self.decider.scroll_direction();
+                    let delta_px = match dir {
+                        ScrollDirection::Down => DEFAULT_SCROLL_DELTA_PX,
+                        ScrollDirection::Up => DEFAULT_SCROLL_UP_DELTA_PX,
+                    };
+                    let (fallback_key, fallback_method) = match dir {
+                        ScrollDirection::Down => (KeyCode::PageDown, "pagedown_fallback"),
+                        ScrollDirection::Up => (KeyCode::PageUp, "pageup_fallback"),
+                    };
+
                     let mut method = "wheel".to_string();
                     let mut focus_click_pt: Option<(f64, f64)> = None;
                     let mut screen_changed = false;
 
                     if !self.dry_run {
-                        self.input.scroll_vertical_at(
-                            scroll_pt.0,
-                            scroll_pt.1,
-                            DEFAULT_SCROLL_DELTA_PX,
-                        )?;
+                        self.input
+                            .scroll_vertical_at(scroll_pt.0, scroll_pt.1, delta_px)?;
                         executed = true;
                         if !self.timing.post_action_wait.is_zero() {
                             thread::sleep(self.timing.post_action_wait);
@@ -1360,7 +1486,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         let after_wheel = self.screen.capture()?;
                         screen_changed = is_changed(&full, &after_wheel);
                         if !screen_changed {
-                            // Fall back: safe click on blank space in the page content margin, then Page Down (keycode 121)
+                            // Fall back: safe click on blank space in the page content margin, then Page Down / Page Up
                             let blank_pt = (
                                 win_rect.x + 12.0,
                                 content_top + content_h / 2.0,
@@ -1400,22 +1526,30 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                                 break;
                             }
                             self.input.focus_click(blank_pt.0, blank_pt.1)?;
-                            self.input.key(KeyCode::PageDown)?;
+                            self.input.key(fallback_key)?;
                             self.input.release_modifiers()?;
                             if !self.timing.post_action_wait.is_zero() {
                                 thread::sleep(self.timing.post_action_wait);
                             }
-                            let after_pgdn = self.screen.capture()?;
-                            screen_changed = is_changed(&full, &after_pgdn);
-                            method = "pagedown_fallback".to_string();
+                            let after_pg = self.screen.capture()?;
+                            screen_changed = is_changed(&full, &after_pg);
+                            method = fallback_method.to_string();
                             focus_click_pt = Some(blank_pt);
                         }
+                    }
+
+                    if dir == ScrollDirection::Down
+                        && (!screen_changed
+                            || decision.footer_noul.unwrap_or(0.0) >= FOOTER_DETECTED_THRESHOLD)
+                    {
+                        self.decider.set_scroll_direction(ScrollDirection::Up);
                     }
 
                     if let Some(ref mut logger) = self.logger {
                         let evt = ScrollEventRecord {
                             event: "scroll".to_string(),
                             step,
+                            direction: dir.as_str().to_string(),
                             method,
                             scroll_point: scroll_pt,
                             focus_click_point: focus_click_pt,
@@ -1424,7 +1558,11 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         let _ = logger.log_entry(&evt);
                     }
 
-                    history.push("scroll down".to_string());
+                    let hist_str = match dir {
+                        ScrollDirection::Down => "scroll down",
+                        ScrollDirection::Up => "scroll up",
+                    };
+                    history.push(hist_str.to_string());
                     let elapsed = step_start.elapsed().as_secs_f64();
                     total_step_secs += elapsed;
                     steps_completed += 1;
