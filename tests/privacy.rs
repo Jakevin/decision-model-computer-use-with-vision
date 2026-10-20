@@ -888,3 +888,91 @@ fn click_blocked_when_chrome_loses_frontmost() {
     ));
     assert!(agent.input().clicks.is_empty());
 }
+
+#[test]
+fn previous_target_and_repeated_target_excluded_from_criteria() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+
+    // Step 0: click "trip type dropdown" (req 0 = choice, req 1 = box)
+    // Step 1: click "one way option" (req 2 = choice -> must omit "trip type dropdown", req 3 = box)
+    // Step 2: click "trip type dropdown" again (req 4 = choice -> omits "one way option", req 5 = box)
+    // Step 3: scroll (req 6 = choice -> "trip type dropdown" now clicked 2x in last 3 steps, so excluded for next 3 steps: steps 3, 4, 5!)
+    // Step 4: scroll (req 7 = choice -> "trip type dropdown" still excluded)
+    // Step 5: done (req 8 = choice -> "trip type dropdown" still excluded)
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results("click", "trip type dropdown", 0.1),
+        make_box_response(0.4, 0.4, 0.6, 0.6, 0.95),
+        make_choice_response_with_results("click", "one way option", 0.1),
+        make_box_response(0.4, 0.4, 0.6, 0.6, 0.95),
+        make_choice_response_with_results("click", "trip type dropdown", 0.1),
+        make_box_response(0.4, 0.4, 0.6, 0.6, 0.95),
+        make_choice_response_with_results("scroll", "nothing to click", 0.1),
+        make_choice_response_with_results("scroll", "nothing to click", 0.1),
+        make_choice_response_with_results("done", "nothing to click", 0.7),
+    ]);
+
+    let decider = VisionDecider::new(
+        backend,
+        vec![
+            TargetSpec::new("trip type dropdown", None),
+            TargetSpec::new("one way option", None),
+            TargetSpec::new("origin field", None),
+        ],
+    );
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default());
+    let summary = agent.run("Select one way").unwrap();
+    assert_eq!(summary.stop_reason, StopReason::Done);
+
+    let reqs = agent.decider().backend().requests.borrow();
+
+    // Step 1 choice request (reqs[2]): must omit "trip type dropdown" and include step-order hint in state
+    assert!(reqs[2]
+        .state
+        .contains("Targets already clicked: trip type dropdown"));
+    match reqs[2].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("trip type dropdown"));
+            assert!(criteria.contains_key("one way option"));
+            assert!(criteria.contains_key("origin field"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+
+    // Step 2 choice request (reqs[4]): must omit "one way option"
+    assert!(reqs[4]
+        .state
+        .contains("Targets already clicked: trip type dropdown -> one way option"));
+    match reqs[4].questions.get("target").unwrap() {
+        Question::Choice { criteria, .. } => {
+            assert!(!criteria.contains_key("one way option"));
+            assert!(criteria.contains_key("trip type dropdown"));
+        }
+        _ => panic!("Expected target choice question"),
+    }
+
+    // Steps 3, 4, 5 choice requests (reqs[6], reqs[7], reqs[8]): "trip type dropdown" excluded for 3 steps
+    for idx in [6usize, 7, 8] {
+        match reqs[idx].questions.get("target").unwrap() {
+            Question::Choice { criteria, .. } => {
+                assert!(
+                    !criteria.contains_key("trip type dropdown"),
+                    "trip type dropdown should be excluded at request index {}",
+                    idx
+                );
+            }
+            _ => panic!("Expected target choice question"),
+        }
+    }
+}

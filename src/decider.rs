@@ -110,6 +110,62 @@ pub fn map_box_center_to_screen_pt(bbox: &BoundingBox, img: &PreparedImage) -> (
     (screen_x_px / scale, screen_y_px / scale)
 }
 
+pub fn extract_clicked_target(history_entry: &str) -> Option<String> {
+    if let Some(rest) = history_entry.strip_prefix("click '") {
+        let end = rest.find('\'')?;
+        return Some(rest[..end].to_string());
+    }
+    if let Some(pos) = history_entry.find("' into ") {
+        if history_entry.starts_with("clicked and typed '") {
+            return Some(history_entry[pos + 7..].trim().to_string());
+        }
+    }
+    None
+}
+
+pub fn clicked_targets_from_history(history: &[String]) -> Vec<String> {
+    history
+        .iter()
+        .filter_map(|h| extract_clicked_target(h))
+        .collect()
+}
+
+pub fn compute_excluded_targets(step_clicks: &[Option<String>]) -> Vec<String> {
+    let mut excluded = Vec::new();
+    let n = step_clicks.len();
+    if n == 0 {
+        return excluded;
+    }
+
+    // (1) Target clicked in the immediately previous step
+    if let Some(Some(prev)) = step_clicks.last() {
+        excluded.push(prev.clone());
+    }
+
+    // (3) If the same target would be clicked 3 times within the last 5 steps
+    // (or was triggered within the last 3 steps), exclude it for 3 steps.
+    for offset in 0..3 {
+        if n < offset {
+            break;
+        }
+        let end = n - offset;
+        let start = end.saturating_sub(4);
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for item in &step_clicks[start..end] {
+            if let Some(ref t) = item {
+                *counts.entry(t.as_str()).or_insert(0) += 1;
+            }
+        }
+        for (t, count) in counts {
+            if count >= 2 && !excluded.iter().any(|e| e == t) {
+                excluded.push(t.to_string());
+            }
+        }
+    }
+
+    excluded
+}
+
 pub fn format_state(goal: &str, history: &[String]) -> String {
     let recent: Vec<&String> = history
         .iter()
@@ -119,8 +175,17 @@ pub fn format_state(goal: &str, history: &[String]) -> String {
         .into_iter()
         .rev()
         .collect();
+    let clicked = clicked_targets_from_history(history);
+    let clicked_str = if clicked.is_empty() {
+        "(none)".to_string()
+    } else {
+        clicked.join(" -> ")
+    };
     if recent.is_empty() {
-        format!("Goal: {}\nHistory: (none)", goal)
+        format!(
+            "Goal: {}\nTargets already clicked: {}\nHistory: (none)",
+            goal, clicked_str
+        )
     } else {
         let joined = recent
             .iter()
@@ -128,7 +193,10 @@ pub fn format_state(goal: &str, history: &[String]) -> String {
             .map(|(i, h)| format!("{}. {}", i + 1, h))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("Goal: {}\nHistory:\n{}", goal, joined)
+        format!(
+            "Goal: {}\nTargets already clicked: {}\nHistory:\n{}",
+            goal, clicked_str, joined
+        )
     }
 }
 
@@ -224,6 +292,19 @@ impl<B: DecisionBackend> VisionDecider<B> {
         history: &[String],
         img: &PreparedImage,
     ) -> Result<Decision, DeciderError> {
+        let step_clicks: Vec<Option<String>> =
+            history.iter().map(|h| extract_clicked_target(h)).collect();
+        let auto_excluded = compute_excluded_targets(&step_clicks);
+        self.decide_with_excluded(goal, history, img, &auto_excluded)
+    }
+
+    pub fn decide_with_excluded(
+        &self,
+        goal: &str,
+        history: &[String],
+        img: &PreparedImage,
+        excluded_targets: &[String],
+    ) -> Result<Decision, DeciderError> {
         let state = format_state(goal, history);
         let active_fill_target = pending_fill_target(history, &self.type_values);
 
@@ -257,7 +338,9 @@ impl<B: DecisionBackend> VisionDecider<B> {
 
         let mut target_criteria = BTreeMap::new();
         for t in &self.targets {
-            target_criteria.insert(t.label.clone(), t.description.clone());
+            if !excluded_targets.iter().any(|ex| ex == &t.label) {
+                target_criteria.insert(t.label.clone(), t.description.clone());
+            }
         }
         target_criteria.insert(
             NOTHING_TO_CLICK.to_string(),

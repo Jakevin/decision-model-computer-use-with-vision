@@ -1,7 +1,9 @@
 use crate::api::DecisionBackend;
 use crate::browser::{Browser, DefaultAllowedBrowser};
 use crate::capture::{CaptureError, Rect, Screen};
-use crate::decider::{ActionKind, DeciderError, Decision, VisionDecider};
+use crate::decider::{
+    compute_excluded_targets, ActionKind, DeciderError, Decision, VisionDecider,
+};
 use crate::input::{Input, InputError, KeyCode};
 use crate::logging::RunLogger;
 use crate::privacy::{prepare_image, AuditLog, PreparedImage, PrivacyError};
@@ -242,6 +244,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         let mut steps_completed = 0usize;
         let mut all_images_cropped = true;
         let mut consecutive_results_high = 0usize;
+        let mut step_clicks: Vec<Option<String>> = Vec::new();
 
         if let Some(ref url) = self.start_url {
             let _ = self.browser.activate_chrome();
@@ -324,7 +327,10 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             self.audit_log
                 .record(&prepared, format!("step_{}_decision", step));
 
-            let decision = self.decider.decide(goal, &history, &prepared)?;
+            let excluded_targets = compute_excluded_targets(&step_clicks);
+            let decision =
+                self.decider
+                    .decide_with_excluded(goal, &history, &prepared, &excluded_targets)?;
 
             if let Some(ref target_label) = decision.target {
                 if let Err(e) = self.policy.check_target(target_label) {
@@ -358,6 +364,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             }
 
             let mut executed = false;
+            let mut clicked_this_step: Option<String> = None;
 
             match decision.kind {
                 ActionKind::Done => {
@@ -441,6 +448,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             executed = true;
                         }
                         clicks += 1;
+                        clicked_this_step = Some(tgt.to_string());
 
                         if let Some(val) = fill_val {
                             if !self.dry_run {
@@ -541,6 +549,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     );
                 }
             }
+            step_clicks.push(clicked_this_step);
         }
 
         let avg_seconds_per_step = if steps_completed > 0 {
