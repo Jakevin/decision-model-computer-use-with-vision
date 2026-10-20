@@ -56,6 +56,45 @@ pub fn select_main_window(windows: &[WinInfo]) -> Option<Rect> {
     })
 }
 
+pub fn select_topmost_app_at(windows: &[WinInfo], x_pt: f64, y_pt: f64) -> Option<String> {
+    for w in windows {
+        if w.is_minimized || w.width <= 1.0 || w.height <= 1.0 {
+            continue;
+        }
+        let app = w.app_name.trim();
+        if app.is_empty() || app == "Window Server" || app == "Dock" {
+            continue;
+        }
+        if x_pt >= w.x && x_pt <= w.x + w.width && y_pt >= w.y && y_pt <= w.y + w.height {
+            return Some(app.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+pub fn topmost_app_at(x_pt: f64, y_pt: f64) -> Option<String> {
+    let windows = xcap::Window::all().ok()?;
+    let infos: Vec<WinInfo> = windows
+        .into_iter()
+        .map(|win| WinInfo {
+            app_name: win.app_name().unwrap_or_default(),
+            title: win.title().unwrap_or_default(),
+            is_minimized: win.is_minimized().unwrap_or(false),
+            x: win.x().unwrap_or(0) as f64,
+            y: win.y().unwrap_or(0) as f64,
+            width: win.width().unwrap_or(0) as f64,
+            height: win.height().unwrap_or(0) as f64,
+        })
+        .collect();
+    select_topmost_app_at(&infos, x_pt, y_pt)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn topmost_app_at(_x_pt: f64, _y_pt: f64) -> Option<String> {
+    None
+}
+
 #[derive(Debug, Error)]
 pub enum CaptureError {
     #[error("No primary monitor found")]
@@ -69,6 +108,9 @@ pub trait Screen {
     fn chrome_window_rect(&self) -> Option<Rect>;
     fn scale_factor(&self) -> f64 {
         2.0
+    }
+    fn topmost_app_at(&self, _x_pt: f64, _y_pt: f64) -> Option<String> {
+        Some("Google Chrome".to_string())
     }
 }
 
@@ -143,6 +185,10 @@ impl Screen for MacScreen {
             }
         }
         2.0
+    }
+
+    fn topmost_app_at(&self, x_pt: f64, y_pt: f64) -> Option<String> {
+        topmost_app_at(x_pt, y_pt)
     }
 }
 

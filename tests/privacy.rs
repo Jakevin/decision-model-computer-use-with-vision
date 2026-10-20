@@ -115,6 +115,7 @@ struct SequenceBrowser {
     urls: RefCell<VecDeque<Option<String>>>,
     set_urls: Vec<String>,
     activated: usize,
+    back_calls: usize,
 }
 
 impl SequenceBrowser {
@@ -123,6 +124,7 @@ impl SequenceBrowser {
             urls: RefCell::new(VecDeque::from(urls)),
             set_urls: Vec::new(),
             activated: 0,
+            back_calls: 0,
         }
     }
 }
@@ -139,6 +141,11 @@ impl decision_cu::browser::Browser for SequenceBrowser {
 
     fn activate_chrome(&mut self) -> Result<(), decision_cu::browser::BrowserError> {
         self.activated += 1;
+        Ok(())
+    }
+
+    fn go_back(&mut self) -> Result<(), decision_cu::browser::BrowserError> {
+        self.back_calls += 1;
         Ok(())
     }
 }
@@ -881,12 +888,151 @@ fn click_blocked_when_chrome_loses_frontmost() {
 
     let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
         .with_browser(browser);
-    let err = agent.run("Click search").unwrap_err();
-    assert!(matches!(
-        err,
-        AgentError::Safety(SafetyError::NotFrontmost)
-    ));
+    let summary = agent.run("Click search").unwrap();
+    assert_eq!(
+        summary.stop_reason,
+        StopReason::SafetyBlocked("Chrome occluded by Slack".to_string())
+    );
     assert!(agent.input().clicks.is_empty());
+}
+
+struct OccludedScreen {
+    img: RgbaImage,
+    rect: Option<Rect>,
+    scale: f64,
+    topmost_app: String,
+}
+
+impl Screen for OccludedScreen {
+    fn capture(&self) -> Result<RgbaImage, CaptureError> {
+        Ok(self.img.clone())
+    }
+
+    fn chrome_window_rect(&self) -> Option<Rect> {
+        self.rect
+    }
+
+    fn scale_factor(&self) -> f64 {
+        self.scale
+    }
+
+    fn topmost_app_at(&self, _x_pt: f64, _y_pt: f64) -> Option<String> {
+        Some(self.topmost_app.clone())
+    }
+}
+
+#[test]
+fn occluded_click_blocked_with_no_input_events_and_logs_occluded() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = OccludedScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+        topmost_app: "iTerm2".to_string(),
+    };
+    let backend = MockBackend::new(vec![
+        make_choice_response_with_results("click", "origin field", 0.1),
+        make_box_response(0.4, 0.4, 0.6, 0.6, 0.95),
+    ]);
+    let mut fills = BTreeMap::new();
+    fills.insert("origin field".to_string(), "Osaka".to_string());
+    let decider = VisionDecider::new(
+        backend,
+        vec![TargetSpec::new("origin field", None)],
+    )
+    .with_type_values(fills);
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_occluded");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_logger(logger);
+    let summary = agent.run("Search flights").unwrap();
+
+    assert_eq!(
+        summary.stop_reason,
+        StopReason::SafetyBlocked("Chrome occluded by iTerm2".to_string())
+    );
+    let s_json = summary.to_summary_json();
+    assert_eq!(s_json.status, "blocked");
+    assert_eq!(s_json.reason, "Chrome occluded by iTerm2");
+    assert!(agent.input().clicks.is_empty());
+    assert_eq!(agent.input().select_alls, 0);
+    assert!(agent.input().typed.is_empty());
+    assert!(agent.input().keys.is_empty());
+
+    let log_str = std::fs::read_to_string(&steps_path).unwrap();
+    assert!(log_str.contains("\"occluded\""));
+    assert!(log_str.contains("\"iTerm2\""));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn explore_url_goes_back_sends_nothing_and_adds_history_hint() {
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let screen = MockScreen {
+        img,
+        rect: Some(window),
+        scale: 2.0,
+    };
+    // Only 1 response needed because step 0 is on /travel/explore (sends nothing, goes back)
+    // and step 1 is back on /travel/flights
+    let backend = MockBackend::new(vec![make_choice_response_with_results(
+        "done",
+        "nothing to click",
+        0.7,
+    )]);
+    let decider = VisionDecider::new(
+        backend,
+        vec![TargetSpec::new("search button", None)],
+    );
+    let browser = SequenceBrowser::new(vec![
+        Some("https://www.google.com/travel/explore?tfs=abc".to_string()),
+        Some("https://www.google.com/travel/flights".to_string()),
+    ]);
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_explore_back");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let logger = RunLogger::new_in_dir(&temp_dir, None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_browser(browser)
+        .with_logger(logger);
+    let summary = agent.run("Find flights").unwrap();
+
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.requests_sent, 1);
+    assert_eq!(summary.images_sent, 1);
+    assert_eq!(agent.browser().back_calls, 1);
+    assert_eq!(
+        summary.history[0],
+        "search went to Explore page; set destination and date before searching"
+    );
+
+    let reqs = agent.decider().backend().requests.borrow();
+    assert_eq!(reqs.len(), 1);
+    assert!(reqs[0]
+        .state
+        .contains("search went to Explore page; set destination and date before searching"));
+
+    let log_str = std::fs::read_to_string(&steps_path).unwrap();
+    assert!(log_str.contains("\"explore_back\""));
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 #[test]

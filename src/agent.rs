@@ -115,6 +115,14 @@ pub struct TabEventRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OccludedEventRecord {
+    pub event: String,
+    pub step: usize,
+    pub app: String,
+    pub point: (f64, f64),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSummaryJson {
     pub status: String,
     pub reason: String,
@@ -287,6 +295,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         let mut all_images_cropped = true;
         let mut consecutive_results_high = 0usize;
         let mut step_clicks: Vec<Option<String>> = Vec::new();
+        let mut last_click_point: Option<(f64, f64)> = None;
 
         if let Some(ref url) = self.start_url {
             let _ = self.browser.activate_chrome();
@@ -320,6 +329,40 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
 
             // Read active tab URL before capture
             let current_url = self.browser.active_tab_url();
+            if current_url
+                .as_deref()
+                .map(|u| u.trim().starts_with("https://www.google.com/travel/explore"))
+                .unwrap_or(false)
+            {
+                tab_events += 1;
+                let _ = self.browser.go_back();
+                if !self.timing.post_action_wait.is_zero() {
+                    thread::sleep(self.timing.post_action_wait);
+                }
+                if let Some(ref mut logger) = self.logger {
+                    let evt = TabEventRecord {
+                        event: "explore_back".to_string(),
+                        step,
+                        url: current_url.clone(),
+                        restored_to: Some("back".to_string()),
+                        tab_events,
+                    };
+                    let _ = logger.log_entry(&evt);
+                }
+                history.push(
+                    "search went to Explore page; set destination and date before searching"
+                        .to_string(),
+                );
+                if tab_events > MAX_TAB_EVENTS {
+                    stop_reason = StopReason::SafetyBlocked(format!(
+                        "Tab URL off allowed prefix more than {} times (last URL: {:?})",
+                        MAX_TAB_EVENTS, current_url
+                    ));
+                    break;
+                }
+                continue;
+            }
+
             let url_allowed = current_url
                 .as_deref()
                 .map(|u| self.policy.check_url(u).is_ok())
@@ -475,8 +518,9 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     self.policy.reset_wait();
                     if let Some(pt) = decision.click_point_screen_pt {
                         self.policy.check_click(pt, win_rect)?;
-                        if !self.browser.is_chrome_frontmost() {
-                            return Err(AgentError::Safety(SafetyError::NotFrontmost));
+                        if let Err(reason) = self.check_unoccluded_at(step, pt) {
+                            stop_reason = StopReason::SafetyBlocked(reason);
+                            break;
                         }
                         let tgt = decision.target.as_deref().unwrap_or("unknown");
                         let fill_val = self.decider.fill_for(tgt).map(|s| s.to_string());
@@ -493,12 +537,19 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         }
                         clicks += 1;
                         clicked_this_step = Some(tgt.to_string());
+                        last_click_point = Some(pt);
 
                         if let Some(val) = fill_val {
                             if !self.dry_run {
                                 if !self.timing.before_fill_wait.is_zero() {
                                     thread::sleep(self.timing.before_fill_wait);
                                 }
+                            }
+                            if let Err(reason) = self.check_unoccluded_at(step, pt) {
+                                stop_reason = StopReason::SafetyBlocked(reason);
+                                break;
+                            }
+                            if !self.dry_run {
                                 self.input.select_all()?;
                                 self.input.type_text(&val)?;
                                 self.input.release_modifiers()?;
@@ -540,6 +591,14 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     if is_sensitive_text(text) {
                         return Err(AgentError::Safety(SafetyError::SensitiveTextBlocked));
                     }
+                    let check_pt = last_click_point.unwrap_or((
+                        win_rect.x + win_rect.width / 2.0,
+                        win_rect.y + win_rect.height / 2.0,
+                    ));
+                    if let Err(reason) = self.check_unoccluded_at(step, check_pt) {
+                        stop_reason = StopReason::SafetyBlocked(reason);
+                        break;
+                    }
                     if !self.dry_run && !text.is_empty() {
                         self.input.type_text(text)?;
                         self.input.release_modifiers()?;
@@ -563,6 +622,14 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                 }
                 ActionKind::PressEnter => {
                     self.policy.reset_wait();
+                    let check_pt = last_click_point.unwrap_or((
+                        win_rect.x + win_rect.width / 2.0,
+                        win_rect.y + win_rect.height / 2.0,
+                    ));
+                    if let Err(reason) = self.check_unoccluded_at(step, check_pt) {
+                        stop_reason = StopReason::SafetyBlocked(reason);
+                        break;
+                    }
                     if !self.dry_run {
                         self.input.key(KeyCode::Return)?;
                         self.input.release_modifiers()?;
@@ -638,6 +705,37 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         }
 
         Ok(summary)
+    }
+
+    fn check_unoccluded_at(&mut self, step: usize, pt: (f64, f64)) -> Result<(), String> {
+        let topmost = self.screen.topmost_app_at(pt.0, pt.1);
+        let frontmost = self.browser.frontmost_app();
+        let top_ok = topmost
+            .as_deref()
+            .map(|a| a.trim() == "Google Chrome")
+            .unwrap_or(false);
+        let front_ok = frontmost
+            .as_deref()
+            .map(|a| a.trim() == "Google Chrome")
+            .unwrap_or(false);
+        if top_ok && front_ok {
+            return Ok(());
+        }
+        let app = if !top_ok {
+            topmost.unwrap_or_else(|| frontmost.unwrap_or_else(|| "unknown".to_string()))
+        } else {
+            frontmost.unwrap_or_else(|| "unknown".to_string())
+        };
+        if let Some(ref mut logger) = self.logger {
+            let evt = OccludedEventRecord {
+                event: "occluded".to_string(),
+                step,
+                app: app.clone(),
+                point: pt,
+            };
+            let _ = logger.log_entry(&evt);
+        }
+        Err(format!("Chrome occluded by {}", app))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -22,6 +22,9 @@ pub trait Browser {
             .map(|n| n.trim() == "Google Chrome")
             .unwrap_or(false)
     }
+    fn go_back(&mut self) -> Result<(), BrowserError> {
+        Ok(())
+    }
 }
 
 impl<T: Browser + ?Sized> Browser for Box<T> {
@@ -44,6 +47,10 @@ impl<T: Browser + ?Sized> Browser for Box<T> {
     fn is_chrome_frontmost(&self) -> bool {
         (**self).is_chrome_frontmost()
     }
+
+    fn go_back(&mut self) -> Result<(), BrowserError> {
+        (**self).go_back()
+    }
 }
 
 impl<T: Browser + ?Sized> Browser for &mut T {
@@ -65,6 +72,10 @@ impl<T: Browser + ?Sized> Browser for &mut T {
 
     fn is_chrome_frontmost(&self) -> bool {
         (**self).is_chrome_frontmost()
+    }
+
+    fn go_back(&mut self) -> Result<(), BrowserError> {
+        (**self).go_back()
     }
 }
 
@@ -144,6 +155,21 @@ pub fn is_chrome_frontmost() -> bool {
         .unwrap_or(false)
 }
 
+pub fn go_back() -> Result<(), BrowserError> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"Google Chrome\" to go back active tab of front window")
+        .output()
+        .map_err(|e| BrowserError::CommandFailed(e.to_string()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(BrowserError::CommandFailed(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ))
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MacBrowser;
 
@@ -168,6 +194,10 @@ impl Browser for MacBrowser {
 
     fn frontmost_app(&self) -> Option<String> {
         frontmost_app()
+    }
+
+    fn go_back(&mut self) -> Result<(), BrowserError> {
+        go_back()
     }
 }
 
