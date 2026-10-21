@@ -94,11 +94,18 @@ impl DecisionBackend for MockBackend {
 #[derive(Default)]
 struct MockInput {
     clicks: Vec<(f64, f64)>,
+    focus_clicks: Vec<(f64, f64)>,
+    keys: Vec<KeyCode>,
+    scrolls: Vec<i32>,
 }
 
 impl Input for MockInput {
     fn click(&mut self, x: f64, y: f64) -> Result<(), InputError> {
         self.clicks.push((x, y));
+        Ok(())
+    }
+    fn focus_click(&mut self, x: f64, y: f64) -> Result<(), InputError> {
+        self.focus_clicks.push((x, y));
         Ok(())
     }
     fn move_mouse(&mut self, _x: f64, _y: f64) -> Result<(), InputError> {
@@ -107,10 +114,12 @@ impl Input for MockInput {
     fn type_text(&mut self, _text: &str) -> Result<(), InputError> {
         Ok(())
     }
-    fn key(&mut self, _key: KeyCode) -> Result<(), InputError> {
+    fn key(&mut self, key: KeyCode) -> Result<(), InputError> {
+        self.keys.push(key);
         Ok(())
     }
-    fn scroll_vertical(&mut self, _amount: i32) -> Result<(), InputError> {
+    fn scroll_vertical(&mut self, amount: i32) -> Result<(), InputError> {
+        self.scrolls.push(amount);
         Ok(())
     }
     fn release_modifiers(&mut self) -> Result<(), InputError> {
@@ -295,12 +304,9 @@ fn a_no_harness_file_produces_identical_decisions_to_before() {
         decider_missing_harness.requests_sent()
     );
 
-    // Baseline flag --no-self-fix skips the self_fix probe on low confidence
+    // Baseline flag --no-self-fix disables new self-fix probe paths while preserving legacy low-confidence re-ask
     let decider_no_self_fix = VisionDecider::new(
-        MockBackend::new(vec![
-            make_choice_response("click", "search button", 0.1),
-            make_box_response(0.30, 0.30, 0.40, 0.50, 0.12, 0.02),
-        ]),
+        MockBackend::new(responses()),
         targets,
     )
     .with_self_fix(false);
@@ -308,10 +314,10 @@ fn a_no_harness_file_produces_identical_decisions_to_before() {
     let d_baseline = decider_no_self_fix
         .decide("Find flights", &[], &prepared)
         .unwrap();
-    assert!(!d_baseline.reasked);
+    assert!(d_baseline.reasked);
     assert!(d_baseline.self_fix.is_none());
-    assert!(d_baseline.click_point_screen_pt.is_none());
-    assert_eq!(decider_no_self_fix.requests_sent(), 2);
+    assert!(d_baseline.click_point_screen_pt.is_some());
+    assert_eq!(decider_no_self_fix.requests_sent(), 3);
 }
 
 #[test]
@@ -812,4 +818,584 @@ fn g_experience_text_strips_url_query_and_fragment() {
     assert!(!out.contains("frag"));
     assert!(out.contains("https://www.accupass.com/event/abc"));
     assert!(out.contains("https://x.com/p"));
+}
+
+#[test]
+fn h_no_self_fix_runs_legacy_reask_and_page_turn_retry_while_disabling_new_paths() {
+    use decision_cu::api::Question;
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_f10_h");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let exp_dir = temp_dir.join("experience");
+    let store = ExperienceStore::new(&exp_dir);
+
+    // Pre-populate an experience entry to prove it is NOT read or updated when self_fix_enabled=false
+    store
+        .write_entry(
+            "events-zh",
+            "www.accupass.com",
+            &ExperienceEntry {
+                cue: "活動卡片".to_string(),
+                lesson: "經驗庫中的活動卡片提示".to_string(),
+                evidence: "prior win".to_string(),
+                confidence: 0.91,
+                adopted_candidate: "reask".to_string(),
+                uses: 1,
+                wins: 1,
+            },
+        )
+        .unwrap();
+
+    // Configure harness with rewritten description and custom re-ask prompts, plus all 4 candidate kinds
+    let harness = HarnessOverrides {
+        targets: vec![HarnessTargetOverride {
+            label: "活動卡片".to_string(),
+            description: Some("HARNESS_REWRITTEN_DESC".to_string()),
+            reask: vec!["HARNESS_CUSTOM_REASK_PROMPT".to_string()],
+        }],
+        candidate_order: vec![
+            CandidateKind::Reask,
+            CandidateKind::Experience,
+            CandidateKind::Zoom,
+            CandidateKind::Ocr,
+        ],
+        max_extra_requests_per_step: 4,
+    };
+
+    let img_same = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let mut img_changed = img_same.clone();
+    for y in 250..950 {
+        for x in 250..1150 {
+            img_changed.put_pixel(x, y, Rgba([30, 120, 210, 255]));
+        }
+    }
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+
+    // Screen sequence across steps:
+    // Step 0 (click with low initial conf -> legacy reask succeeds):
+    //   capture 1: step 0 initial window capture (img_same)
+    // Step 1 (scroll where wheel does not change screen, PageDown fallback changes screen):
+    //   capture 2: step 1 initial window capture (img_same)
+    //   capture 3: after wheel scroll (img_same -> unchanged, triggers PageDown fallback!)
+    //   capture 4: after PageDown fallback (img_changed -> changed!)
+    // Step 2 (done):
+    //   capture 5: step 2 initial window capture (img_changed)
+    let screen = MockScreen::sequence(
+        vec![
+            img_same.clone(),
+            img_same.clone(),
+            img_same.clone(),
+            img_changed.clone(),
+            img_changed.clone(),
+        ],
+        Some(window),
+        2.0,
+    );
+
+    let backend = MockBackend::new(vec![
+        // Step 0: choice ("click", "活動卡片") + initial low-conf box (0.11)
+        // + legacy card re-ask 1 (0.12) + legacy card re-ask 2 (0.14) + legacy content 2x zoom (0.87)
+        make_choice_response("click", "活動卡片", 0.1),
+        make_box_response(0.30, 0.30, 0.40, 0.40, 0.11, 0.01),
+        make_box_response(0.32, 0.32, 0.42, 0.42, 0.12, 0.01),
+        make_box_response(0.34, 0.34, 0.44, 0.44, 0.14, 0.01),
+        make_box_response(0.45, 0.40, 0.55, 0.60, 0.87, 0.01),
+        // Step 1: choice ("scroll", "nothing to click") -> runs wheel scroll then PageDown retry
+        make_choice_response("scroll", "nothing to click", 0.2),
+        // Step 2: choice ("done", "nothing to click")
+        make_choice_response("done", "nothing to click", 0.95),
+    ]);
+
+    let logger = RunLogger::new_in_dir(&temp_dir.join("logs"), None).unwrap();
+    let steps_path = logger.path().to_path_buf();
+
+    let decider = VisionDecider::new(backend, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_done_condition(DoneCondition::CheckoutPage)
+        .with_harness(harness)
+        .with_experience_store(store.clone())
+        .with_self_fix(false);
+
+    // Experience lookup must return None when self_fix_enabled is false
+    assert!(decider.lookup_experience("活動卡片").is_none());
+
+    // OCR candidates are supplied via FakeOcr, but must NOT be queried when self_fix_enabled=false
+    let ocr = FakeOcr::new(vec![OcrLine::new(
+        "免費講座活動",
+        0.96,
+        0.45,
+        0.40,
+        0.55,
+        0.60,
+    )]);
+
+    let browser = SequenceBrowser::new(vec![
+        Some("https://www.accupass.com/search".to_string()),
+        Some("https://www.accupass.com/search?q=free".to_string()),
+        Some("https://www.accupass.com/search?q=free".to_string()),
+        Some("https://www.accupass.com/search?q=free".to_string()),
+    ]);
+
+    let mut agent = Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+        .with_browser(browser)
+        .with_ocr(ocr)
+        .with_flights_preset(false)
+        .with_start_url(Some("https://www.accupass.com/search".to_string()))
+        .with_logger(logger);
+
+    let summary = agent.run("Find free event").unwrap();
+    assert_eq!(summary.stop_reason, StopReason::Done);
+    assert_eq!(summary.clicks, 1);
+    // 7 requests: 5 in step 0 (choice + initial box + 2 card_primary_reask_descriptions + 1 legacy content 2x zoom),
+    // 1 in step 1 (scroll), 1 in step 2 (done)
+    assert_eq!(summary.requests_sent, 7);
+    assert_eq!(summary.images_sent, 7);
+    assert!(agent.decider().last_self_fix().is_none());
+
+    // Inspect the sent requests to verify:
+    // 1) Legacy card re-ask used card_primary_reask_descriptions("活動卡片") followed by legacy content 2x zoom
+    // 2) Harness rewritten description / reask ("HARNESS_REWRITTEN_DESC", "HARNESS_CUSTOM_REASK_PROMPT") did NOT fire
+    // 3) Experience prompt ("經驗庫中的活動卡片提示") did NOT fire
+    // 4) OCR item choice question ("item") did NOT fire
+    // 5) Only the single legacy step_0_content_2x zoom record was recorded (no extra self-fix zoom requests)
+    let sent_reqs = agent.decider().backend().requests.borrow();
+    assert_eq!(sent_reqs.len(), 7);
+
+    // Request 0: target criteria must use original base description, not HARNESS_REWRITTEN_DESC
+    if let Some(Question::Choice { criteria, .. }) = sent_reqs[0].questions.get("target") {
+        let card_desc = criteria.get("活動卡片").and_then(|d| d.as_deref());
+        assert_eq!(card_desc, Some("列表中顯示日期與標題的即將舉辦活動卡片"));
+    } else {
+        panic!("Expected target choice question in req 0");
+    }
+
+    // Request 1: initial box query for "活動卡片"
+    if let Some(Question::Box { instructions }) = sent_reqs[1].questions.get("target_box") {
+        assert_eq!(instructions, "活動卡片");
+    } else {
+        panic!("Expected initial target_box question in req 1");
+    }
+
+    // Requests 2 & 3: legacy card-specific re-ask descriptions from card_primary_reask_descriptions("活動卡片")
+    if let Some(Question::Box { instructions }) = sent_reqs[2].questions.get("target_box") {
+        assert_eq!(
+            instructions,
+            decision_cu::decider::CARD_REASK_FIRST_CARD_IMAGE_DESC
+        );
+    } else {
+        panic!("Expected card re-ask 1 target_box question in req 2");
+    }
+    if let Some(Question::Box { instructions }) = sent_reqs[3].questions.get("target_box") {
+        assert_eq!(
+            instructions,
+            decision_cu::decider::CARD_REASK_TITLE_TEXT_DESC
+        );
+    } else {
+        panic!("Expected card re-ask 2 target_box question in req 3");
+    }
+
+    // Request 4: legacy content 2x zoom using first card re-ask description
+    if let Some(Question::Box { instructions }) = sent_reqs[4].questions.get("target_box") {
+        assert_eq!(
+            instructions,
+            decision_cu::decider::CARD_REASK_FIRST_CARD_IMAGE_DESC
+        );
+    } else {
+        panic!("Expected legacy content 2x zoom target_box question in req 4");
+    }
+    assert_ne!(
+        sent_reqs[4].images[0], sent_reqs[1].images[0],
+        "Legacy content 2x zoom must send the 2x content crop image"
+    );
+
+    for req in sent_reqs.iter() {
+        assert!(
+            !req.questions.contains_key("item"),
+            "OCR item question must not be sent when self_fix_enabled=false"
+        );
+        for q in req.questions.values() {
+            if let Question::Box { instructions } = q {
+                assert!(!instructions.contains("HARNESS_"));
+                assert!(!instructions.contains("經驗庫中的活動卡片提示"));
+            }
+        }
+    }
+
+    // Verify the legacy step_0_content_2x audit record was recorded and no extra zoom records exist
+    let zoom_records: Vec<_> = agent
+        .audit_log()
+        .records()
+        .iter()
+        .filter(|r| r.purpose.contains("2x"))
+        .collect();
+    assert_eq!(
+        zoom_records.len(),
+        1,
+        "Expected exactly 1 legacy content 2x zoom record, got {:?}",
+        zoom_records
+    );
+    assert_eq!(zoom_records[0].purpose, "step_0_content_2x");
+
+    // Verify legacy popup corner 2x zoom in resolve_dismiss_popup still works when self_fix_enabled=false
+    {
+        use decision_cu::decider::{ActionKind, Decision};
+        use decision_cu::privacy::AuditLog;
+
+        let popup_answers = |conf: f64, closeish: f64| -> Response {
+            let mut answers = BTreeMap::new();
+            answers.insert(
+                "target_box".to_string(),
+                Answer::Box {
+                    bbox: BoundingBox {
+                        top: 0.80,
+                        left: 0.80,
+                        bottom: 0.85,
+                        right: 0.88,
+                    },
+                    confidence: conf,
+                },
+            );
+            answers.insert("closeish".to_string(), Answer::Noul { noul: closeish });
+            Response {
+                answers,
+                model: DEFAULT_MODEL.to_string(),
+                usage: Usage {
+                    input_tokens: 100,
+                    output_tokens: 0,
+                },
+            }
+        };
+        let popup_backend = MockBackend::new(vec![
+            popup_answers(0.05, 0.2), // initial ask
+            popup_answers(0.05, 0.2), // reask 1
+            popup_answers(0.05, 0.2), // reask 2
+            popup_answers(0.05, 0.2), // reask 3
+            popup_answers(0.05, 0.2), // reask 4
+            popup_answers(0.05, 0.2), // reask 5
+            popup_answers(0.05, 0.2), // reask 6
+            popup_answers(0.92, 0.90), // bottom_right_2x corner zoom succeeds!
+        ]);
+        let popup_decider = VisionDecider::new(popup_backend, Preset::EventsZh.default_targets())
+            .with_preset(Preset::EventsZh)
+            .with_self_fix(false);
+        let prepared = prepare_image(&img_same, Some(window), 2.0).unwrap();
+        let mut popup_decision = Decision {
+            kind: ActionKind::DismissPopup,
+            kind_confidence: 0.9,
+            target: Some("關閉彈窗".to_string()),
+            click_point_screen_pt: None,
+            bbox: None,
+            box_confidence: None,
+            confidence: 0.9,
+            reasked: false,
+            text_to_type: None,
+            results_noul: 0.1,
+            sensitive_noul: None,
+            closeish_noul: None,
+            popup_present_noul: Some(0.9),
+            footer_noul: None,
+            login_form_noul: None,
+            click_source: None,
+            ocr_item_text: None,
+            ocr_item_center_frac: None,
+            self_fix: None,
+        };
+        let mut popup_audit = AuditLog::default();
+        popup_decider
+            .resolve_dismiss_popup("Goal", &prepared, &mut popup_decision, Some((&mut popup_audit, 0)))
+            .unwrap();
+        assert!(popup_decision.click_point_screen_pt.is_some());
+        assert!(
+            popup_audit
+                .records()
+                .iter()
+                .any(|r| r.purpose == "step_0_popup_bottom_right_2x"),
+            "Legacy popup corner 2x zoom must still run when self_fix_enabled=false"
+        );
+    }
+
+    // Verify experience store was NOT written/updated (uses is still 1)
+    let persisted = store
+        .load_entry("events-zh", "www.accupass.com", "活動卡片")
+        .unwrap();
+    assert_eq!(persisted.uses, 1);
+    assert_eq!(persisted.wins, 1);
+    assert_eq!(persisted.lesson, "經驗庫中的活動卡片提示");
+
+    // Verify page-turn retry (focus_click + KeyCode::PageDown) ran on step 1 scroll
+    assert_eq!(agent.input().scrolls.len(), 1);
+    assert_eq!(agent.input().focus_clicks.len(), 1);
+    assert!(agent.input().keys.contains(&KeyCode::PageDown));
+
+    let log_str = std::fs::read_to_string(&steps_path).unwrap();
+    assert!(
+        !log_str.contains("\"event\":\"self_fix\""),
+        "self_fix event must not be logged when self_fix_enabled=false"
+    );
+    assert!(
+        log_str.contains("\"method\":\"pagedown_fallback\""),
+        "page-turn fallback must still run when self_fix_enabled=false"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn i_min_ocr_text_chars_rejects_short_digits_and_punctuation_from_experience_store() {
+    use decision_cu::experience::{is_valid_ocr_text, MIN_OCR_TEXT_CHARS};
+
+    assert_eq!(MIN_OCR_TEXT_CHARS, 2);
+
+    // Short (< 2 non-whitespace chars), purely digits, or purely punctuation must be rejected
+    for invalid in [
+        "",
+        "   ",
+        "3",
+        " 3 ",
+        "a",
+        "免",
+        "12",
+        "123",
+        " 2026 ",
+        "０１",
+        "..",
+        "---",
+        "!@#",
+        "「」",
+        "（）",
+        "+-",
+    ] {
+        assert!(
+            !is_valid_ocr_text(invalid),
+            "Expected OCR text {:?} to be rejected",
+            invalid
+        );
+    }
+
+    // Valid multi-char non-digit non-punctuation OCR texts must pass
+    for valid in ["免費", "Go", "NT$0", "立即報名", "10月", " 免費活動 "] {
+        assert!(
+            is_valid_ocr_text(valid),
+            "Expected OCR text {:?} to be accepted",
+            valid
+        );
+    }
+
+    let temp_dir = std::env::temp_dir().join("decision_cu_test_f10_i");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let store = ExperienceStore::new(temp_dir.join("experience"));
+
+    // Direct record_outcome and write_entry must refuse short / digit-only / punctuation-only OCR lessons
+    for bad_lesson in ["3", " 7 ", "12", "..."] {
+        let res = store
+            .record_outcome(
+                "events-zh",
+                "www.accupass.com",
+                "票種選項",
+                bad_lesson,
+                "ocr",
+                0.90,
+                true,
+                Some("step 0 click changed screen"),
+            )
+            .unwrap();
+        assert!(
+            res.is_none(),
+            "Short/invalid OCR lesson {:?} must not be recorded",
+            bad_lesson
+        );
+        assert!(
+            store
+                .load_entry("events-zh", "www.accupass.com", "票種選項")
+                .is_none()
+        );
+
+        let write_res = store.write_entry(
+            "events-zh",
+            "www.accupass.com",
+            &ExperienceEntry {
+                cue: "票種選項".to_string(),
+                lesson: bad_lesson.to_string(),
+                evidence: "step 0 click changed screen".to_string(),
+                confidence: 0.90,
+                adopted_candidate: "ocr".to_string(),
+                uses: 1,
+                wins: 1,
+            },
+        );
+        assert!(write_res.is_err());
+    }
+
+    // End-to-end Agent run where self-fix adopts an OCR candidate with text "3":
+    // click succeeds and URL/screen changes, but "3" must NOT be written to the experience library.
+    let img1 = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let mut img2 = img1.clone();
+    for y in 200..900 {
+        for x in 200..1100 {
+            img2.put_pixel(x, y, Rgba([50, 160, 80, 255]));
+        }
+    }
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+
+    let harness_ocr_only = HarnessOverrides {
+        targets: vec![],
+        candidate_order: vec![CandidateKind::Ocr],
+        max_extra_requests_per_step: 1,
+    };
+
+    {
+        let screen = MockScreen::sequence(vec![img1.clone(), img2.clone()], Some(window), 2.0);
+        let backend = MockBackend::new(vec![
+            make_choice_response("click", "數量加號", 0.1),
+            make_box_response(0.30, 0.30, 0.40, 0.40, 0.10, 0.01),
+            make_item_choice_response("0", 0.92),
+            make_choice_response("done", "nothing to click", 0.95),
+        ]);
+        let decider = VisionDecider::new(backend, Preset::EventsZh.default_targets())
+            .with_preset(Preset::EventsZh)
+            .with_done_condition(DoneCondition::CheckoutPage)
+            .with_harness(harness_ocr_only.clone())
+            .with_experience_store(store.clone());
+        let browser = SequenceBrowser::new(vec![
+            Some("https://www.accupass.com/event/123".to_string()),
+            Some("https://www.accupass.com/event/123?step=2".to_string()),
+        ]);
+        let ocr = FakeOcr::new(vec![OcrLine::new("3", 0.98, 0.45, 0.45, 0.55, 0.55)]);
+        let mut agent =
+            Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+                .with_browser(browser)
+                .with_ocr(ocr)
+                .with_flights_preset(false)
+                .with_start_url(Some("https://www.accupass.com/event/123".to_string()));
+        let summary = agent.run("Select ticket").unwrap();
+        assert_eq!(summary.stop_reason, StopReason::Done);
+        assert!(
+            store
+                .load_entry("events-zh", "www.accupass.com", "數量加號")
+                .is_none(),
+            "OCR text '3' must never be recorded in the experience library"
+        );
+    }
+
+    // Contrast: when OCR candidate has valid text "免費票", it IS recorded in the experience library.
+    {
+        let screen = MockScreen::sequence(vec![img1, img2], Some(window), 2.0);
+        let backend = MockBackend::new(vec![
+            make_choice_response("click", "票種選項", 0.1),
+            make_box_response(0.30, 0.30, 0.40, 0.40, 0.10, 0.01),
+            make_item_choice_response("0", 0.93),
+            make_choice_response("done", "nothing to click", 0.95),
+        ]);
+        let decider = VisionDecider::new(backend, Preset::EventsZh.default_targets())
+            .with_preset(Preset::EventsZh)
+            .with_done_condition(DoneCondition::CheckoutPage)
+            .with_harness(harness_ocr_only)
+            .with_experience_store(store.clone());
+        let browser = SequenceBrowser::new(vec![
+            Some("https://www.accupass.com/event/123".to_string()),
+            Some("https://www.accupass.com/event/123?ticket=free".to_string()),
+        ]);
+        let ocr = FakeOcr::new(vec![OcrLine::new("免費票", 0.98, 0.45, 0.45, 0.55, 0.55)]);
+        let mut agent =
+            Agent::new(screen, decider, MockInput::default(), SafetyPolicy::default())
+                .with_browser(browser)
+                .with_ocr(ocr)
+                .with_flights_preset(false)
+                .with_start_url(Some("https://www.accupass.com/event/123".to_string()));
+        let summary = agent.run("Select free ticket").unwrap();
+        assert_eq!(summary.stop_reason, StopReason::Done);
+        let entry = store
+            .load_entry("events-zh", "www.accupass.com", "票種選項")
+            .expect("Valid OCR text '免費票' should be recorded");
+        assert_eq!(entry.lesson, "免費票");
+        assert_eq!(entry.adopted_candidate, "ocr");
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn j_no_self_fix_non_card_target_runs_label_description_legacy_reask() {
+    use decision_cu::api::Question;
+    use decision_cu::privacy::AuditLog;
+
+    let img = RgbaImage::from_pixel(1600, 1200, Rgba([240, 240, 240, 255]));
+    let window = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    let prepared = prepare_image(&img, Some(window), 2.0).unwrap();
+
+    let harness = HarnessOverrides {
+        targets: vec![HarnessTargetOverride {
+            label: "搜尋或活動分類".to_string(),
+            description: Some("HARNESS_REWRITTEN_DESC".to_string()),
+            reask: vec!["HARNESS_CUSTOM_REASK_PROMPT".to_string()],
+        }],
+        candidate_order: vec![
+            CandidateKind::Reask,
+            CandidateKind::Experience,
+            CandidateKind::Zoom,
+            CandidateKind::Ocr,
+        ],
+        max_extra_requests_per_step: 4,
+    };
+
+    let backend = MockBackend::new(vec![
+        // Initial box query: low confidence (0.11)
+        make_box_response(0.30, 0.30, 0.40, 0.40, 0.11, 0.01),
+        // Legacy non-card re-ask '<label> (<description>)': high confidence (0.88)
+        make_box_response(0.45, 0.40, 0.55, 0.60, 0.88, 0.01),
+    ]);
+
+    let decider = VisionDecider::new(backend, Preset::EventsZh.default_targets())
+        .with_preset(Preset::EventsZh)
+        .with_harness(harness)
+        .with_self_fix(false);
+
+    let mut audit_log = AuditLog::default();
+    let (_bbox, box_conf, _sens, reasked) = decider
+        .resolve_click_box(
+            "Goal: find event",
+            &prepared,
+            "搜尋或活動分類",
+            Some((&mut audit_log, 0)),
+        )
+        .unwrap();
+
+    assert!(reasked);
+    assert!((box_conf - 0.88).abs() < 1e-6);
+    assert!(decider.last_self_fix().is_none());
+    assert!(
+        !audit_log.records().iter().any(|r| r.purpose.contains("2x")),
+        "Non-card legacy re-ask must not trigger content 2x zoom"
+    );
+
+    let sent_reqs = decider.backend().requests.borrow();
+    assert_eq!(sent_reqs.len(), 2);
+    if let Some(Question::Box { instructions }) = sent_reqs[0].questions.get("target_box") {
+        assert_eq!(instructions, "搜尋或活動分類");
+    } else {
+        panic!("Expected initial target_box question in req 0");
+    }
+    if let Some(Question::Box { instructions }) = sent_reqs[1].questions.get("target_box") {
+        assert_eq!(
+            instructions,
+            "搜尋或活動分類 (首頁的活動分類或「近期活動」連結)"
+        );
+    } else {
+        panic!("Expected '<label> (<description>)' legacy re-ask in req 1");
+    }
 }

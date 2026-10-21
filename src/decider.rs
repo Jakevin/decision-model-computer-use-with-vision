@@ -753,6 +753,7 @@ fn pending_fill_target<'a>(
 pub struct VisionDecider<B: DecisionBackend> {
     backend: B,
     model: String,
+    base_targets: Vec<TargetSpec>,
     targets: Vec<TargetSpec>,
     preset: Option<Preset>,
     done_condition: DoneCondition,
@@ -775,9 +776,11 @@ pub struct VisionDecider<B: DecisionBackend> {
 
 impl<B: DecisionBackend> VisionDecider<B> {
     pub fn new(backend: B, targets: Vec<TargetSpec>) -> Self {
+        let base_targets = targets.clone();
         Self {
             backend,
             model: DEFAULT_MODEL.to_string(),
+            base_targets,
             targets,
             preset: None,
             done_condition: DoneCondition::FlightsResults,
@@ -800,7 +803,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
     }
 
     pub fn with_harness(mut self, harness: HarnessOverrides) -> Self {
-        self.targets = harness.apply_to_targets(&self.targets);
+        self.targets = harness.apply_to_targets(&self.base_targets);
         self.harness = Some(harness);
         self
     }
@@ -874,11 +877,17 @@ impl<B: DecisionBackend> VisionDecider<B> {
     }
 
     pub fn lookup_experience(&self, target_label: &str) -> Option<ExperienceEntry> {
+        if !self.self_fix_enabled {
+            return None;
+        }
         let store = self.experience_store.as_ref()?;
         store.lookup(self.preset_str(), &self.current_host(), target_label)
     }
 
     pub fn ocr_candidates_for_self_fix(&self, tgt: &str) -> Vec<OcrLine> {
+        if !self.self_fix_enabled {
+            return Vec::new();
+        }
         let all = self.ocr_candidates();
         if all.is_empty() {
             return Vec::new();
@@ -1222,8 +1231,16 @@ impl<B: DecisionBackend> VisionDecider<B> {
         &self.backend
     }
 
+    fn active_targets(&self) -> &[TargetSpec] {
+        if self.self_fix_enabled {
+            &self.targets
+        } else {
+            &self.base_targets
+        }
+    }
+
     pub fn targets(&self) -> &[TargetSpec] {
-        &self.targets
+        self.active_targets()
     }
 
     pub fn requests_sent(&self) -> usize {
@@ -1244,7 +1261,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
     }
 
     fn find_target_description(&self, label: &str) -> Option<&str> {
-        self.targets
+        self.active_targets()
             .iter()
             .find(|t| t.label == label)
             .and_then(|t| t.description.as_deref())
@@ -1276,7 +1293,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
             .unwrap()
             .unwrap_or(0.0);
         let popup_exhausted = self.is_any_popup_exhausted();
-        self.targets.iter().any(|t| {
+        self.active_targets().iter().any(|t| {
             if self.is_popup_close_target(&t.label)
                 && (prev_popup_present < POPUP_PRESENT_THRESHOLD || popup_exhausted)
             {
@@ -1301,8 +1318,45 @@ impl<B: DecisionBackend> VisionDecider<B> {
         let base_conf = box_conf;
         let mut reasked = false;
 
-        if box_conf < LOW_CONFIDENCE_THRESHOLD && self.self_fix_enabled {
+        if box_conf < LOW_CONFIDENCE_THRESHOLD {
             reasked = true;
+            if !self.self_fix_enabled {
+                // Legacy (pre-self-fix) low-confidence re-ask, kept verbatim for the baseline.
+                if let Some(specific_descs) = card_primary_reask_descriptions(tgt) {
+                    for desc in specific_descs {
+                        let (b, c, s) = self.ask_box(state, img, desc)?;
+                        bbox = b;
+                        box_conf = c;
+                        sensitive_noul = s.or(sensitive_noul);
+                        if box_conf >= LOW_CONFIDENCE_THRESHOLD {
+                            break;
+                        }
+                    }
+                    if box_conf < LOW_CONFIDENCE_THRESHOLD {
+                        if let Ok(content_img) = prepare_content_zoom_2x(img) {
+                            if let Some((ref mut log, step)) = audit_log {
+                                log.record(&content_img, format!("step_{}_content_2x", step));
+                            }
+                            let crop_desc = specific_descs.first().copied().unwrap_or(tgt);
+                            let (cb, cc, cs) = self.ask_box(state, &content_img, crop_desc)?;
+                            let mapped_box = map_content_box_to_window_box(&cb, img);
+                            bbox = mapped_box;
+                            box_conf = cc;
+                            sensitive_noul = cs.or(sensitive_noul);
+                        }
+                    }
+                } else {
+                    let longer = self
+                        .find_target_description(tgt)
+                        .map(|desc| format!("{} ({})", tgt, desc))
+                        .unwrap_or_else(|| format!("Locate the interactive element: {}", tgt));
+                    let (bbox2, conf2, sens2) = self.ask_box(state, img, &longer)?;
+                    bbox = bbox2;
+                    box_conf = conf2;
+                    sensitive_noul = sens2.or(sensitive_noul);
+                }
+                return Ok((bbox, box_conf, sensitive_noul, reasked));
+            }
             let budget = self
                 .harness
                 .as_ref()
@@ -1643,7 +1697,13 @@ impl<B: DecisionBackend> VisionDecider<B> {
                     box_conf = best.effective_conf;
                     sensitive_noul = best.sensitive_noul.or(sensitive_noul);
                     chosen = Some(best.candidate.clone());
-                    chosen_lesson = Some(best.lesson.clone());
+                    chosen_lesson = if best.candidate == "ocr"
+                        && !crate::experience::is_valid_ocr_text(&best.lesson)
+                    {
+                        None
+                    } else {
+                        Some(best.lesson.clone())
+                    };
                     if let Some((text, center)) = best.ocr_item {
                         *self.last_ocr_item_choice.lock().unwrap() = Some((text, center));
                     }
@@ -1764,7 +1824,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
 
         let mut target_criteria = BTreeMap::new();
         let popup_exhausted = self.is_any_popup_exhausted();
-        for t in &self.targets {
+        for t in self.active_targets() {
             if self.is_popup_close_target(&t.label)
                 && (prev_popup_present < POPUP_PRESENT_THRESHOLD || popup_exhausted)
             {
@@ -2071,7 +2131,10 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 ("立即報名按鈕", EVENT_PAGE_REGISTER_DESC),
                 ("票種選項", EVENT_PAGE_TICKET_DESC),
             ] {
-                let has_target = self.targets.iter().any(|t| t.label == priority_label);
+                let has_target = self
+                    .active_targets()
+                    .iter()
+                    .any(|t| t.label == priority_label);
                 let is_excluded = excluded_targets.iter().any(|ex| ex == priority_label);
                 if has_target && !is_excluded {
                     let candidates = candidates_for_target(

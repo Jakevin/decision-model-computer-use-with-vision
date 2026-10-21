@@ -1478,35 +1478,48 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         clicked_this_step = Some(tgt.to_string());
                         last_click_point = Some(pt);
 
-                        if !self.dry_run {
+                        if !self.dry_run && self.decider.self_fix_enabled() {
                             if let Some(ref sf) = decision.self_fix {
                                 if let Some(ref chosen) = sf.chosen {
-                                    let lesson = sf
-                                        .chosen_lesson
-                                        .clone()
-                                        .filter(|s| !s.trim().is_empty())
-                                        .or_else(|| {
-                                            self.decider
-                                                .targets()
-                                                .iter()
-                                                .find(|t| t.label == tgt)
-                                                .and_then(|t| t.description.clone())
-                                        })
-                                        .unwrap_or_else(|| format!("Locate {}", tgt));
-                                    let host = crate::experience::extract_host_from_url(
-                                        current_url.as_deref().or(self.start_url.as_deref()),
-                                    );
-                                    pending_self_fix_click = Some(PendingSelfFixClick {
-                                        step,
-                                        preset: self.decider.preset_str().to_string(),
-                                        host,
-                                        target: tgt.to_string(),
-                                        lesson,
-                                        chosen: chosen.clone(),
-                                        confidence: box_conf,
-                                        prev_url: current_url.clone(),
-                                        prev_img: full.clone(),
-                                    });
+                                    let is_ocr_candidate =
+                                        chosen.trim().eq_ignore_ascii_case("ocr");
+                                    let lesson_opt = if is_ocr_candidate {
+                                        sf.chosen_lesson
+                                            .clone()
+                                            .or_else(|| decision.ocr_item_text.clone())
+                                            .filter(|s| crate::experience::is_valid_ocr_text(s))
+                                    } else {
+                                        Some(
+                                            sf.chosen_lesson
+                                                .clone()
+                                                .filter(|s| !s.trim().is_empty())
+                                                .or_else(|| {
+                                                    self.decider
+                                                        .targets()
+                                                        .iter()
+                                                        .find(|t| t.label == tgt)
+                                                        .and_then(|t| t.description.clone())
+                                                })
+                                                .unwrap_or_else(|| format!("Locate {}", tgt)),
+                                        )
+                                        .filter(|s| crate::experience::is_valid_ocr_text(s))
+                                    };
+                                    if let Some(lesson) = lesson_opt {
+                                        let host = crate::experience::extract_host_from_url(
+                                            current_url.as_deref().or(self.start_url.as_deref()),
+                                        );
+                                        pending_self_fix_click = Some(PendingSelfFixClick {
+                                            step,
+                                            preset: self.decider.preset_str().to_string(),
+                                            host,
+                                            target: tgt.to_string(),
+                                            lesson,
+                                            chosen: chosen.clone(),
+                                            confidence: box_conf,
+                                            prev_url: current_url.clone(),
+                                            prev_img: full.clone(),
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -2102,6 +2115,14 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         current_url: &Option<String>,
         current_img: Option<&image::RgbaImage>,
     ) {
+        if !self.decider.self_fix_enabled() {
+            return;
+        }
+        if pending.chosen.trim().eq_ignore_ascii_case("ocr")
+            && !crate::experience::is_valid_ocr_text(&pending.lesson)
+        {
+            return;
+        }
         let Some(store) = self.decider.experience_store() else {
             return;
         };

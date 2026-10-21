@@ -87,7 +87,7 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 - `--done-when <CONDITION>`: Done condition: `flights-results`, `checkout-page`, or `model` (defaults from `--preset`).
 - `--fill <KEY=VALUE>`: Repeatable target-to-text fill mapping (e.g. `--fill "origin field=Osaka"`).
 - `--harness <PATH>`: Optional harness JSON for target overrides and self-fix probe order/budget.
-- `--no-self-fix`: Disable the in-run self-correction probe (baseline runs).
+- `--no-self-fix`: Disable new self-correction paths (rewritten description re-ask, experience library read/write, zoom, OCR candidates) while keeping the legacy low-confidence re-ask and page-turn scroll retry (baseline runs).
 - `--experience-dir <PATH>`: Directory for experience entries and `INDEX.md` (default `./experience`).
 - `--dry-run`: Perform capture and decision making without executing mouse/keyboard actions.
 - `--json`: Print a single final JSON result object to stdout (`{status, steps, reason, ...}`).
@@ -146,7 +146,7 @@ When the click box for the chosen target comes back with confidence `< 0.2`, `de
 - Each probe is logged as a `self_fix` event (`target`, `tried[]`, `chosen`, `base_conf`, `budget_used`) in the run's `log.jsonl`.
 - With no harness file, no experience entry and no OCR candidates, the probe sends exactly the same requests as before this feature.
 
-**Experience library** (`--experience-dir`, default `./experience`): after a self-fix click whose result changed the URL or the screen, a text-only Markdown entry is written to `<dir>/<preset>/<host>/entries/` and indexed in `INDEX.md`. Entries store only text (cue, lesson, evidence, confidence, uses/wins) — never image bytes — and pass through `redact` (API key removed) with URL query strings/fragments stripped. An entry is disabled after 4+ uses with a win rate under 50%.
+**Experience library** (`--experience-dir`, default `./experience`): after a self-fix click whose result changed the URL or the screen, a text-only Markdown entry is written to `<dir>/<preset>/<host>/entries/` and indexed in `INDEX.md`. Entries store only text (cue, lesson, evidence, confidence, uses/wins) — never image bytes — and pass through `redact` (API key removed) with URL query strings/fragments stripped. OCR text lessons must have at least `MIN_OCR_TEXT_CHARS` (`2`) non-whitespace characters and must not be purely digits or purely punctuation, so short or noisy tokens like `'3'` are never recorded. An entry is disabled after 4+ uses with a win rate under 50%.
 
 **Harness file** (`--harness <PATH>`, optional JSON): overrides target descriptions, per-target re-ask prompts, candidate order and budget:
 
@@ -158,7 +158,7 @@ When the click box for the chosen target comes back with confidence `< 0.2`, `de
 }
 ```
 
-`--no-self-fix` turns the probe off for baseline runs (no low-confidence re-ask at all).
+`--no-self-fix` disables only the new self-correction paths (rewritten description re-ask, experience library read/write, 2x zoom, and OCR candidates) for baseline runs; the original legacy low-confidence re-ask (`<label> (<description>)`) and the page-turn / scroll retry (`PageDown`/`PageUp` fallback) still run.
 
 **Regression script**: `scripts/regress.sh` builds a release binary, then runs Task A (Google Flights KIX→TPE, 2026-11-03) and Task B (Accupass free event up to `checkout-page`) 3x with `--no-self-fix` and 3x with self-fix, and writes `runs/regress_<timestamp>/regress_records.tsv` (needs `jq`). Environment: `DECISION_CU_BIN` (use an existing binary), `HARNESS_FILE`, `EXPERIENCE_DIR`, `REGRESS_OUT_DIR`. It drives the real screen and spends API requests — run it only when you mean to.
 
@@ -265,7 +265,7 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 - `--done-when <CONDITION>`：完成條件：`flights-results`、`checkout-page` 或 `model`（預設依 `--preset` 自動決定）。
 - `--fill <KEY=VALUE>`：可重複指定的目標欄位填入文字對應（例如 `--fill "origin field=Osaka"`）。
 - `--harness <PATH>`：選用的 harness JSON，覆寫目標描述與自我修正的候選順序／預算。
-- `--no-self-fix`：關閉執行中自我修正（基準對照用）。
+- `--no-self-fix`：關閉新增的自我修正路徑（改寫描述重問、經驗庫讀寫、2 倍放大、OCR 候選），同時保留原有的低信心度重問與翻頁／捲動重試（基準對照用）。
 - `--experience-dir <PATH>`：經驗庫條目與 `INDEX.md` 的目錄（預設 `./experience`）。
 - `--dry-run`：乾跑模式，不執行實際滑鼠或鍵盤動作。
 - `--json`：於標準輸出印出單一 JSON 結果物件（`{status, steps, reason, ...}`）。
@@ -304,11 +304,11 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 - 每次探測都會在該次執行的 `log.jsonl` 記一筆 `self_fix` 事件（`target`、`tried[]`、`chosen`、`base_conf`、`budget_used`）。
 - 沒有 harness 檔、沒有經驗條目、也沒有 OCR 候選時，送出的請求與加入此功能前完全相同。
 
-**經驗庫**（`--experience-dir`，預設 `./experience`）：自我修正後的點擊若讓網址或畫面改變，會在 `<dir>/<preset>/<host>/entries/` 寫入一筆純文字 Markdown 條目並更新 `INDEX.md`。條目只存文字（cue、lesson、evidence、信心值、使用／成功次數），絕不存圖片位元組，並經 `redact`（移除 API 金鑰）及去除網址查詢字串／錨點。使用 4 次以上且成功率低於 50% 的條目會自動停用。
+**經驗庫**（`--experience-dir`，預設 `./experience`）：自我修正後的點擊若讓網址或畫面改變，會在 `<dir>/<preset>/<host>/entries/` 寫入一筆純文字 Markdown 條目並更新 `INDEX.md`。條目只存文字（cue、lesson、evidence、信心值、使用／成功次數），絕不存圖片位元組，並經 `redact`（移除 API 金鑰）及去除網址查詢字串／錨點。OCR 文字教訓去除空白後至少需達 `MIN_OCR_TEXT_CHARS`（`2`）個字元，且不可全為數字或全為標點符號，因此像 `'3'` 這類過短或雜訊字串不會被記錄。使用 4 次以上且成功率低於 50% 的條目會自動停用。
 
 **Harness 檔**（`--harness <PATH>`，選用 JSON）：可覆寫目標描述、各目標重問提示、候選順序與預算，格式見上方英文段落範例。
 
-`--no-self-fix`：關閉探測，作為基準對照（低信心時完全不重問）。
+`--no-self-fix`：作為基準對照時，僅關閉新增的自我修正路徑（改寫描述重問、經驗庫讀寫、2 倍放大、OCR 候選）；原有的舊版低信心度重問（`<label> (<description>)`）以及翻頁／捲動重試（`PageDown`/`PageUp` 備援）仍會照常執行。
 
 **回歸腳本**：`scripts/regress.sh` 會先編譯 release 版，再把任務 A（Google Flights 大阪 KIX→台北 TPE，2026-11-03）與任務 B（Accupass 免費活動走到 `checkout-page`）各以 `--no-self-fix` 跑 3 次、開自我修正跑 3 次，結果寫到 `runs/regress_<時間>/regress_records.tsv`（需要 `jq`）。環境變數：`DECISION_CU_BIN`（改用現成執行檔）、`HARNESS_FILE`、`EXPERIENCE_DIR`、`REGRESS_OUT_DIR`。腳本會實際操作螢幕並消耗 API 請求，請確定要跑再執行。
 

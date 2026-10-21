@@ -3,7 +3,10 @@
 #
 # Runs Task A (Google Flights KIX -> TPE, one-way, 2026-11-03, cheapest) and
 # Task B (Accupass events-zh FREE event registration flow up to checkout-page)
-# 3x each WITH --no-self-fix (baseline) and 3x each WITHOUT --no-self-fix (self-fix + experience),
+# 3x each WITH --no-self-fix (baseline: legacy low-confidence re-ask and page-turn
+# scroll retry still run; only new self-correction paths — rewritten description
+# re-ask, experience library read/write, zoom, and OCR candidates — are disabled)
+# and 3x each WITHOUT --no-self-fix (self-fix + experience),
 # then summarizes the summary.json fields across all runs.
 #
 # ============================================================================

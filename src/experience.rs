@@ -8,6 +8,27 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_EXPERIENCE_DIR: &str = "./experience";
 pub const MIN_USES_FOR_DISABLE: usize = 4;
 pub const MIN_WIN_RATE: f64 = 0.5;
+pub const MIN_OCR_TEXT_CHARS: usize = 2;
+
+/// Validate OCR text before storing it in the experience library:
+/// after removing whitespace, the text must have at least `MIN_OCR_TEXT_CHARS` (2)
+/// characters and must not be purely digits or purely punctuation.
+pub fn is_valid_ocr_text(text: &str) -> bool {
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.chars().count() < MIN_OCR_TEXT_CHARS {
+        return false;
+    }
+    if compact.chars().all(|c| c.is_ascii_digit() || c.is_numeric()) {
+        return false;
+    }
+    if compact
+        .chars()
+        .all(|c| c.is_ascii_punctuation() || !c.is_alphanumeric())
+    {
+        return false;
+    }
+    true
+}
 
 pub fn strip_image_bytes(input: &str) -> String {
     let mut out = input.to_string();
@@ -287,10 +308,14 @@ impl ExperienceStore {
     pub fn lookup(&self, preset: &str, host: &str, target_label: &str) -> Option<ExperienceEntry> {
         let entry = self.load_entry(preset, host, target_label)?;
         if entry.is_disabled() {
-            None
-        } else {
-            Some(entry)
+            return None;
         }
+        if entry.adopted_candidate.trim().eq_ignore_ascii_case("ocr")
+            && !is_valid_ocr_text(&entry.lesson)
+        {
+            return None;
+        }
+        Some(entry)
     }
 
     pub fn write_entry(
@@ -305,6 +330,11 @@ impl ExperienceStore {
         }
         if clean.lesson.trim().is_empty() {
             return Err("Experience entry lesson cannot be empty".to_string());
+        }
+        if !is_valid_ocr_text(&clean.lesson) {
+            return Err(
+                "Experience entry lesson does not meet minimum OCR text requirements".to_string(),
+            );
         }
         if clean.evidence.trim().is_empty() {
             return Err("Experience entry requires non-empty evidence".to_string());
@@ -335,9 +365,19 @@ impl ExperienceStore {
         won: bool,
         evidence: Option<&str>,
     ) -> Result<Option<ExperienceEntry>, String> {
+        let clean_lesson = sanitize_text(lesson, self.api_key.as_ref());
+        if adopted_candidate.trim().eq_ignore_ascii_case("ocr")
+            && (!is_valid_ocr_text(lesson) || !is_valid_ocr_text(&clean_lesson))
+        {
+            return Ok(None);
+        }
+
         if let Some(mut existing) = self.load_entry(preset, host, target_label) {
             existing.uses += 1;
             if won {
+                if !is_valid_ocr_text(lesson) || !is_valid_ocr_text(&clean_lesson) {
+                    return Ok(None);
+                }
                 existing.wins += 1;
                 if let Some(ev) = evidence.map(|s| s.trim()).filter(|s| !s.is_empty()) {
                     existing.evidence = sanitize_text(ev, self.api_key.as_ref());
@@ -346,12 +386,15 @@ impl ExperienceStore {
                 existing.adopted_candidate =
                     sanitize_text(adopted_candidate, self.api_key.as_ref());
                 if !lesson.trim().is_empty() {
-                    existing.lesson = sanitize_text(lesson, self.api_key.as_ref());
+                    existing.lesson = clean_lesson;
                 }
             }
             self.write_entry(preset, host, &existing)?;
             Ok(Some(existing.sanitized(self.api_key.as_ref())))
         } else if won {
+            if !is_valid_ocr_text(lesson) || !is_valid_ocr_text(&clean_lesson) {
+                return Ok(None);
+            }
             let ev = evidence
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())

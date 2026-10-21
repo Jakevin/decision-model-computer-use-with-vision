@@ -79,7 +79,7 @@ cargo run --quiet -- run --goal "Sort flights by cheapest" --max-steps 10 --json
 - Provide a clear, read-only visual inspection or search instruction via `--task "<text>"` (or `--goal "<text>"`).
 - Pass `--start-url "https://www.google.com/travel/flights"` to automatically activate Chrome and set the active tab URL before step 0 (never opens or closes tabs/windows).
 - Pass repeatable `--fill "target=value"` flags for fields that should be automatically selected (`Meta+A`) and typed into right after clicking them.
-- Low-confidence clicks (`< 0.2`) trigger a budgeted self-fix probe (re-ask / experience / zoom / OCR, max 3 extra requests per step, all safety checks applied) logged as `self_fix` events; pass `--no-self-fix` for a baseline, `--experience-dir` to choose where text-only lessons are stored, `--harness` for a JSON override file.
+- Low-confidence clicks (`< 0.2`) trigger a budgeted self-fix probe (re-ask / experience / zoom / OCR, max 3 extra requests per step, all safety checks applied) logged as `self_fix` events; pass `--no-self-fix` for a baseline that disables only the new self-correction paths (rewritten description re-ask, experience library read/write, zoom, and OCR candidates) while keeping the original legacy low-confidence re-ask and page-turn/scroll retry, `--experience-dir` to choose where text-only lessons are stored (OCR lessons require `>= MIN_OCR_TEXT_CHARS` = 2 non-whitespace chars and cannot be purely digits or purely punctuation), and `--harness` for a JSON override file.
 - When calling from an automated agent, always pass `--json` so stdout contains a single machine-readable JSON line.
 
 ## Outputs & Exit Codes
