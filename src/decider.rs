@@ -1,6 +1,9 @@
 use crate::api::{
     Answer, ApiError, BoundingBox, DecisionBackend, Question, Request, Response, DEFAULT_MODEL,
 };
+use crate::ocr::{
+    candidates_for_target, is_ocr_text_target, OcrLine, TriedOcrItem,
+};
 use crate::privacy::{
     content_region_offset_and_scale_frac, corner_offset_and_scale_frac, prepare_content_zoom_2x,
     prepare_corner_zoom_2x, CornerRegion, PreparedImage,
@@ -480,6 +483,12 @@ pub struct Decision {
     pub footer_noul: Option<f64>,
     #[serde(default)]
     pub login_form_noul: Option<f64>,
+    #[serde(default)]
+    pub click_source: Option<String>,
+    #[serde(default)]
+    pub ocr_item_text: Option<String>,
+    #[serde(default)]
+    pub ocr_item_center_frac: Option<(f64, f64)>,
 }
 
 #[derive(Debug, Error)]
@@ -729,6 +738,8 @@ pub struct VisionDecider<B: DecisionBackend> {
     current_url: std::sync::Mutex<Option<String>>,
     scroll_direction: std::sync::Mutex<ScrollDirection>,
     closed_popups: std::sync::Mutex<Vec<ClosedPopupMemory>>,
+    ocr_candidates: std::sync::Mutex<Vec<OcrLine>>,
+    tried_ocr_items: std::sync::Mutex<Vec<TriedOcrItem>>,
 }
 
 impl<B: DecisionBackend> VisionDecider<B> {
@@ -746,6 +757,105 @@ impl<B: DecisionBackend> VisionDecider<B> {
             current_url: std::sync::Mutex::new(None),
             scroll_direction: std::sync::Mutex::new(ScrollDirection::Down),
             closed_popups: std::sync::Mutex::new(Vec::new()),
+            ocr_candidates: std::sync::Mutex::new(Vec::new()),
+            tried_ocr_items: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn set_ocr_candidates(&self, candidates: Vec<OcrLine>) {
+        *self.ocr_candidates.lock().unwrap() = candidates;
+    }
+
+    pub fn ocr_candidates(&self) -> Vec<OcrLine> {
+        self.ocr_candidates.lock().unwrap().clone()
+    }
+
+    pub fn record_tried_ocr_item(
+        &self,
+        text: impl Into<String>,
+        center_frac: (f64, f64),
+        url: Option<String>,
+    ) {
+        let item = TriedOcrItem {
+            text: text.into(),
+            center_frac,
+            url,
+        };
+        let mut guard = self.tried_ocr_items.lock().unwrap();
+        if !guard.iter().any(|existing| {
+            existing.url == item.url
+                && existing.text.trim() == item.text.trim()
+                && (existing.center_frac.0 - item.center_frac.0).abs() <= 0.08
+                && (existing.center_frac.1 - item.center_frac.1).abs() <= 0.08
+        }) {
+            guard.push(item);
+        }
+    }
+
+    pub fn tried_ocr_items(&self) -> Vec<TriedOcrItem> {
+        self.tried_ocr_items.lock().unwrap().clone()
+    }
+
+    pub fn build_item_criteria(candidates: &[OcrLine]) -> BTreeMap<String, Option<String>> {
+        let mut criteria = BTreeMap::new();
+        for (idx, line) in candidates.iter().enumerate() {
+            criteria.insert(idx.to_string(), Some(line.format_criterion()));
+        }
+        criteria.insert(
+            "none".to_string(),
+            Some("None of the listed text items match the target".to_string()),
+        );
+        criteria
+    }
+
+    pub fn ask_ocr_item(
+        &self,
+        state: &str,
+        img: &PreparedImage,
+        target_label: &str,
+        candidates: &[OcrLine],
+    ) -> Result<Option<(OcrLine, f64)>, DeciderError> {
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let criteria = Self::build_item_criteria(candidates);
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "item".to_string(),
+            Question::Choice {
+                instructions: format!(
+                    "Choose the OCR text item that matches '{}', or 'none' if none matches.",
+                    target_label
+                ),
+                criteria,
+            },
+        );
+        let req = Request {
+            model: self.model.clone(),
+            state: state.to_string(),
+            images: vec![img.data_url.clone()],
+            questions,
+        };
+        let resp = match self.ask_backend(&req) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        match resp.answers.get("item") {
+            Some(Answer::Choice {
+                choice, confidence, ..
+            }) => {
+                let c = choice.trim();
+                if c.eq_ignore_ascii_case("none") || *confidence < LOW_CONFIDENCE_THRESHOLD {
+                    return Ok(None);
+                }
+                if let Ok(idx) = c.parse::<usize>() {
+                    if let Some(chosen) = candidates.get(idx) {
+                        return Ok(Some((chosen.clone(), *confidence)));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1260,6 +1370,9 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 popup_present_noul,
                 footer_noul,
                 login_form_noul,
+                click_source: None,
+                ocr_item_text: None,
+                ocr_item_center_frac: None,
             });
         }
 
@@ -1280,6 +1393,9 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 popup_present_noul,
                 footer_noul,
                 login_form_noul,
+                click_source: None,
+                ocr_item_text: None,
+                ocr_item_center_frac: None,
             });
         }
 
@@ -1304,7 +1420,73 @@ impl<B: DecisionBackend> VisionDecider<B> {
                     popup_present_noul,
                     footer_noul,
                     login_form_noul,
+                    click_source: None,
+                    ocr_item_text: None,
+                    ocr_item_center_frac: None,
                 });
+            }
+
+            if is_ocr_text_target(&tgt) {
+                let candidates = candidates_for_target(
+                    &self.ocr_candidates(),
+                    &tgt,
+                    self.current_url().as_deref(),
+                    &self.tried_ocr_items(),
+                );
+                if !candidates.is_empty() {
+                    let chosen_from_resp1 = match resp1.answers.get("item") {
+                        Some(Answer::Choice {
+                            choice, confidence, ..
+                        }) => {
+                            let c = choice.trim();
+                            if !c.eq_ignore_ascii_case("none")
+                                && *confidence >= LOW_CONFIDENCE_THRESHOLD
+                            {
+                                c.parse::<usize>()
+                                    .ok()
+                                    .and_then(|idx| candidates.get(idx).cloned())
+                                    .map(|line| (line, *confidence))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+
+                    let chosen_item = if resp1.answers.contains_key("item") {
+                        chosen_from_resp1
+                    } else {
+                        self.ask_ocr_item(&state, img, &tgt, &candidates)
+                            .ok()
+                            .flatten()
+                    };
+
+                    if let Some((chosen, item_conf)) = chosen_item {
+                        let bbox = chosen.bbox();
+                        let pt = Some(map_box_center_to_screen_pt(&bbox, img));
+                        let fill_text = self.type_values.get(&tgt).cloned();
+                        return Ok(Decision {
+                            kind: ActionKind::Click,
+                            kind_confidence: kind_conf,
+                            target: Some(tgt),
+                            click_point_screen_pt: pt,
+                            bbox: Some(bbox),
+                            box_confidence: Some(item_conf),
+                            confidence: item_conf,
+                            reasked: false,
+                            text_to_type: fill_text,
+                            results_noul,
+                            sensitive_noul: None,
+                            closeish_noul: None,
+                            popup_present_noul,
+                            footer_noul,
+                            login_form_noul,
+                            click_source: Some("ocr".to_string()),
+                            ocr_item_text: Some(chosen.text.clone()),
+                            ocr_item_center_frac: Some(chosen.center()),
+                        });
+                    }
+                }
             }
 
             let (bbox, box_conf, sensitive_noul, reasked) =
@@ -1336,6 +1518,9 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 popup_present_noul,
                 footer_noul,
                 login_form_noul,
+                click_source: Some("box".to_string()),
+                ocr_item_text: None,
+                ocr_item_center_frac: None,
             });
         }
 
@@ -1347,6 +1532,40 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 let has_target = self.targets.iter().any(|t| t.label == priority_label);
                 let is_excluded = excluded_targets.iter().any(|ex| ex == priority_label);
                 if has_target && !is_excluded {
+                    let candidates = candidates_for_target(
+                        &self.ocr_candidates(),
+                        priority_label,
+                        self.current_url().as_deref(),
+                        &self.tried_ocr_items(),
+                    );
+                    if !candidates.is_empty() {
+                        if let Ok(Some((chosen, item_conf))) =
+                            self.ask_ocr_item(&state, img, priority_label, &candidates)
+                        {
+                            let bbox = chosen.bbox();
+                            let pt = Some(map_box_center_to_screen_pt(&bbox, img));
+                            return Ok(Decision {
+                                kind: ActionKind::Click,
+                                kind_confidence: kind_conf,
+                                target: Some(priority_label.to_string()),
+                                click_point_screen_pt: pt,
+                                bbox: Some(bbox),
+                                box_confidence: Some(item_conf),
+                                confidence: item_conf,
+                                reasked: true,
+                                text_to_type: None,
+                                results_noul,
+                                sensitive_noul: None,
+                                closeish_noul: None,
+                                popup_present_noul,
+                                footer_noul,
+                                login_form_noul,
+                                click_source: Some("ocr".to_string()),
+                                ocr_item_text: Some(chosen.text.clone()),
+                                ocr_item_center_frac: Some(chosen.center()),
+                            });
+                        }
+                    }
                     let (bbox, box_conf, sensitive_noul) =
                         self.ask_box(&state, img, priority_desc)?;
                     if box_conf >= LOW_CONFIDENCE_THRESHOLD {
@@ -1367,6 +1586,9 @@ impl<B: DecisionBackend> VisionDecider<B> {
                             popup_present_noul,
                             footer_noul,
                             login_form_noul,
+                            click_source: Some("box".to_string()),
+                            ocr_item_text: None,
+                            ocr_item_center_frac: None,
                         });
                     }
                 }
@@ -1407,6 +1629,9 @@ impl<B: DecisionBackend> VisionDecider<B> {
             popup_present_noul,
             footer_noul,
             login_form_noul,
+            click_source: None,
+            ocr_item_text: None,
+            ocr_item_center_frac: None,
         })
     }
 
@@ -1507,6 +1732,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
         decision.reasked = reasked;
         decision.click_point_screen_pt = pt;
         decision.closeish_noul = closeish_noul;
+        decision.click_source = Some("box".to_string());
         Ok(())
     }
 

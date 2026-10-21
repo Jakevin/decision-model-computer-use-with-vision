@@ -11,8 +11,10 @@ use crate::input::{
     Input, InputError, KeyCode, DEFAULT_SCROLL_DELTA_PX, DEFAULT_SCROLL_UP_DELTA_PX,
 };
 use crate::logging::RunLogger;
+use crate::ocr::{filter_ocr_candidates, has_login_ocr_lines, Ocr, OcrLine};
 use crate::privacy::{
-    encode_jpeg, prepare_image, AuditLog, PreparedImage, PrivacyError, JPEG_QUALITY,
+    content_region_offset_and_scale_frac, encode_jpeg, is_sensitive_text, prepare_image, AuditLog,
+    PreparedImage, PrivacyError, JPEG_QUALITY,
 };
 use crate::safety::{
     is_sensitive_fill_label, resolve_allowed_url_prefixes, SafetyError, SafetyPolicy,
@@ -127,6 +129,8 @@ pub struct StepRecord {
     pub full_screen_size: (u32, u32),
     pub decision: Decision,
     pub executed: bool,
+    #[serde(default)]
+    pub click_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +233,15 @@ pub struct PriceSeenEventRecord {
     pub crop_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OcrEventRecord {
+    pub event: String,
+    pub step: usize,
+    pub lines_total: usize,
+    pub candidates: usize,
+    pub ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSummaryJson {
     pub status: String,
@@ -312,6 +325,7 @@ pub struct Agent<S: Screen, B: DecisionBackend, I: Input, Br: Browser = DefaultA
     input: I,
     policy: SafetyPolicy,
     browser: Br,
+    ocr: Option<Box<dyn Ocr>>,
     start_url: Option<String>,
     flights_preset: bool,
     timing: Timing,
@@ -328,6 +342,7 @@ impl<S: Screen, B: DecisionBackend, I: Input> Agent<S, B, I, DefaultAllowedBrows
             input,
             policy,
             browser: DefaultAllowedBrowser::default(),
+            ocr: None,
             start_url: None,
             flights_preset: true,
             timing: Timing::zero(),
@@ -346,6 +361,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             input: self.input,
             policy: self.policy,
             browser,
+            ocr: self.ocr,
             start_url: self.start_url,
             flights_preset: self.flights_preset,
             timing: self.timing,
@@ -353,6 +369,11 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             logger: self.logger,
             dry_run: self.dry_run,
         }
+    }
+
+    pub fn with_ocr<O: Ocr + 'static>(mut self, ocr: O) -> Self {
+        self.ocr = Some(Box::new(ocr));
+        self
     }
 
     pub fn with_flights_preset(mut self, flights_preset: bool) -> Self {
@@ -436,6 +457,14 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
         let mut checkout_clicked = false;
         let mut price_crops: Vec<String> = Vec::new();
         let mut price_box_asked = false;
+        let mut pending_ocr_click: Option<(
+            String,
+            (f64, f64),
+            Option<String>,
+            Option<usize>,
+            Option<String>,
+            image::RgbaImage,
+        )> = None;
 
         if self.policy.allowed_hosts.is_empty() {
             let preset_prefixes = if self.flights_preset {
@@ -610,6 +639,95 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
 
             self.audit_log
                 .record(&prepared, format!("step_{}_decision", step));
+
+            if let Some((prev_text, prev_center, prev_url, prev_tabs, prev_win, prev_img)) =
+                pending_ocr_click.take()
+            {
+                let url_changed = current_url != prev_url;
+                let tab_changed = cur_tab_count != prev_tabs || cur_window_id != prev_win;
+                let content_changed = is_changed(&prev_img, &full);
+                if !url_changed && !tab_changed && !content_changed {
+                    self.decider
+                        .record_tried_ocr_item(prev_text, prev_center, prev_url);
+                }
+            }
+
+            if let Some(ref ocr) = self.ocr {
+                let ocr_start = Instant::now();
+                let raw_ocr_lines = ocr.recognize(&full).unwrap_or_default();
+                let lines_total = raw_ocr_lines.len();
+                let front_ok = self
+                    .browser
+                    .frontmost_app()
+                    .as_deref()
+                    .map(|a| a.trim() == "Google Chrome")
+                    .unwrap_or(false);
+                let (_lo, content_top_frac, _ws, _hs) =
+                    content_region_offset_and_scale_frac(&prepared);
+                let strip_limit_pt = win_rect.y + self.policy.tab_strip_pt;
+                let unoccluded_raw: Vec<OcrLine> = raw_ocr_lines
+                    .iter()
+                    .filter(|l| {
+                        l.conf >= crate::ocr::MIN_OCR_CONFIDENCE
+                            && !l.text.trim().is_empty()
+                            && l.left >= 0.0
+                            && l.right <= 1.0
+                            && l.top > content_top_frac
+                            && l.bottom <= 1.0
+                            && l.left < l.right
+                            && l.top < l.bottom
+                            && l.center().1 > content_top_frac
+                            && {
+                                let pt = map_box_center_to_screen_pt(&l.bbox(), &prepared);
+                                pt.0 >= win_rect.x
+                                    && pt.0 <= win_rect.x + win_rect.width
+                                    && pt.1 > strip_limit_pt
+                                    && pt.1 <= win_rect.y + win_rect.height
+                                    && front_ok
+                                    && self
+                                        .screen
+                                        .topmost_app_at(pt.0, pt.1)
+                                        .as_deref()
+                                        .map(|a| a.trim() == "Google Chrome")
+                                        .unwrap_or(false)
+                            }
+                    })
+                    .cloned()
+                    .collect();
+                let candidates = filter_ocr_candidates(
+                    &raw_ocr_lines,
+                    &prepared,
+                    win_rect,
+                    self.policy.tab_strip_pt,
+                    |pt| {
+                        front_ok
+                            && self
+                                .screen
+                                .topmost_app_at(pt.0, pt.1)
+                                .as_deref()
+                                .map(|a| a.trim() == "Google Chrome")
+                                .unwrap_or(false)
+                    },
+                );
+                let ocr_ms = ocr_start.elapsed().as_millis() as u64;
+                if let Some(ref mut logger) = self.logger {
+                    let evt = OcrEventRecord {
+                        event: "ocr".to_string(),
+                        step,
+                        lines_total,
+                        candidates: candidates.len(),
+                        ms: ocr_ms,
+                    };
+                    let _ = logger.log_entry(&evt);
+                }
+                if has_login_ocr_lines(&unoccluded_raw) || has_login_ocr_lines(&candidates) {
+                    stop_reason = StopReason::SafetyBlocked("login required".to_string());
+                    break;
+                }
+                self.decider.set_ocr_candidates(candidates);
+            } else {
+                self.decider.set_ocr_candidates(Vec::new());
+            }
 
             let mut excluded_targets = compute_excluded_targets(&step_clicks);
             for (lbl, remaining) in &sensitive_excluded {
@@ -1338,7 +1456,20 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                             if executed && !self.timing.post_action_wait.is_zero() {
                                 thread::sleep(self.timing.post_action_wait);
                             }
-                            if !self.dry_run && tgt == "活動卡片" {
+                            if !self.dry_run && decision.click_source.as_deref() == Some("ocr") {
+                                if let (Some(ref item_text), Some(center_frac)) =
+                                    (&decision.ocr_item_text, decision.ocr_item_center_frac)
+                                {
+                                    pending_ocr_click = Some((
+                                        item_text.clone(),
+                                        center_frac,
+                                        current_url.clone(),
+                                        cur_tab_count,
+                                        cur_window_id.clone(),
+                                        full.clone(),
+                                    ));
+                                }
+                            } else if !self.dry_run && tgt == "活動卡片" {
                                 let post_url = self.browser.active_tab_url();
                                 let post_tabs = self.browser.tab_count();
                                 let post_win = self.browser.front_window_id();
@@ -1844,13 +1975,9 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                 full_screen_size,
                 decision: decision.clone(),
                 executed,
+                click_source: decision.click_source.clone(),
             };
             let _ = logger.log_entry(&rec);
         }
     }
-}
-
-fn is_sensitive_text(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    lower.contains("password") || lower.contains("sk-vsr-")
 }

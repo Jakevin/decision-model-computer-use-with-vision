@@ -316,3 +316,8 @@ pub fn encode_jpeg(img: &RgbaImage, quality: u8) -> Result<Vec<u8>, PrivacyError
         .map_err(|e| PrivacyError::EncodeError(e.to_string()))?;
     Ok(jpeg_bytes)
 }
+
+pub fn is_sensitive_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("password") || lower.contains("sk-vsr-")
+}

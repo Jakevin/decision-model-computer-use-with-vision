@@ -5,5 +5,6 @@ pub mod capture;
 pub mod decider;
 pub mod input;
 pub mod logging;
+pub mod ocr;
 pub mod privacy;
 pub mod safety;

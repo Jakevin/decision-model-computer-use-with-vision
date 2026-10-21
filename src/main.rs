@@ -292,6 +292,7 @@ fn execute_run(
         use decision_cu::browser::MacBrowser;
         use decision_cu::capture::MacScreen;
         use decision_cu::input::EnigoInput;
+        use decision_cu::ocr::VisionOcr;
 
         let screen = MacScreen::new();
         let input = match EnigoInput::new() {
@@ -310,6 +311,7 @@ fn execute_run(
 
         let mut agent = Agent::new(screen, decider, input, policy)
             .with_browser(MacBrowser::new())
+            .with_ocr(VisionOcr::new())
             .with_flights_preset(preset == Preset::Flights)
             .with_timing(Timing::default())
             .with_start_url(resolved_start_url)
