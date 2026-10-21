@@ -3,6 +3,8 @@ pub mod api;
 pub mod browser;
 pub mod capture;
 pub mod decider;
+pub mod experience;
+pub mod harness;
 pub mod input;
 pub mod logging;
 pub mod ocr;

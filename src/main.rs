@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand};
 use decision_cu::agent::{Agent, AgentError, Timing, FLIGHTS_DEFAULT_URL_PREFIX};
 use decision_cu::api::{ApiKey, DecisionClient};
 use decision_cu::decider::{load_targets_file, DoneCondition, Preset, VisionDecider};
+use decision_cu::experience::DEFAULT_EXPERIENCE_DIR;
+use decision_cu::harness::HarnessOverrides;
 use decision_cu::logging::{redact, RunLogger};
 use decision_cu::safety::{is_sensitive_fill_label, resolve_allowed_url_prefixes, SafetyPolicy};
 use serde::{Deserialize, Serialize};
@@ -67,6 +69,22 @@ pub enum Commands {
         /// Repeatable target-to-text fill mapping (e.g. --fill "origin field=Osaka")
         #[arg(long = "fill", value_name = "KEY=VALUE")]
         fill: Vec<String>,
+
+        /// Optional harness JSON path for target overrides and self-fix probe order/budget
+        #[arg(long = "harness", value_name = "PATH")]
+        harness: Option<PathBuf>,
+
+        /// Disable minimal in-run self-correction probe (baseline runs)
+        #[arg(long = "no-self-fix", default_value_t = false)]
+        no_self_fix: bool,
+
+        /// Directory for experience store entries and INDEX.md
+        #[arg(
+            long = "experience-dir",
+            default_value = DEFAULT_EXPERIENCE_DIR,
+            value_name = "PATH"
+        )]
+        experience_dir: PathBuf,
 
         /// Perform capture and decision making without executing mouse/keyboard actions
         #[arg(long, default_value_t = false)]
@@ -177,6 +195,9 @@ fn execute_run(
     targets_file: Option<&std::path::Path>,
     done_when: Option<&str>,
     fills: &[String],
+    harness_file: Option<&std::path::Path>,
+    no_self_fix: bool,
+    experience_dir: &std::path::Path,
     dry_run: bool,
 ) -> (CliResultOutput, Option<ApiKey>) {
     let preset = match Preset::from_name(preset_str) {
@@ -204,6 +225,17 @@ fn execute_run(
             }
         },
         None => preset.default_targets(),
+    };
+
+    let harness_opt = match HarnessOverrides::load_optional(harness_file) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                CliResultOutput::error_or_blocked("error", redact(&e, None))
+                    .with_done_condition(done_condition),
+                None,
+            )
+        }
     };
 
     let resolved_start_url = match (start_url, start_url_preset) {
@@ -259,7 +291,13 @@ fn execute_run(
     let decider = VisionDecider::new(client, targets)
         .with_preset(preset)
         .with_done_condition(done_condition)
-        .with_type_values(type_values);
+        .with_type_values(type_values)
+        .with_harness_opt(harness_opt)
+        .with_experience_store(
+            decision_cu::experience::ExperienceStore::new(experience_dir)
+                .with_api_key(Some(api_key.clone())),
+        )
+        .with_self_fix(!no_self_fix);
 
     let preset_prefixes = if preset == Preset::Flights {
         vec![FLIGHTS_DEFAULT_URL_PREFIX.to_string()]
@@ -405,6 +443,9 @@ fn main() -> ExitCode {
             targets_file,
             done_when,
             fill,
+            harness,
+            no_self_fix,
+            experience_dir,
             dry_run,
             json,
         } => {
@@ -418,6 +459,9 @@ fn main() -> ExitCode {
                 targets_file.as_deref(),
                 done_when.as_deref(),
                 &fill,
+                harness.as_deref(),
+                no_self_fix,
+                &experience_dir,
                 dry_run,
             );
             let code = out.exit_code();
@@ -476,6 +520,11 @@ mod tests {
             "origin field=Osaka",
             "--fill",
             "destination field=Taipei",
+            "--harness",
+            "/tmp/harness.json",
+            "--no-self-fix",
+            "--experience-dir",
+            "/tmp/exp_dir",
             "--dry-run",
             "--json",
         ])
@@ -491,6 +540,9 @@ mod tests {
                 targets_file,
                 done_when,
                 fill,
+                harness,
+                no_self_fix,
+                experience_dir,
                 dry_run,
                 json,
             } => {
@@ -518,6 +570,12 @@ mod tests {
                 let parsed = parse_fills(&fill).unwrap();
                 assert_eq!(parsed.get("origin field").unwrap(), "Osaka");
                 assert_eq!(parsed.get("destination field").unwrap(), "Taipei");
+                assert_eq!(
+                    harness.as_deref(),
+                    Some(std::path::Path::new("/tmp/harness.json"))
+                );
+                assert!(no_self_fix);
+                assert_eq!(experience_dir, std::path::Path::new("/tmp/exp_dir"));
                 assert!(dry_run);
                 assert!(json);
             }
@@ -543,6 +601,9 @@ mod tests {
                 targets_file,
                 done_when,
                 fill,
+                harness,
+                no_self_fix,
+                experience_dir,
                 dry_run,
                 json,
             } => {
@@ -559,6 +620,9 @@ mod tests {
                 assert!(targets_file.is_none());
                 assert!(done_when.is_none());
                 assert!(fill.is_empty());
+                assert!(harness.is_none());
+                assert!(!no_self_fix);
+                assert_eq!(experience_dir, std::path::Path::new(DEFAULT_EXPERIENCE_DIR));
                 assert!(!dry_run);
                 assert!(!json);
             }

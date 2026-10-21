@@ -243,6 +243,29 @@ pub struct OcrEventRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelfFixEventRecord {
+    pub event: String,
+    pub step: usize,
+    pub target: String,
+    pub tried: Vec<crate::decider::SelfFixTriedEntry>,
+    pub chosen: Option<String>,
+    pub base_conf: f64,
+    pub budget_used: usize,
+}
+
+struct PendingSelfFixClick {
+    step: usize,
+    preset: String,
+    host: String,
+    target: String,
+    lesson: String,
+    chosen: String,
+    confidence: f64,
+    prev_url: Option<String>,
+    prev_img: image::RgbaImage,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSummaryJson {
     pub status: String,
     pub reason: String,
@@ -335,7 +358,8 @@ pub struct Agent<S: Screen, B: DecisionBackend, I: Input, Br: Browser = DefaultA
 }
 
 impl<S: Screen, B: DecisionBackend, I: Input> Agent<S, B, I, DefaultAllowedBrowser> {
-    pub fn new(screen: S, decider: VisionDecider<B>, input: I, policy: SafetyPolicy) -> Self {
+    pub fn new(screen: S, mut decider: VisionDecider<B>, input: I, policy: SafetyPolicy) -> Self {
+        decider.set_safety_policy(policy.clone());
         Self {
             screen,
             decider,
@@ -373,6 +397,31 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
 
     pub fn with_ocr<O: Ocr + 'static>(mut self, ocr: O) -> Self {
         self.ocr = Some(Box::new(ocr));
+        self
+    }
+
+    pub fn with_harness(mut self, harness: crate::harness::HarnessOverrides) -> Self {
+        self.decider = self.decider.with_harness(harness);
+        self
+    }
+
+    pub fn with_harness_opt(mut self, harness: Option<crate::harness::HarnessOverrides>) -> Self {
+        self.decider = self.decider.with_harness_opt(harness);
+        self
+    }
+
+    pub fn with_experience_store(mut self, store: crate::experience::ExperienceStore) -> Self {
+        self.decider = self.decider.with_experience_store(store);
+        self
+    }
+
+    pub fn with_experience_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.decider = self.decider.with_experience_dir(dir);
+        self
+    }
+
+    pub fn with_self_fix(mut self, enabled: bool) -> Self {
+        self.decider = self.decider.with_self_fix(enabled);
         self
     }
 
@@ -465,6 +514,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             Option<String>,
             image::RgbaImage,
         )> = None;
+        let mut pending_self_fix_click: Option<PendingSelfFixClick> = None;
 
         if self.policy.allowed_hosts.is_empty() {
             let preset_prefixes = if self.flights_preset {
@@ -478,6 +528,7 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                 self.start_url.as_deref(),
             );
         }
+        self.decider.set_safety_policy(self.policy.clone());
 
         if let Some(ref url) = self.start_url {
             let _ = self.browser.activate_chrome();
@@ -652,6 +703,10 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                 }
             }
 
+            if let Some(pending) = pending_self_fix_click.take() {
+                self.record_pending_self_fix(pending, &current_url, Some(&full));
+            }
+
             if let Some(ref ocr) = self.ocr {
                 let ocr_start = Instant::now();
                 let raw_ocr_lines = ocr.recognize(&full).unwrap_or_default();
@@ -758,6 +813,21 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                     break;
                 }
             };
+
+            if let Some(ref sf) = decision.self_fix {
+                if let Some(ref mut logger) = self.logger {
+                    let evt = SelfFixEventRecord {
+                        event: "self_fix".to_string(),
+                        step,
+                        target: sf.target.clone(),
+                        tried: sf.tried.clone(),
+                        chosen: sf.chosen.clone(),
+                        base_conf: sf.base_conf,
+                        budget_used: sf.budget_used,
+                    };
+                    let _ = logger.log_entry(&evt);
+                }
+            }
 
             if decision.login_form_noul.unwrap_or(0.0) >= LOGIN_FORM_DETECTED_THRESHOLD {
                 let elapsed = step_start.elapsed().as_secs_f64();
@@ -1408,6 +1478,39 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                         clicked_this_step = Some(tgt.to_string());
                         last_click_point = Some(pt);
 
+                        if !self.dry_run {
+                            if let Some(ref sf) = decision.self_fix {
+                                if let Some(ref chosen) = sf.chosen {
+                                    let lesson = sf
+                                        .chosen_lesson
+                                        .clone()
+                                        .filter(|s| !s.trim().is_empty())
+                                        .or_else(|| {
+                                            self.decider
+                                                .targets()
+                                                .iter()
+                                                .find(|t| t.label == tgt)
+                                                .and_then(|t| t.description.clone())
+                                        })
+                                        .unwrap_or_else(|| format!("Locate {}", tgt));
+                                    let host = crate::experience::extract_host_from_url(
+                                        current_url.as_deref().or(self.start_url.as_deref()),
+                                    );
+                                    pending_self_fix_click = Some(PendingSelfFixClick {
+                                        step,
+                                        preset: self.decider.preset_str().to_string(),
+                                        host,
+                                        target: tgt.to_string(),
+                                        lesson,
+                                        chosen: chosen.clone(),
+                                        confidence: box_conf,
+                                        prev_url: current_url.clone(),
+                                        prev_img: full.clone(),
+                                    });
+                                }
+                            }
+                        }
+
                         if let Some(val) = fill_val {
                             if !self.dry_run {
                                 if !self.timing.before_fill_wait.is_zero() {
@@ -1469,7 +1572,10 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
                                         full.clone(),
                                     ));
                                 }
-                            } else if !self.dry_run && tgt == "活動卡片" {
+                            } else if !self.dry_run
+                                && tgt == "活動卡片"
+                                && self.decider.harness().is_none()
+                            {
                                 let post_url = self.browser.active_tab_url();
                                 let post_tabs = self.browser.tab_count();
                                 let post_win = self.browser.front_window_id();
@@ -1851,6 +1957,15 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             }
         }
 
+        if let Some(pending) = pending_self_fix_click.take() {
+            let post_url = self
+                .browser
+                .active_tab_url()
+                .or_else(|| pending.prev_url.clone());
+            let post_img = self.screen.capture().ok();
+            self.record_pending_self_fix(pending, &post_url, post_img.as_ref());
+        }
+
         let avg_seconds_per_step = if steps_completed > 0 {
             total_step_secs / (steps_completed as f64)
         } else {
@@ -1979,5 +2094,57 @@ impl<S: Screen, B: DecisionBackend, I: Input, Br: Browser> Agent<S, B, I, Br> {
             };
             let _ = logger.log_entry(&rec);
         }
+    }
+
+    fn record_pending_self_fix(
+        &self,
+        pending: PendingSelfFixClick,
+        current_url: &Option<String>,
+        current_img: Option<&image::RgbaImage>,
+    ) {
+        let Some(store) = self.decider.experience_store() else {
+            return;
+        };
+        let url_changed = current_url != &pending.prev_url;
+        let screen_changed = current_img
+            .map(|img| is_changed(&pending.prev_img, img))
+            .unwrap_or(false);
+        let won = url_changed || screen_changed;
+        let evidence = if won {
+            match (url_changed, screen_changed) {
+                (true, true) => format!(
+                    "step {} click '{}' changed URL ({} -> {}) and screen content",
+                    pending.step,
+                    pending.target,
+                    pending.prev_url.as_deref().unwrap_or("none"),
+                    current_url.as_deref().unwrap_or("none")
+                ),
+                (true, false) => format!(
+                    "step {} click '{}' changed URL ({} -> {})",
+                    pending.step,
+                    pending.target,
+                    pending.prev_url.as_deref().unwrap_or("none"),
+                    current_url.as_deref().unwrap_or("none")
+                ),
+                _ => format!(
+                    "step {} click '{}' changed screen content on {}",
+                    pending.step,
+                    pending.target,
+                    pending.prev_url.as_deref().unwrap_or("page")
+                ),
+            }
+        } else {
+            String::new()
+        };
+        let _ = store.record_outcome(
+            &pending.preset,
+            &pending.host,
+            &pending.target,
+            &pending.lesson,
+            &pending.chosen,
+            pending.confidence,
+            won,
+            if won { Some(evidence.as_str()) } else { None },
+        );
     }
 }

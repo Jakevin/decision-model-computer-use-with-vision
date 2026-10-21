@@ -46,6 +46,9 @@ Options:
       --targets-file <PATH>        Path to a JSON file containing custom targets ([{"label":..,"description":..}])
       --done-when <CONDITION>      Done condition: flights-results, checkout-page, or model (defaults from --preset)
       --fill <KEY=VALUE>           Repeatable target-to-text fill mapping (e.g. --fill "origin field=Osaka")
+      --harness <PATH>             Optional harness JSON path for target overrides and self-fix probe order/budget
+      --no-self-fix                Disable minimal in-run self-correction probe (baseline runs)
+      --experience-dir <PATH>      Directory for experience store entries and INDEX.md [default: ./experience]
       --dry-run                    Perform capture and decision making without executing mouse/keyboard actions
       --json                       Print a single final JSON result object to stdout ({status, steps, reason, ...})
   -h, --help                       Print help
@@ -76,6 +79,7 @@ cargo run --quiet -- run --goal "Sort flights by cheapest" --max-steps 10 --json
 - Provide a clear, read-only visual inspection or search instruction via `--task "<text>"` (or `--goal "<text>"`).
 - Pass `--start-url "https://www.google.com/travel/flights"` to automatically activate Chrome and set the active tab URL before step 0 (never opens or closes tabs/windows).
 - Pass repeatable `--fill "target=value"` flags for fields that should be automatically selected (`Meta+A`) and typed into right after clicking them.
+- Low-confidence clicks (`< 0.2`) trigger a budgeted self-fix probe (re-ask / experience / zoom / OCR, max 3 extra requests per step, all safety checks applied) logged as `self_fix` events; pass `--no-self-fix` for a baseline, `--experience-dir` to choose where text-only lessons are stored, `--harness` for a JSON override file.
 - When calling from an automated agent, always pass `--json` so stdout contains a single machine-readable JSON line.
 
 ## Outputs & Exit Codes

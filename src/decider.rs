@@ -1,13 +1,18 @@
 use crate::api::{
     Answer, ApiError, BoundingBox, DecisionBackend, Question, Request, Response, DEFAULT_MODEL,
 };
+use crate::experience::{extract_host_from_url, ExperienceEntry, ExperienceStore};
+use crate::harness::{
+    CandidateKind, HarnessOverrides, DEFAULT_MAX_EXTRA_REQUESTS_PER_STEP,
+};
 use crate::ocr::{
-    candidates_for_target, is_ocr_text_target, OcrLine, TriedOcrItem,
+    candidates_for_target, is_ocr_text_target, OcrLine, TriedOcrItem, TRIED_POSITION_TOLERANCE_FRAC,
 };
 use crate::privacy::{
-    content_region_offset_and_scale_frac, corner_offset_and_scale_frac, prepare_content_zoom_2x,
-    prepare_corner_zoom_2x, CornerRegion, PreparedImage,
+    content_region_offset_and_scale_frac, corner_offset_and_scale_frac, is_sensitive_text,
+    prepare_content_zoom_2x, prepare_corner_zoom_2x, CornerRegion, PreparedImage,
 };
+use crate::safety::SafetyPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,6 +20,8 @@ use thiserror::Error;
 
 pub const NOTHING_TO_CLICK: &str = "nothing to click";
 pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.2;
+pub const SELF_FIX_OCR_BOX_BONUS: f64 = 0.10;
+pub const SELF_FIX_SENSITIVE_THRESHOLD: f64 = 0.5;
 pub const MAX_POPUP_BOX_WIDTH_FRAC: f64 = 0.15;
 pub const PRIMARY_LOW_BOX_CONF_EXCLUDE_STEPS: usize = 3;
 pub const CARD_REASK_FIRST_CARD_IMAGE_DESC: &str = "熱門活動區第一張活動卡片的圖片";
@@ -465,6 +472,22 @@ impl ActionKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelfFixTriedEntry {
+    pub candidate: String,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelfFixProbeResult {
+    pub target: String,
+    pub tried: Vec<SelfFixTriedEntry>,
+    pub chosen: Option<String>,
+    pub chosen_lesson: Option<String>,
+    pub base_conf: f64,
+    pub budget_used: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Decision {
     pub kind: ActionKind,
     pub kind_confidence: f64,
@@ -489,6 +512,8 @@ pub struct Decision {
     pub ocr_item_text: Option<String>,
     #[serde(default)]
     pub ocr_item_center_frac: Option<(f64, f64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_fix: Option<SelfFixProbeResult>,
 }
 
 #[derive(Debug, Error)]
@@ -740,6 +765,12 @@ pub struct VisionDecider<B: DecisionBackend> {
     closed_popups: std::sync::Mutex<Vec<ClosedPopupMemory>>,
     ocr_candidates: std::sync::Mutex<Vec<OcrLine>>,
     tried_ocr_items: std::sync::Mutex<Vec<TriedOcrItem>>,
+    harness: Option<HarnessOverrides>,
+    experience_store: Option<ExperienceStore>,
+    self_fix_enabled: bool,
+    safety_policy: SafetyPolicy,
+    last_self_fix: std::sync::Mutex<Option<SelfFixProbeResult>>,
+    last_ocr_item_choice: std::sync::Mutex<Option<(String, (f64, f64))>>,
 }
 
 impl<B: DecisionBackend> VisionDecider<B> {
@@ -759,7 +790,151 @@ impl<B: DecisionBackend> VisionDecider<B> {
             closed_popups: std::sync::Mutex::new(Vec::new()),
             ocr_candidates: std::sync::Mutex::new(Vec::new()),
             tried_ocr_items: std::sync::Mutex::new(Vec::new()),
+            harness: None,
+            experience_store: None,
+            self_fix_enabled: true,
+            safety_policy: SafetyPolicy::default(),
+            last_self_fix: std::sync::Mutex::new(None),
+            last_ocr_item_choice: std::sync::Mutex::new(None),
         }
+    }
+
+    pub fn with_harness(mut self, harness: HarnessOverrides) -> Self {
+        self.targets = harness.apply_to_targets(&self.targets);
+        self.harness = Some(harness);
+        self
+    }
+
+    pub fn with_harness_opt(self, harness: Option<HarnessOverrides>) -> Self {
+        match harness {
+            Some(h) => self.with_harness(h),
+            None => self,
+        }
+    }
+
+    pub fn harness(&self) -> Option<&HarnessOverrides> {
+        self.harness.as_ref()
+    }
+
+    pub fn with_experience_store(mut self, store: ExperienceStore) -> Self {
+        self.experience_store = Some(store);
+        self
+    }
+
+    pub fn with_experience_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.experience_store = Some(ExperienceStore::new(dir));
+        self
+    }
+
+    pub fn set_experience_store(&mut self, store: Option<ExperienceStore>) {
+        self.experience_store = store;
+    }
+
+    pub fn experience_store(&self) -> Option<&ExperienceStore> {
+        self.experience_store.as_ref()
+    }
+
+    pub fn with_self_fix(mut self, enabled: bool) -> Self {
+        self.self_fix_enabled = enabled;
+        self
+    }
+
+    pub fn set_self_fix(&mut self, enabled: bool) {
+        self.self_fix_enabled = enabled;
+    }
+
+    pub fn self_fix_enabled(&self) -> bool {
+        self.self_fix_enabled
+    }
+
+    pub fn with_safety_policy(mut self, policy: SafetyPolicy) -> Self {
+        self.safety_policy = policy;
+        self
+    }
+
+    pub fn set_safety_policy(&mut self, policy: SafetyPolicy) {
+        self.safety_policy = policy;
+    }
+
+    pub fn last_self_fix(&self) -> Option<SelfFixProbeResult> {
+        self.last_self_fix.lock().unwrap().clone()
+    }
+
+    pub fn take_last_self_fix(&self) -> Option<SelfFixProbeResult> {
+        self.last_self_fix.lock().unwrap().take()
+    }
+
+    pub fn preset_str(&self) -> &'static str {
+        self.preset.unwrap_or_default().as_str()
+    }
+
+    pub fn current_host(&self) -> String {
+        let u = self.current_url();
+        extract_host_from_url(u.as_deref())
+    }
+
+    pub fn lookup_experience(&self, target_label: &str) -> Option<ExperienceEntry> {
+        let store = self.experience_store.as_ref()?;
+        store.lookup(self.preset_str(), &self.current_host(), target_label)
+    }
+
+    pub fn ocr_candidates_for_self_fix(&self, tgt: &str) -> Vec<OcrLine> {
+        let all = self.ocr_candidates();
+        if all.is_empty() {
+            return Vec::new();
+        }
+        let url = self.current_url();
+        let tried = self.tried_ocr_items();
+        let targeted = candidates_for_target(&all, tgt, url.as_deref(), &tried);
+        if !targeted.is_empty() {
+            return targeted;
+        }
+        all.into_iter()
+            .filter(|c| !tried.iter().any(|tr| tr.matches(c, url.as_deref())))
+            .collect()
+    }
+
+    fn is_candidate_safe(
+        &self,
+        tgt: &str,
+        desc_or_text: &str,
+        bbox: &BoundingBox,
+        sensitive_noul: Option<f64>,
+        img: &PreparedImage,
+    ) -> bool {
+        if self.safety_policy.check_target(tgt).is_err() {
+            return false;
+        }
+        if self.safety_policy.check_target(desc_or_text).is_err() {
+            return false;
+        }
+        if is_sensitive_text(desc_or_text) {
+            return false;
+        }
+        if sensitive_noul.unwrap_or(0.0) >= SELF_FIX_SENSITIVE_THRESHOLD {
+            return false;
+        }
+        if self.is_popup_close_target(tgt) && !is_popup_box_width_ok(bbox) {
+            return false;
+        }
+        let pt = map_box_center_to_screen_pt(bbox, img);
+        if let Some(win_rect) = img.window_rect {
+            if self.safety_policy.check_click(pt, win_rect).is_err() {
+                return false;
+            }
+        } else {
+            let (_lo, content_top_frac, _ws, _hs) = content_region_offset_and_scale_frac(img);
+            let (_cx, cy) = bbox.center();
+            if cy < content_top_frac
+                || bbox.left < 0.0
+                || bbox.right > 1.0
+                || bbox.top < 0.0
+                || bbox.bottom > 1.0
+            {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn set_ocr_candidates(&self, candidates: Vec<OcrLine>) {
@@ -1074,7 +1249,26 @@ impl<B: DecisionBackend> VisionDecider<B> {
             .find(|t| t.label == label)
             .and_then(|t| t.description.as_deref())
     }
+}
 
+pub fn centers_within_tolerance(a: (f64, f64), b: (f64, f64)) -> bool {
+    (a.0 - b.0).abs() <= TRIED_POSITION_TOLERANCE_FRAC
+        && (a.1 - b.1).abs() <= TRIED_POSITION_TOLERANCE_FRAC
+}
+
+#[derive(Debug, Clone)]
+struct ProbedCandidate {
+    candidate: String,
+    bbox: BoundingBox,
+    raw_conf: f64,
+    effective_conf: f64,
+    sensitive_noul: Option<f64>,
+    safe: bool,
+    lesson: String,
+    ocr_item: Option<(String, (f64, f64))>,
+}
+
+impl<B: DecisionBackend> VisionDecider<B> {
     pub fn has_available_targets(&self, excluded_targets: &[String]) -> bool {
         let prev_popup_present = self
             .last_popup_present
@@ -1099,44 +1293,379 @@ impl<B: DecisionBackend> VisionDecider<B> {
         tgt: &str,
         mut audit_log: Option<(&mut crate::privacy::AuditLog, usize)>,
     ) -> Result<(BoundingBox, f64, Option<f64>, bool), DeciderError> {
+        *self.last_self_fix.lock().unwrap() = None;
+        *self.last_ocr_item_choice.lock().unwrap() = None;
+
         let (mut bbox, mut box_conf, mut sensitive_noul) = self.ask_box(state, img, tgt)?;
+        let base_bbox = bbox;
+        let base_conf = box_conf;
         let mut reasked = false;
 
-        if box_conf < LOW_CONFIDENCE_THRESHOLD {
+        if box_conf < LOW_CONFIDENCE_THRESHOLD && self.self_fix_enabled {
             reasked = true;
-            if let Some(specific_descs) = card_primary_reask_descriptions(tgt) {
-                for desc in specific_descs {
-                    let (b, c, s) = self.ask_box(state, img, desc)?;
-                    bbox = b;
-                    box_conf = c;
-                    sensitive_noul = s.or(sensitive_noul);
-                    if box_conf >= LOW_CONFIDENCE_THRESHOLD {
-                        break;
-                    }
+            let budget = self
+                .harness
+                .as_ref()
+                .map(|h| h.max_extra_requests_per_step)
+                .unwrap_or(DEFAULT_MAX_EXTRA_REQUESTS_PER_STEP);
+            let default_order = crate::harness::default_candidate_order();
+            let order = self
+                .harness
+                .as_ref()
+                .map(|h| h.candidate_order.as_slice())
+                .unwrap_or(&default_order);
+
+            let exp_entry = self.lookup_experience(tgt);
+            let ocr_cands = self.ocr_candidates_for_self_fix(tgt);
+            let is_legacy_only =
+                self.harness.is_none() && exp_entry.is_none() && ocr_cands.is_empty();
+
+            let mut budget_used = 0usize;
+            let mut probed: Vec<ProbedCandidate> = Vec::new();
+
+            for kind in order {
+                if budget_used >= budget {
+                    break;
                 }
-                if box_conf < LOW_CONFIDENCE_THRESHOLD {
-                    if let Ok(content_img) = prepare_content_zoom_2x(img) {
-                        if let Some((ref mut log, step)) = audit_log {
-                            log.record(&content_img, format!("step_{}_content_2x", step));
+                match kind {
+                    CandidateKind::Reask => {
+                        let harness_reasks: Vec<String> = self
+                            .harness
+                            .as_ref()
+                            .and_then(|h| h.reask_for(tgt).map(|s| s.to_vec()))
+                            .unwrap_or_default();
+
+                        if !harness_reasks.is_empty() {
+                            for prompt in &harness_reasks {
+                                if budget_used >= budget {
+                                    break;
+                                }
+                                let (b, c, s) = self.ask_box(state, img, prompt)?;
+                                budget_used += 1;
+                                let safe = self.is_candidate_safe(tgt, prompt, &b, s, img);
+                                probed.push(ProbedCandidate {
+                                    candidate: "reask".to_string(),
+                                    bbox: b,
+                                    raw_conf: c,
+                                    effective_conf: c,
+                                    sensitive_noul: s,
+                                    safe,
+                                    lesson: prompt.clone(),
+                                    ocr_item: None,
+                                });
+                                if harness_reasks.len() > 1
+                                    && safe
+                                    && c >= LOW_CONFIDENCE_THRESHOLD
+                                {
+                                    break;
+                                }
+                            }
+                        } else if let Some(specific_descs) = card_primary_reask_descriptions(tgt) {
+                            if is_legacy_only {
+                                for desc in specific_descs {
+                                    if budget_used >= budget {
+                                        break;
+                                    }
+                                    let (b, c, s) = self.ask_box(state, img, desc)?;
+                                    budget_used += 1;
+                                    let safe = self.is_candidate_safe(tgt, desc, &b, s, img);
+                                    probed.push(ProbedCandidate {
+                                        candidate: "reask".to_string(),
+                                        bbox: b,
+                                        raw_conf: c,
+                                        effective_conf: c,
+                                        sensitive_noul: s,
+                                        safe,
+                                        lesson: (*desc).to_string(),
+                                        ocr_item: None,
+                                    });
+                                    if safe && c >= LOW_CONFIDENCE_THRESHOLD {
+                                        break;
+                                    }
+                                }
+                            } else {
+                                let desc = specific_descs.first().copied().unwrap_or(tgt);
+                                let (b, c, s) = self.ask_box(state, img, desc)?;
+                                budget_used += 1;
+                                let safe = self.is_candidate_safe(tgt, desc, &b, s, img);
+                                probed.push(ProbedCandidate {
+                                    candidate: "reask".to_string(),
+                                    bbox: b,
+                                    raw_conf: c,
+                                    effective_conf: c,
+                                    sensitive_noul: s,
+                                    safe,
+                                    lesson: desc.to_string(),
+                                    ocr_item: None,
+                                });
+                            }
+                        } else {
+                            let longer = self
+                                .find_target_description(tgt)
+                                .map(|desc| format!("{} ({})", tgt, desc))
+                                .unwrap_or_else(|| {
+                                    format!("Locate the interactive element: {}", tgt)
+                                });
+                            let (b, c, s) = self.ask_box(state, img, &longer)?;
+                            budget_used += 1;
+                            let safe = self.is_candidate_safe(tgt, &longer, &b, s, img);
+                            probed.push(ProbedCandidate {
+                                candidate: "reask".to_string(),
+                                bbox: b,
+                                raw_conf: c,
+                                effective_conf: c,
+                                sensitive_noul: s,
+                                safe,
+                                lesson: longer,
+                                ocr_item: None,
+                            });
                         }
-                        let crop_desc = specific_descs.first().copied().unwrap_or(tgt);
-                        let (cb, cc, cs) = self.ask_box(state, &content_img, crop_desc)?;
-                        let mapped_box = map_content_box_to_window_box(&cb, img);
-                        bbox = mapped_box;
-                        box_conf = cc;
-                        sensitive_noul = cs.or(sensitive_noul);
+                    }
+                    CandidateKind::Experience => {
+                        if let Some(ref entry) = exp_entry {
+                            if !entry.lesson.trim().is_empty() && budget_used < budget {
+                                let exp_prompt = if entry.lesson.contains(tgt) {
+                                    entry.lesson.clone()
+                                } else {
+                                    format!("{} ({})", tgt, entry.lesson)
+                                };
+                                let (b, c, s) = self.ask_box(state, img, &exp_prompt)?;
+                                budget_used += 1;
+                                let safe = self.is_candidate_safe(tgt, &entry.lesson, &b, s, img);
+                                probed.push(ProbedCandidate {
+                                    candidate: "experience".to_string(),
+                                    bbox: b,
+                                    raw_conf: c,
+                                    effective_conf: c,
+                                    sensitive_noul: s,
+                                    safe,
+                                    lesson: entry.lesson.clone(),
+                                    ocr_item: None,
+                                });
+                            }
+                        }
+                    }
+                    CandidateKind::Zoom => {
+                        let legacy_already_resolved = is_legacy_only
+                            && probed
+                                .iter()
+                                .any(|p| p.safe && p.raw_conf >= LOW_CONFIDENCE_THRESHOLD);
+                        let skip_aux = is_auxiliary_target(tgt) && self.harness.is_none();
+                        // Legacy (no harness / no experience / no OCR) only zoomed for card
+                        // targets; keep that so runs without a harness send the same requests.
+                        let legacy_no_zoom =
+                            is_legacy_only && card_primary_reask_descriptions(tgt).is_none();
+                        if !legacy_already_resolved
+                            && !skip_aux
+                            && !legacy_no_zoom
+                            && budget_used < budget
+                        {
+                            if self.is_popup_close_target(tgt) {
+                                if let Ok(corner_img) =
+                                    prepare_corner_zoom_2x(img, CornerRegion::BottomRight)
+                                {
+                                    if let Some((ref mut log, step)) = audit_log {
+                                        log.record(
+                                            &corner_img,
+                                            format!("step_{}_popup_bottom_right_2x", step),
+                                        );
+                                    }
+                                    let crop_desc = POPUP_REASK_COOKIE_GOT_IT_DESC;
+                                    let (cb, cc, cs) =
+                                        self.ask_box(state, &corner_img, crop_desc)?;
+                                    budget_used += 1;
+                                    let mapped_box = map_corner_box_to_window_box(
+                                        &cb,
+                                        img,
+                                        CornerRegion::BottomRight,
+                                    );
+                                    let safe = self.is_candidate_safe(
+                                        tgt,
+                                        crop_desc,
+                                        &mapped_box,
+                                        cs,
+                                        img,
+                                    );
+                                    probed.push(ProbedCandidate {
+                                        candidate: "zoom".to_string(),
+                                        bbox: mapped_box,
+                                        raw_conf: cc,
+                                        effective_conf: cc,
+                                        sensitive_noul: cs,
+                                        safe,
+                                        lesson: crop_desc.to_string(),
+                                        ocr_item: None,
+                                    });
+                                }
+                            } else if let Ok(content_img) = prepare_content_zoom_2x(img) {
+                                if let Some((ref mut log, step)) = audit_log {
+                                    log.record(&content_img, format!("step_{}_content_2x", step));
+                                }
+                                let crop_desc = self
+                                    .harness
+                                    .as_ref()
+                                    .and_then(|h| h.reask_for(tgt)?.first().map(|s| s.as_str()))
+                                    .or_else(|| {
+                                        card_primary_reask_descriptions(tgt)
+                                            .and_then(|d| d.first().copied())
+                                    })
+                                    .or_else(|| self.find_target_description(tgt))
+                                    .unwrap_or(tgt)
+                                    .to_string();
+                                let (cb, cc, cs) =
+                                    self.ask_box(state, &content_img, &crop_desc)?;
+                                budget_used += 1;
+                                let mapped_box = map_content_box_to_window_box(&cb, img);
+                                let safe = self.is_candidate_safe(
+                                    tgt,
+                                    &crop_desc,
+                                    &mapped_box,
+                                    cs,
+                                    img,
+                                );
+                                probed.push(ProbedCandidate {
+                                    candidate: "zoom".to_string(),
+                                    bbox: mapped_box,
+                                    raw_conf: cc,
+                                    effective_conf: cc,
+                                    sensitive_noul: cs,
+                                    safe,
+                                    lesson: crop_desc,
+                                    ocr_item: None,
+                                });
+                            }
+                        }
+                    }
+                    CandidateKind::Ocr => {
+                        if !ocr_cands.is_empty() && budget_used < budget {
+                            let chosen_opt = self.ask_ocr_item(state, img, tgt, &ocr_cands)?;
+                            budget_used += 1;
+                            if let Some((chosen_line, ocr_conf)) = chosen_opt {
+                                let ocr_bbox = chosen_line.bbox();
+                                let safe = self.is_candidate_safe(
+                                    tgt,
+                                    &chosen_line.text,
+                                    &ocr_bbox,
+                                    None,
+                                    img,
+                                );
+                                probed.push(ProbedCandidate {
+                                    candidate: "ocr".to_string(),
+                                    bbox: ocr_bbox,
+                                    raw_conf: ocr_conf,
+                                    effective_conf: ocr_conf,
+                                    sensitive_noul: None,
+                                    safe,
+                                    lesson: chosen_line.text.clone(),
+                                    ocr_item: Some((chosen_line.text.clone(), chosen_line.center())),
+                                });
+                            } else {
+                                probed.push(ProbedCandidate {
+                                    candidate: "ocr".to_string(),
+                                    bbox: base_bbox,
+                                    raw_conf: 0.0,
+                                    effective_conf: 0.0,
+                                    sensitive_noul: None,
+                                    safe: false,
+                                    lesson: String::new(),
+                                    ocr_item: None,
+                                });
+                            }
+                        }
                     }
                 }
-            } else {
-                let longer = self
-                    .find_target_description(tgt)
-                    .map(|desc| format!("{} ({})", tgt, desc))
-                    .unwrap_or_else(|| format!("Locate the interactive element: {}", tgt));
-                let (bbox2, conf2, sens2) = self.ask_box(state, img, &longer)?;
-                bbox = bbox2;
-                box_conf = conf2;
-                sensitive_noul = sens2.or(sensitive_noul);
             }
+
+            // Compute OCR center & box center agreement bonus within TRIED_POSITION_TOLERANCE_FRAC
+            let mut ocr_centers: Vec<(f64, f64)> = probed
+                .iter()
+                .filter(|p| p.candidate == "ocr" && p.ocr_item.is_some())
+                .map(|p| p.bbox.center())
+                .collect();
+            if ocr_centers.is_empty() {
+                for line in &ocr_cands {
+                    ocr_centers.push(line.center());
+                }
+            }
+
+            let mut box_centers: Vec<(f64, f64)> = probed
+                .iter()
+                .filter(|p| p.candidate != "ocr" && p.raw_conf > 0.0)
+                .map(|p| p.bbox.center())
+                .collect();
+            if base_conf > 0.0 {
+                box_centers.push(base_bbox.center());
+            }
+
+            for p in &mut probed {
+                if p.raw_conf <= 0.0 {
+                    continue;
+                }
+                let c_center = p.bbox.center();
+                let agrees = if p.candidate == "ocr" {
+                    box_centers
+                        .iter()
+                        .any(|&bc| centers_within_tolerance(c_center, bc))
+                } else {
+                    ocr_centers
+                        .iter()
+                        .any(|&oc| centers_within_tolerance(c_center, oc))
+                };
+                if agrees {
+                    p.effective_conf = (p.raw_conf + SELF_FIX_OCR_BOX_BONUS).min(1.0);
+                }
+            }
+
+            let tried: Vec<SelfFixTriedEntry> = probed
+                .iter()
+                .map(|p| SelfFixTriedEntry {
+                    candidate: p.candidate.clone(),
+                    confidence: p.effective_conf,
+                })
+                .collect();
+
+            let best_safe = probed
+                .iter()
+                .filter(|p| p.safe)
+                .max_by(|a, b| {
+                    a.effective_conf
+                        .partial_cmp(&b.effective_conf)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .cloned();
+
+            let mut chosen = None;
+            let mut chosen_lesson = None;
+
+            if let Some(best) = best_safe {
+                if best.effective_conf >= LOW_CONFIDENCE_THRESHOLD {
+                    bbox = best.bbox;
+                    box_conf = best.effective_conf;
+                    sensitive_noul = best.sensitive_noul.or(sensitive_noul);
+                    chosen = Some(best.candidate.clone());
+                    chosen_lesson = Some(best.lesson.clone());
+                    if let Some((text, center)) = best.ocr_item {
+                        *self.last_ocr_item_choice.lock().unwrap() = Some((text, center));
+                    }
+                } else {
+                    bbox = best.bbox;
+                    box_conf = best.effective_conf;
+                    sensitive_noul = best.sensitive_noul.or(sensitive_noul);
+                }
+            } else if let Some(any_unsafe) = probed.last() {
+                // Keep sensitive_noul if a sensitive candidate was probed so safety checks can observe it if needed,
+                // while keeping box_conf at base_conf (< LOW_CONFIDENCE_THRESHOLD) so it is never adopted.
+                sensitive_noul = sensitive_noul.or(any_unsafe.sensitive_noul);
+            }
+
+            *self.last_self_fix.lock().unwrap() = Some(SelfFixProbeResult {
+                target: tgt.to_string(),
+                tried,
+                chosen,
+                chosen_lesson,
+                base_conf,
+                budget_used,
+            });
         }
 
         Ok((bbox, box_conf, sensitive_noul, reasked))
@@ -1373,6 +1902,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 click_source: None,
                 ocr_item_text: None,
                 ocr_item_center_frac: None,
+                self_fix: None,
             });
         }
 
@@ -1396,6 +1926,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 click_source: None,
                 ocr_item_text: None,
                 ocr_item_center_frac: None,
+                self_fix: None,
             });
         }
 
@@ -1423,10 +1954,11 @@ impl<B: DecisionBackend> VisionDecider<B> {
                     click_source: None,
                     ocr_item_text: None,
                     ocr_item_center_frac: None,
+                    self_fix: None,
                 });
             }
 
-            if is_ocr_text_target(&tgt) {
+            if is_ocr_text_target(&tgt) && self.harness.is_none() {
                 let candidates = candidates_for_target(
                     &self.ocr_candidates(),
                     &tgt,
@@ -1484,6 +2016,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                             click_source: Some("ocr".to_string()),
                             ocr_item_text: Some(chosen.text.clone()),
                             ocr_item_center_frac: Some(chosen.center()),
+                            self_fix: None,
                         });
                     }
                 }
@@ -1491,6 +2024,8 @@ impl<B: DecisionBackend> VisionDecider<B> {
 
             let (bbox, box_conf, sensitive_noul, reasked) =
                 self.resolve_click_box(&state, img, &tgt, audit_log)?;
+            let self_fix = self.take_last_self_fix();
+            let ocr_choice = self.last_ocr_item_choice.lock().unwrap().take();
 
             let pt = if box_conf < LOW_CONFIDENCE_THRESHOLD {
                 None
@@ -1502,6 +2037,12 @@ impl<B: DecisionBackend> VisionDecider<B> {
             } else {
                 self.type_values.get(&tgt).cloned()
             };
+            let (click_source, ocr_item_text, ocr_item_center_frac) =
+                if let Some((text, center)) = ocr_choice {
+                    (Some("ocr".to_string()), Some(text), Some(center))
+                } else {
+                    (Some("box".to_string()), None, None)
+                };
             return Ok(Decision {
                 kind: ActionKind::Click,
                 kind_confidence: kind_conf,
@@ -1518,9 +2059,10 @@ impl<B: DecisionBackend> VisionDecider<B> {
                 popup_present_noul,
                 footer_noul,
                 login_form_noul,
-                click_source: Some("box".to_string()),
-                ocr_item_text: None,
-                ocr_item_center_frac: None,
+                click_source,
+                ocr_item_text,
+                ocr_item_center_frac,
+                self_fix,
             });
         }
 
@@ -1563,6 +2105,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                                 click_source: Some("ocr".to_string()),
                                 ocr_item_text: Some(chosen.text.clone()),
                                 ocr_item_center_frac: Some(chosen.center()),
+                                self_fix: None,
                             });
                         }
                     }
@@ -1589,6 +2132,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
                             click_source: Some("box".to_string()),
                             ocr_item_text: None,
                             ocr_item_center_frac: None,
+                            self_fix: None,
                         });
                     }
                 }
@@ -1632,6 +2176,7 @@ impl<B: DecisionBackend> VisionDecider<B> {
             click_source: None,
             ocr_item_text: None,
             ocr_item_center_frac: None,
+            self_fix: None,
         })
     }
 

@@ -86,6 +86,9 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 - `--targets-file <PATH>`: Path to a JSON file containing custom targets (`[{"label":..,"description":..}]`).
 - `--done-when <CONDITION>`: Done condition: `flights-results`, `checkout-page`, or `model` (defaults from `--preset`).
 - `--fill <KEY=VALUE>`: Repeatable target-to-text fill mapping (e.g. `--fill "origin field=Osaka"`).
+- `--harness <PATH>`: Optional harness JSON for target overrides and self-fix probe order/budget.
+- `--no-self-fix`: Disable the in-run self-correction probe (baseline runs).
+- `--experience-dir <PATH>`: Directory for experience entries and `INDEX.md` (default `./experience`).
 - `--dry-run`: Perform capture and decision making without executing mouse/keyboard actions.
 - `--json`: Print a single final JSON result object to stdout (`{status, steps, reason, ...}`).
 
@@ -132,6 +135,32 @@ Enforced by `SafetyPolicy` (`src/safety.rs`), `VisionDecider` (`src/decider.rs`)
 - **Single-Tab / Single-Window Guard**: Before each capture, if Chrome's tab count increases or the front window ID changes (`new_tab`), `decision-cu` stops immediately with `status: "blocked"` without navigating or closing any user tabs.
 - **API Timeout & Transport Retry**: Requests use a `60s` timeout and retry once after `2s` on connection/transport errors (in addition to `Retry-After` handling for HTTP `429`/`5xx`).
 - **Loop Termination Limits**: Automatically halts when the configured `--done-when` condition (`flights-results`, `checkout-page`, or `model`; for `events-zh`, `checkout-page` asks `"畫面是否為顯示票價的選擇票種或結帳頁面？"`) is satisfied, when `max_steps` (default `30`) is reached, or after `> 2` consecutive `"wait"` actions.
+
+### In-run Self-correction & Experience Library
+
+When the click box for the chosen target comes back with confidence `< 0.2`, `decision-cu` runs a small, budgeted probe before giving up on the step (`resolve_click_box` in `src/decider.rs`):
+
+- Candidates, in order (default `reask → experience → zoom → ocr`): a re-ask with a more specific description, a lesson from the experience library, a 2x zoom of the content region (the box is mapped back to window coordinates), and a choice among on-screen OCR (Optical Character Recognition) text lines. Agreement between an OCR line and a box center within tolerance adds `+0.10`.
+- At most **3 extra requests per step** by default (`max_extra_requests_per_step`).
+- Every candidate goes through the same safety checks as a normal click (forbidden words, sensitive text, `sensitive >= 0.5`, tab-strip / window bounds, popup-width rule). An unsafe candidate is never adopted; if nothing reaches `0.2` the step stays low-confidence and nothing is clicked.
+- Each probe is logged as a `self_fix` event (`target`, `tried[]`, `chosen`, `base_conf`, `budget_used`) in the run's `log.jsonl`.
+- With no harness file, no experience entry and no OCR candidates, the probe sends exactly the same requests as before this feature.
+
+**Experience library** (`--experience-dir`, default `./experience`): after a self-fix click whose result changed the URL or the screen, a text-only Markdown entry is written to `<dir>/<preset>/<host>/entries/` and indexed in `INDEX.md`. Entries store only text (cue, lesson, evidence, confidence, uses/wins) — never image bytes — and pass through `redact` (API key removed) with URL query strings/fragments stripped. An entry is disabled after 4+ uses with a win rate under 50%.
+
+**Harness file** (`--harness <PATH>`, optional JSON): overrides target descriptions, per-target re-ask prompts, candidate order and budget:
+
+```json
+{
+  "targets": [{"label": "立即報名按鈕", "description": "活動頁右側的「立即報名」", "reask": ["頁面右側橘色的「立即報名」按鈕"]}],
+  "candidate_order": ["reask", "experience", "zoom", "ocr"],
+  "max_extra_requests_per_step": 3
+}
+```
+
+`--no-self-fix` turns the probe off for baseline runs (no low-confidence re-ask at all).
+
+**Regression script**: `scripts/regress.sh` builds a release binary, then runs Task A (Google Flights KIX→TPE, 2026-11-03) and Task B (Accupass free event up to `checkout-page`) 3x with `--no-self-fix` and 3x with self-fix, and writes `runs/regress_<timestamp>/regress_records.tsv` (needs `jq`). Environment: `DECISION_CU_BIN` (use an existing binary), `HARNESS_FILE`, `EXPERIENCE_DIR`, `REGRESS_OUT_DIR`. It drives the real screen and spends API requests — run it only when you mean to.
 
 ### Privacy Note
 
@@ -235,6 +264,9 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
 - `--targets-file <PATH>`：自訂目標 JSON 檔案路徑（格式為 `[{"label":..,"description":..}]`）。
 - `--done-when <CONDITION>`：完成條件：`flights-results`、`checkout-page` 或 `model`（預設依 `--preset` 自動決定）。
 - `--fill <KEY=VALUE>`：可重複指定的目標欄位填入文字對應（例如 `--fill "origin field=Osaka"`）。
+- `--harness <PATH>`：選用的 harness JSON，覆寫目標描述與自我修正的候選順序／預算。
+- `--no-self-fix`：關閉執行中自我修正（基準對照用）。
+- `--experience-dir <PATH>`：經驗庫條目與 `INDEX.md` 的目錄（預設 `./experience`）。
 - `--dry-run`：乾跑模式，不執行實際滑鼠或鍵盤動作。
 - `--json`：於標準輸出印出單一 JSON 結果物件（`{status, steps, reason, ...}`）。
 - 結束狀態碼：`0` (`done`)、`1` (`error`)、`2` (`step_limit`)、`3` (`wait_limit`)、`4` (`blocked`)。完整說明請參考 [`skills/decision-computer-use/SKILL.md`](skills/decision-computer-use/SKILL.md)。
@@ -261,6 +293,24 @@ cargo run -- run --task "Find nonstop flights from SFO to JFK next Friday" --max
   - **步數與動作**：共 `11` 步、`9` 次點擊，全部精準命中預期目標（行程類型下拉選單 `trip type`、單程 `One way`、出發地 `origin`、`KIX` 建議選項、目的地 `destination`、`TPE` 建議選項、出發日期 `departure date`、`Done` 按鈕、`Search` 搜尋按鈕）以及 `1` 次 Return 鍵。
   - **API 請求與隱私安全**：共發送 `22` 次 API 請求 / `22` 張圖片，每張圖片皆為僅擷取 Chrome 視窗的畫面（Chrome-window-only capture）；平均每步耗時 `4.77 s`；未開啟或關閉任何分頁；未在 Chrome 視窗外輸入任何文字。
   - **早期嘗試備註**：先前的實機嘗試曾因其他應用程式視窗遮擋 Chrome 以及缺少畫面穩定延遲（settle delays）而失敗，相關問題已於本次執行前修復完成。
+
+### 執行中自我修正與經驗庫
+
+當選定目標的點擊框信心值 `< 0.2` 時，`decision-cu` 會在放棄此步前做一次有預算上限的小型探測（`src/decider.rs` 的 `resolve_click_box`）：
+
+- 候選順序（預設 `reask → experience → zoom → ocr`）：用更具體描述重問、套用經驗庫裡的教訓、把內容區放大 2 倍再問（框座標會映回原視窗座標）、在畫面 OCR（光學文字辨識）文字行中挑選。OCR 行與框中心在容差內一致時加 `+0.10`。
+- 預設每步最多 **3 次額外請求**（`max_extra_requests_per_step`）。
+- 每個候選都套用與一般點擊相同的安全檢查（禁按字、敏感文字、`sensitive >= 0.5`、分頁列／視窗邊界、彈窗寬度規則）；不安全的候選絕不採用，沒有候選達到 `0.2` 就維持低信心、不點擊。
+- 每次探測都會在該次執行的 `log.jsonl` 記一筆 `self_fix` 事件（`target`、`tried[]`、`chosen`、`base_conf`、`budget_used`）。
+- 沒有 harness 檔、沒有經驗條目、也沒有 OCR 候選時，送出的請求與加入此功能前完全相同。
+
+**經驗庫**（`--experience-dir`，預設 `./experience`）：自我修正後的點擊若讓網址或畫面改變，會在 `<dir>/<preset>/<host>/entries/` 寫入一筆純文字 Markdown 條目並更新 `INDEX.md`。條目只存文字（cue、lesson、evidence、信心值、使用／成功次數），絕不存圖片位元組，並經 `redact`（移除 API 金鑰）及去除網址查詢字串／錨點。使用 4 次以上且成功率低於 50% 的條目會自動停用。
+
+**Harness 檔**（`--harness <PATH>`，選用 JSON）：可覆寫目標描述、各目標重問提示、候選順序與預算，格式見上方英文段落範例。
+
+`--no-self-fix`：關閉探測，作為基準對照（低信心時完全不重問）。
+
+**回歸腳本**：`scripts/regress.sh` 會先編譯 release 版，再把任務 A（Google Flights 大阪 KIX→台北 TPE，2026-11-03）與任務 B（Accupass 免費活動走到 `checkout-page`）各以 `--no-self-fix` 跑 3 次、開自我修正跑 3 次，結果寫到 `runs/regress_<時間>/regress_records.tsv`（需要 `jq`）。環境變數：`DECISION_CU_BIN`（改用現成執行檔）、`HARNESS_FILE`、`EXPERIENCE_DIR`、`REGRESS_OUT_DIR`。腳本會實際操作螢幕並消耗 API 請求，請確定要跑再執行。
 
 ### 安全規則 (Safety Rules)
 
